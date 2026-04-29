@@ -91,6 +91,11 @@ class LuaZigCliShellTests(unittest.TestCase):
             pass_fixture.write_text("print(21 + 21)\n")
             fail_fixture = temp_path / "fail.lua"
             fail_fixture.write_text('local x = "bad" + 1\nprint(x)\n')
+            fallback_fail_fixture = temp_path / "fallback-fail.lua"
+            fallback_fail_fixture.write_text(
+                'local t = setmetatable({}, { __index = function() error("fallback boom") end })\n'
+                "print(t.answer)\n"
+            )
             env = {"LUA_ZIG_EVIDENCE_DIR": str(temp_path / "evidence")}
 
             passing = run(str(CLI), "test", "--fixture", str(pass_fixture), "--target", "native-full", env=env)
@@ -108,6 +113,26 @@ class LuaZigCliShellTests(unittest.TestCase):
             self.assertEqual(fail_summary["accounting"]["fail_count"], 1)
             self.assertEqual(fail_summary["accounting"]["native_pass_count"], 0)
             self.assertIn("attempt to perform arithmetic", fail_summary["ledger"][0]["diagnostic"])
+
+            fallback_failing = run(
+                str(CLI),
+                "test",
+                "--fixture",
+                str(fallback_fail_fixture),
+                "--target",
+                "native-full",
+                env=env,
+            )
+            self.assertNotEqual(fallback_failing.returncode, 0, fallback_failing.stderr + fallback_failing.stdout)
+            fallback_fail_summary = json.loads(fallback_failing.stdout)
+            self.assertEqual(fallback_fail_summary["state"], "fail")
+            self.assertEqual(fallback_fail_summary["accounting"]["fail_count"], 1)
+            self.assertEqual(fallback_fail_summary["accounting"]["fallback_pass_count"], 0)
+            self.assertEqual(fallback_fail_summary["accounting"]["native_pass_count"], 0)
+            self.assertEqual(fallback_fail_summary["ledger"][0]["state"], "fail")
+            self.assertEqual(fallback_fail_summary["ledger"][0]["implementation_mode"], "stock-lua-fallback")
+            self.assertIn("fallback-fail", fallback_fail_summary["ledger"][0]["diagnostic"])
+            self.assertIn("fallback boom", fallback_fail_summary["ledger"][0]["diagnostic"])
 
             wasm = run(str(CLI), "test", "--fixture", str(pass_fixture), "--target", "wasm-full", env=env)
             self.assertEqual(wasm.returncode, 0, wasm.stderr + wasm.stdout)
@@ -183,6 +208,11 @@ class LuaZigCliShellTests(unittest.TestCase):
             fixture.write_text("print(40 + 2)\n")
             advanced = temp_path / "advanced.lua"
             advanced.write_text('local t = setmetatable({}, { __index = function() return 42 end })\nprint(t.answer)\n')
+            advanced_fail = temp_path / "advanced-fail.lua"
+            advanced_fail.write_text(
+                'local t = setmetatable({}, { __index = function() error("fallback boom") end })\n'
+                "print(t.answer)\n"
+            )
             workload = temp_path / "workload.lua"
             workload.write_text('print("profiled")\n')
 
@@ -190,6 +220,7 @@ class LuaZigCliShellTests(unittest.TestCase):
             self.assertEqual(run(str(CLI), "check", env=env).returncode, 0)
             self.assertEqual(run(str(CLI), "run", "-", stdin=advanced.read_text(), env=env).returncode, 0)
             self.assertEqual(run(str(CLI), "test", "--fixture", str(fixture), env=env).returncode, 0)
+            self.assertNotEqual(run(str(CLI), "test", "--fixture", str(advanced_fail), env=env).returncode, 0)
             self.assertEqual(run(str(CLI), "profile", "metrics", str(workload), env=env).returncode, 0)
 
             completed = run(str(CLI), "report", "--format", "json", env=env)
@@ -197,7 +228,7 @@ class LuaZigCliShellTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
             self.assertEqual(completed.stderr, "")
             report = json.loads(completed.stdout)
-            self.assertEqual(report["state"], "pass")
+            self.assertEqual(report["state"], "fail")
             self.assertEqual(report["ledger_format_version"], 1)
             self.assertIn("fallback-pass", report["states"])
             self.assertIn("capability-denied", report["states"])
@@ -209,11 +240,20 @@ class LuaZigCliShellTests(unittest.TestCase):
                 report["accounting"]["native_implementation_compatibility_count"],
                 report["accounting"]["native_pass_count"],
             )
+            self.assertEqual(report["accounting"]["fail_count"], 1)
             self.assertGreater(report["accounting"]["fallback_pass_count"], 0)
             self.assertGreaterEqual(report["accounting"]["blocked_count"], 2)
             self.assertEqual(report["evidence"]["source"], str(evidence_dir.resolve()))
-            self.assertGreaterEqual(report["evidence"]["record_count"], 5)
+            self.assertGreaterEqual(report["evidence"]["record_count"], 6)
             self.assertTrue(any(entry["state"] == "fallback-pass" for entry in report["ledger"]))
+            self.assertTrue(
+                any(
+                    entry["state"] == "fail"
+                    and entry["implementation_mode"] == "stock-lua-fallback"
+                    and entry["fixture"]["path"] == str(advanced_fail.resolve())
+                    for entry in report["ledger"]
+                )
+            )
             self.assertTrue(any(entry["command"] == "profile" for entry in report["ledger"]))
             self.assertTrue(any(entry["command"] == "test" and entry["fixture"]["path"] == str(fixture.resolve()) for entry in report["ledger"]))
 

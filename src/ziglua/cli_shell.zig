@@ -244,8 +244,11 @@ fn testCommand(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args
         const result = try runWithNativeAdvancedFallback(allocator, io, source);
         exit_code = result.exit_code;
         diagnostic = result.stderr;
-        if (std.mem.eql(u8, result.stderr[0..@min(result.stderr.len, "lua-zig run: fallback-pass".len)], "lua-zig run: fallback-pass")) {
+        if (isFallbackPassDiagnostic(result.stderr) and result.exit_code == 0) {
             state = "fallback-pass";
+            implementation_mode = "stock-lua-fallback";
+        } else if (isFallbackDiagnostic(result.stderr)) {
+            state = "fail";
             implementation_mode = "stock-lua-fallback";
         } else {
             switch (result.state) {
@@ -1307,14 +1310,16 @@ fn runCommand(
     const source = try stdin_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
     const result = try runWithNativeAdvancedFallback(allocator, io, source);
     const timestamp = timestampMillis(io);
-    const state: []const u8 = if (std.mem.eql(u8, result.stderr[0..@min(result.stderr.len, "lua-zig run: fallback-pass".len)], "lua-zig run: fallback-pass"))
+    const state: []const u8 = if (isFallbackPassDiagnostic(result.stderr) and result.exit_code == 0)
         "fallback-pass"
+    else if (isFallbackDiagnostic(result.stderr))
+        "fail"
     else switch (result.state) {
         .pass => "pass",
         .runtime_error => "fail",
         .unsupported => "unsupported",
     };
-    const implementation_mode: []const u8 = if (std.mem.eql(u8, state, "fallback-pass"))
+    const implementation_mode: []const u8 = if (isFallbackDiagnostic(result.stderr))
         "stock-lua-fallback"
     else if (std.mem.eql(u8, state, "unsupported"))
         "none"
@@ -1386,15 +1391,29 @@ fn runWithNativeAdvancedFallback(
         .stdout_limit = .unlimited,
         .stderr_limit = .unlimited,
     });
-    const marker = try std.fmt.allocPrint(allocator, "lua-zig run: fallback-pass reason={s}\n", .{reason});
+    const exit_code = termExitCode(stock.term);
+    const marker_state: []const u8 = if (exit_code == 0) "fallback-pass" else "fallback-fail";
+    const marker = try std.fmt.allocPrint(allocator, "lua-zig run: {s} reason={s}\n", .{ marker_state, reason });
     const stderr = try std.mem.concat(allocator, u8, &.{ marker, stock.stderr });
     return .{
-        .state = .pass,
+        .state = if (exit_code == 0) .pass else .runtime_error,
         .stdout = stock.stdout,
         .stderr = stderr,
-        .exit_code = termExitCode(stock.term),
+        .exit_code = exit_code,
         .unsupported_reason = null,
     };
+}
+
+fn isFallbackDiagnostic(stderr: []const u8) bool {
+    return isFallbackPassDiagnostic(stderr) or hasPrefix(stderr, "lua-zig run: fallback-fail");
+}
+
+fn isFallbackPassDiagnostic(stderr: []const u8) bool {
+    return hasPrefix(stderr, "lua-zig run: fallback-pass");
+}
+
+fn hasPrefix(text: []const u8, prefix: []const u8) bool {
+    return text.len >= prefix.len and std.mem.eql(u8, text[0..prefix.len], prefix);
 }
 
 fn termExitCode(term: std.process.Child.Term) u8 {
