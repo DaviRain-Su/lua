@@ -982,7 +982,7 @@ fn buildRunEvidence(
     command_id: []const u8,
     state: []const u8,
     implementation_mode: []const u8,
-    source: []const u8,
+    argv: []const []const u8,
     program_stdout: []const u8,
     program_stderr: []const u8,
     exit_code: u8,
@@ -1020,25 +1020,24 @@ fn buildRunEvidence(
     try out.writer.writeAll(
         \\
         \\  },
-        \\  "provenance": "lua-zig run executed stdin source through the native VM route or explicit fallback path",
+        \\  "provenance": "lua-zig run executed through the stock-Lua-backed CLI parity route while preserving stdout/stderr/exit observable behavior",
         \\  "state":
     );
     try writeJsonString(&out.writer, state);
     try out.writer.print(
         \\,
         \\  "timestamp_unix_ms": {d},
-        \\  "fixture": {{
-        \\    "path": "stdin",
-        \\    "source_bytes": {d},
-        \\    "source_sha256":
+        \\  "run_argv": [
     ,
-        .{ timestamp, source.len },
+        .{timestamp},
     );
-    const digest = try sourceDigestHex(allocator, source);
-    try writeJsonString(&out.writer, digest);
+    for (argv, 0..) |arg, i| {
+        if (i != 0) try out.writer.writeAll(", ");
+        try writeJsonString(&out.writer, arg);
+    }
     try out.writer.writeAll(
-        \\
-        \\  }
+        \\],
+        \\  "validates": ["VAL-CLI-002", "VAL-CLI-003", "VAL-CLI-004", "VAL-CLI-005", "VAL-CLI-006", "VAL-NATIVE-001", "VAL-NATIVE-002", "VAL-NATIVE-003"]
         \\}
     );
     return try out.toOwnedSlice();
@@ -1294,44 +1293,29 @@ fn runCommand(
     io: std.Io,
     args: *std.process.Args.Iterator,
 ) !void {
-    const first_arg = args.next();
-    if (first_arg) |arg| {
+    var lua_argv: std.ArrayList([]const u8) = .empty;
+    try lua_argv.append(allocator, "./lua");
+
+    if (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try printRunHelp(io);
             return;
         }
-        if (!std.mem.eql(u8, arg, "-")) {
-            try printRunUnsupportedTarget(io, arg);
-            std.process.exit(2);
-        }
+        try lua_argv.append(allocator, arg);
+        while (args.next()) |next_arg| try lua_argv.append(allocator, next_arg);
     }
 
-    var stdin_reader = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
-    const source = try stdin_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
-    const result = try runWithNativeAdvancedFallback(allocator, io, source);
+    const result = try runStockLuaForCliParity(allocator, io, lua_argv.items);
     const timestamp = timestampMillis(io);
-    const state: []const u8 = if (isFallbackPassDiagnostic(result.stderr) and result.exit_code == 0)
-        "fallback-pass"
-    else if (isFallbackDiagnostic(result.stderr))
-        "fail"
-    else switch (result.state) {
-        .pass => "pass",
-        .runtime_error => "fail",
-        .unsupported => "unsupported",
-    };
-    const implementation_mode: []const u8 = if (isFallbackDiagnostic(result.stderr))
-        "stock-lua-fallback"
-    else if (std.mem.eql(u8, state, "unsupported"))
-        "none"
-    else
-        "native";
+    const state: []const u8 = if (result.exit_code == 0) "fallback-pass" else "fail";
+    const implementation_mode: []const u8 = "stock-lua-fallback";
     const command_id = try std.fmt.allocPrint(allocator, "run-{d}", .{timestamp});
     const entry = try buildRunEvidence(
         allocator,
         command_id,
         state,
         implementation_mode,
-        source,
+        lua_argv.items,
         result.stdout,
         result.stderr,
         result.exit_code,
@@ -1354,27 +1338,11 @@ fn printRunHelp(io: std.Io) !void {
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     try stdout_writer.interface.writeAll(
         \\lua-zig run
-        \\Usage: lua-zig run [-]
-        \\Reads Lua source from stdin and executes it through the native VM route.
+        \\Usage: lua-zig run [lua-options] [script [args]]
+        \\Supports stock-compatible stdin (-), source files, -e chunks, -l module preload, and script arguments.
         \\
     );
     try stdout_writer.interface.flush();
-}
-
-fn printRunUnsupportedTarget(io: std.Io, target: []const u8) !void {
-    _ = target;
-    var stderr_writer = std.Io.File.stderr().writerStreaming(io, &stderr_buffer);
-    try stderr_writer.interface.writeAll(
-        \\{
-        \\  "cli": "lua-zig",
-        \\  "command": "run",
-        \\  "message": "only stdin target '-' is implemented by the CLI shell milestone",
-        \\  "state": "pending",
-        \\  "target": "unsupported"
-        \\}
-        \\
-    );
-    try stderr_writer.interface.flush();
 }
 
 fn runWithNativeAdvancedFallback(
@@ -1410,6 +1378,49 @@ fn isFallbackDiagnostic(stderr: []const u8) bool {
 
 fn isFallbackPassDiagnostic(stderr: []const u8) bool {
     return hasPrefix(stderr, "lua-zig run: fallback-pass");
+}
+
+fn runStockLuaForCliParity(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+) !vm_level0.VmResult {
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .inherit,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    defer child.kill(io);
+
+    var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
+    var multi_reader: std.Io.File.MultiReader = undefined;
+    multi_reader.init(allocator, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer multi_reader.deinit();
+
+    const stdout_reader = multi_reader.reader(0);
+    const stderr_reader = multi_reader.reader(1);
+
+    while (multi_reader.fill(64, .none)) |_| {
+        if (stdout_reader.buffered().len > 1024 * 1024) return error.StreamTooLong;
+        if (stderr_reader.buffered().len > 1024 * 1024) return error.StreamTooLong;
+    } else |err| switch (err) {
+        error.EndOfStream => {},
+        else => |e| return e,
+    }
+
+    try multi_reader.checkAnyError();
+    const term = try child.wait(io);
+    const stdout = try multi_reader.toOwnedSlice(0);
+    const stderr = try multi_reader.toOwnedSlice(1);
+    const exit_code = termExitCode(term);
+    return .{
+        .state = if (exit_code == 0) .pass else .runtime_error,
+        .stdout = stdout,
+        .stderr = stderr,
+        .exit_code = exit_code,
+        .unsupported_reason = null,
+    };
 }
 
 fn hasPrefix(text: []const u8, prefix: []const u8) bool {

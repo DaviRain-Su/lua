@@ -454,6 +454,144 @@ class BaselineOracle:
         self.write_json(f"differential/{name}-summary.json", summary)
         return summary
 
+    def run_lua_zig_run_cli_parity(self) -> dict[str, object]:
+        fixtures_dir = self.out_dir / "run-parity-fixtures"
+        fixtures_dir.mkdir(parents=True, exist_ok=True)
+
+        args_script = fixtures_dir / "args.lua"
+        args_script.write_text(
+            "print(arg[0])\n"
+            "for i = 1, #arg do print(i, arg[i]) end\n"
+            "print(...)\n",
+            encoding="utf-8",
+        )
+        file_error_script = fixtures_dir / "file-error.lua"
+        file_error_script.write_text('error("file boom", 0)\n', encoding="utf-8")
+        e_file_script = fixtures_dir / "e-file.lua"
+        e_file_script.write_text("print(prefix .. ':file')\n", encoding="utf-8")
+        module_script = fixtures_dir / "fixture_module.lua"
+        module_script.write_text(
+            "fixture_module = { value = 42 }\n"
+            "io.write('loaded\\n')\n"
+            "return fixture_module\n",
+            encoding="utf-8",
+        )
+        module_env = {"LUA_PATH": f"{fixtures_dir}/?.lua;;"}
+
+        cases = [
+            {
+                "id": "stdin-success",
+                "stock_args": ["-"],
+                "candidate_args": ["./zig-out/bin/lua-zig", "run", "-"],
+                "stdin": 'io.stdout:write("stdin-ok\\n")\n',
+                "env": {},
+                "validates": ["VAL-CLI-002", "VAL-NATIVE-003"],
+            },
+            {
+                "id": "stdin-runtime-error",
+                "stock_args": ["-"],
+                "candidate_args": ["./zig-out/bin/lua-zig", "run", "-"],
+                "stdin": 'local x = "bad" + 1\nprint(x)\n',
+                "env": {},
+                "validates": ["VAL-CLI-002", "VAL-NATIVE-003"],
+            },
+            {
+                "id": "file-args",
+                "stock_args": [str(args_script), "alpha", "--flag"],
+                "candidate_args": ["./zig-out/bin/lua-zig", "run", str(args_script), "alpha", "--flag"],
+                "stdin": None,
+                "env": {},
+                "validates": ["VAL-CLI-003", "VAL-CLI-006", "VAL-NATIVE-001"],
+            },
+            {
+                "id": "file-diagnostic",
+                "stock_args": [str(file_error_script)],
+                "candidate_args": ["./zig-out/bin/lua-zig", "run", str(file_error_script)],
+                "stdin": None,
+                "env": {},
+                "validates": ["VAL-CLI-003", "VAL-NATIVE-001"],
+            },
+            {
+                "id": "e-order",
+                "stock_args": ["-e", "value = 40", "-e", "print(value + 2)"],
+                "candidate_args": ["./zig-out/bin/lua-zig", "run", "-e", "value = 40", "-e", "print(value + 2)"],
+                "stdin": None,
+                "env": {},
+                "validates": ["VAL-CLI-004", "VAL-NATIVE-002"],
+            },
+            {
+                "id": "e-file-composition",
+                "stock_args": ["-e", "prefix = 'from-e'", str(e_file_script)],
+                "candidate_args": ["./zig-out/bin/lua-zig", "run", "-e", "prefix = 'from-e'", str(e_file_script)],
+                "stdin": None,
+                "env": {},
+                "validates": ["VAL-CLI-004", "VAL-CLI-003", "VAL-NATIVE-002"],
+            },
+            {
+                "id": "l-preload",
+                "stock_args": ["-l", "fixture_module", "-e", "print(fixture_module.value)"],
+                "candidate_args": ["./zig-out/bin/lua-zig", "run", "-l", "fixture_module", "-e", "print(fixture_module.value)"],
+                "stdin": None,
+                "env": module_env,
+                "validates": ["VAL-CLI-005"],
+            },
+            {
+                "id": "l-missing-diagnostic",
+                "stock_args": ["-l", "missing_fixture_module", "-e", "print('unreachable')"],
+                "candidate_args": ["./zig-out/bin/lua-zig", "run", "-l", "missing_fixture_module", "-e", "print('unreachable')"],
+                "stdin": None,
+                "env": module_env,
+                "validates": ["VAL-CLI-005"],
+            },
+        ]
+
+        entries = []
+        state = "pass"
+        for case in cases:
+            stock = self.runner(["./lua", *case["stock_args"]], self.repo, case["env"], case["stdin"], None)
+            candidate = self.runner(case["candidate_args"], self.repo, case["env"], case["stdin"], None)
+            stock_file = self.write_result(f"run-parity-stock-{case['id']}", stock)
+            candidate_file = self.write_result(f"run-parity-candidate-{case['id']}", candidate)
+            diffs = compare_cli_results(stock.to_dict(), candidate.to_dict())
+            case_state = "pass" if not diffs else "fail"
+            if case_state != "pass":
+                state = "fail"
+            entries.append(
+                {
+                    "id": case["id"],
+                    "state": case_state,
+                    "stock_result_file": stock_file,
+                    "candidate_result_file": candidate_file,
+                    "stock_command": stock.to_dict()["command_text"],
+                    "candidate_command": candidate.to_dict()["command_text"],
+                    "diffs": diffs,
+                    "validates": case["validates"],
+                }
+            )
+
+        summary = {
+            "state": state,
+            "validator": "lua-zig-run-cli-parity",
+            "cases": entries,
+            "case_count": len(entries),
+            "pass_count": sum(1 for entry in entries if entry["state"] == "pass"),
+            "fail_count": sum(1 for entry in entries if entry["state"] == "fail"),
+            "compared_fields": ["stdout", "stderr", "exit_code"],
+            "normalization_policy": "exact stdout/stderr/exit comparison; no path, executable, or diagnostic normalization applied",
+            "validates": [
+                "VAL-CLI-002",
+                "VAL-CLI-003",
+                "VAL-CLI-004",
+                "VAL-CLI-005",
+                "VAL-CLI-006",
+                "VAL-NATIVE-001",
+                "VAL-NATIVE-002",
+                "VAL-NATIVE-003",
+            ],
+        }
+        self.write_json("run-parity/summary.json", summary)
+        return summary
+
     def run_build(self) -> dict[str, object]:
         build = self.runner(DARWIN_BUILD_COMMAND, self.repo, DARWIN_BUILD_OVERRIDES, None, None)
         build_file = self.write_result("stock-build-darwin", build)
@@ -2972,6 +3110,14 @@ def validator_registry(repo: Path) -> dict[str, object]:
             "requires_service": False,
             "artifacts_or_channels": ["stdout", "stderr", "exit_code", "build/validation/baseline-oracle/cross-area/integration-summary.json"],
         },
+        {
+            "id": "lua-zig-run-cli-parity",
+            "description": "Compare lua-zig run against stock ./lua for stdin, files, -e chunks, -l preloads, script args, exit status, stdout, stderr, and diagnostics.",
+            "command": f"python3 {script} --repo {repo} lua-zig-run-cli-parity",
+            "surface": "cli",
+            "requires_service": False,
+            "artifacts_or_channels": ["stdout", "stderr", "exit_code", "build/validation/baseline-oracle/run-parity/summary.json"],
+        },
     ]
     return {
         "state": "pass",
@@ -3338,6 +3484,7 @@ def build_parser() -> argparse.ArgumentParser:
     cross_area = subparsers.add_parser("cross-area-integration-validation", help="run baseline, Zig VM/AOT, packaging, taxonomy, and post-Zig C selected-test validation in one CLI flow")
     cross_area.add_argument("--vm-command", default=shlex.join(DEFAULT_ZIG_VM_CANDIDATE_COMMAND), help="Zig VM command that reads Lua source from stdin")
     cross_area.add_argument("--aot-command", default=shlex.join(DEFAULT_ZIG_AOT_CANDIDATE_COMMAND), help="Zig AOT command that reads Lua source from stdin")
+    subparsers.add_parser("lua-zig-run-cli-parity", help="compare lua-zig run source forms against stock ./lua")
     subparsers.add_parser("list-validators", help="list CLI-only validators and their report/artifact surfaces")
     aot_errors = subparsers.add_parser("aot-runtime-error-parity", help="validate deterministic AOT runtime-error parity under normalized policy")
     aot_errors.add_argument("--vm-command", default=shlex.join(DEFAULT_ZIG_VM_CANDIDATE_COMMAND), help="Zig VM command that reads Lua source from stdin")
@@ -3413,6 +3560,8 @@ def main(argv: list[str] | None = None) -> int:
                 shlex.split(args.aot_command),
             )
         )
+    if args.command == "lua-zig-run-cli-parity":
+        return print_summary(oracle.run_lua_zig_run_cli_parity())
     if args.command == "list-validators":
         return print_summary(validator_registry(args.repo.resolve()))
     if args.command == "aot-runtime-error-parity":

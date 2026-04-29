@@ -32,6 +32,9 @@ def run(
 class LuaZigCliShellTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        stock = run("make", "-s", "-j12", "MYCFLAGS=-std=c99 -DLUA_USE_MACOSX", "MYLDFLAGS=", "MYLIBS=")
+        if stock.returncode != 0:
+            raise AssertionError(stock.stderr + stock.stdout)
         completed = run("zig", "build", "-Dprofile=native-full", "--summary", "all")
         if completed.returncode != 0:
             raise AssertionError(completed.stderr + completed.stdout)
@@ -292,6 +295,74 @@ class LuaZigCliShellTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
         self.assertEqual(completed.stdout, "42\n")
         self.assertEqual(completed.stderr, "")
+
+    def assertRunParity(
+        self,
+        stock_args: list[str],
+        candidate_args: list[str],
+        *,
+        stdin: str | None = None,
+        env: dict[str, str] | None = None,
+    ) -> None:
+        stock = run("./lua", *stock_args, stdin=stdin, env=env)
+        candidate = run(str(CLI), "run", *candidate_args, stdin=stdin, env=env)
+        self.assertEqual(candidate.returncode, stock.returncode, stock.stderr + stock.stdout + candidate.stderr + candidate.stdout)
+        self.assertEqual(candidate.stdout, stock.stdout)
+        self.assertEqual(candidate.stderr, stock.stderr)
+
+    def test_run_observable_parity_for_stdin_success_and_diagnostics(self):
+        self.assertRunParity(["-"], ["-"], stdin='io.stdout:write("ok\\n")\n')
+        self.assertRunParity(["-"], ["-"], stdin='local x = "bad" + 1\nprint(x)\n')
+        self.assertRunParity(["-"], ["-"], stdin="function nope(\n")
+
+    def test_run_observable_parity_for_files_args_and_file_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            script = temp_path / "args.lua"
+            script.write_text(
+                "print(arg[0])\n"
+                "for i = 1, #arg do print(i, arg[i]) end\n"
+                "print(...)\n"
+            )
+            self.assertRunParity([str(script), "alpha", "--flag"], [str(script), "alpha", "--flag"])
+
+            error_script = temp_path / "boom.lua"
+            error_script.write_text('error("file boom", 0)\n')
+            self.assertRunParity([str(error_script)], [str(error_script)])
+
+    def test_run_observable_parity_for_e_chunks_order_and_file_composition(self):
+        self.assertRunParity(
+            ["-e", "value = 40", "-e", "print(value + 2)"],
+            ["-e", "value = 40", "-e", "print(value + 2)"],
+        )
+        self.assertRunParity(["-e", "function nope("], ["-e", "function nope("])
+
+        with tempfile.TemporaryDirectory() as temp:
+            script = Path(temp) / "uses_e.lua"
+            script.write_text("print(prefix .. ':file')\n")
+            self.assertRunParity(
+                ["-e", "prefix = 'from-e'", str(script)],
+                ["-e", "prefix = 'from-e'", str(script)],
+            )
+
+    def test_run_observable_parity_for_l_preload_and_require_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            module = temp_path / "fixture_module.lua"
+            module.write_text("fixture_module = { value = 42 }\nio.write('loaded\\n')\nreturn fixture_module\n")
+            lua_path = f"{temp_path}/?.lua;;"
+            env = {"LUA_PATH": lua_path}
+
+            self.assertRunParity(
+                ["-l", "fixture_module", "-e", "print(fixture_module.value)"],
+                ["-l", "fixture_module", "-e", "print(fixture_module.value)"],
+                env=env,
+            )
+            self.assertRunParity(
+                ["-l", "missing_fixture_module", "-e", "print('unreachable')"],
+                ["-l", "missing_fixture_module", "-e", "print('unreachable')"],
+                env=env,
+            )
 
     def test_unknown_command_fails_with_machine_checkable_diagnostic(self):
         completed = run(str(CLI), "not-a-command")

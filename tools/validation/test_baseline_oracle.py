@@ -1593,6 +1593,7 @@ class BaselineOracleTests(unittest.TestCase):
         self.assertIn("cross-target-profile-matrix", validator_ids)
         self.assertIn("sbf-spike-report", validator_ids)
         self.assertIn("cross-area-integration-validation", validator_ids)
+        self.assertIn("lua-zig-run-cli-parity", validator_ids)
         self.assertTrue(all(entry["surface"] == "cli" for entry in summary["validators"]))
         self.assertTrue(all(not entry["requires_service"] for entry in summary["validators"]))
         self.assertTrue(all("command" in entry for entry in summary["validators"]))
