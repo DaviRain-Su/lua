@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      name="description"
+      content="Static Cloudflare Pages site for the local Zig-backed Lua 5.5 runtime foundation mission."
+    >
+    <title>Zig-backed Lua 5.5 Runtime Foundation</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="hero">
+      <nav class="nav" aria-label="Primary">
+        <a class="brand" href="#top" aria-label="Zig-backed Lua home">Zig-backed Lua</a>
+        <div class="nav-links">
+          <a href="#foundation">Foundation</a>
+          <a href="#profiles">Profiles</a>
+          <a href="#validation">Validation</a>
+        </div>
+      </nav>
+
+      <section id="top" class="hero-grid">
+        <div>
+          <p class="eyebrow">Local mission work · not upstream Lua</p>
+          <h1>Zig-backed Lua 5.5 runtime foundation</h1>
+          <p class="lede">
+            A Cloudflare Pages-ready static summary of the local Zig-backed runtime,
+            AOT, allocator, and cross-target validation work built around the Lua
+            5.5 development baseline.
+          </p>
+          <div class="actions" aria-label="Page anchors">
+            <a class="button primary" href="#validation">View validation</a>
+            <a class="button secondary" href="#commands">Key commands</a>
+          </div>
+        </div>
+        <aside class="score-card" aria-label="Validation score">
+          <span class="score-label">Final validation</span>
+          <strong>93/93</strong>
+          <span class="score-detail">assertions passed · 0 failed · 0 blocked</span>
+        </aside>
+      </section>
+    </header>
+
+    <main>
+      <section class="notice" aria-label="Repository positioning">
+        <h2>Repository positioning</h2>
+        <p>
+          This site documents local Zig-backed mission work in a Lua development
+          checkout. It does not change upstream Lua guidance, contribution flow, or
+          positioning; official Lua information remains at Lua.org.
+        </p>
+      </section>
+
+      <section id="foundation" class="section">
+        <div class="section-heading">
+          <p class="eyebrow">Runtime foundation</p>
+          <h2>Project highlights</h2>
+        </div>
+        <div class="cards">
+          <article class="card">
+            <h3>Lua 5.5 baseline</h3>
+            <p>
+              Compatibility is anchored to this repository's Lua 5.5 development
+              line, its current source behavior, and the local validation corpus.
+            </p>
+          </article>
+          <article class="card">
+            <h3>Zig VM/runtime</h3>
+            <p>
+              The VM/runtime track establishes Zig-side value, object, table,
+              function, allocator, execution, and fallback contracts.
+            </p>
+          </article>
+          <article class="card">
+            <h3>AOT track</h3>
+            <p>
+              Lua-to-Zig AOT work targets statically eligible chunks while routing
+              dynamic semantics back through the shared runtime fallback path.
+            </p>
+          </article>
+          <article class="card">
+            <h3>Allocator model</h3>
+            <p>
+              Runtime allocation is modeled around Zig allocators, bounded and
+              failing modes, and a Lua <code>lua_Alloc</code> compatibility bridge.
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <section id="profiles" class="section split">
+        <div>
+          <p class="eyebrow">Target matrix</p>
+          <h2>Native, WASM, and SBF profiles</h2>
+          <p>
+            The foundation keeps platform capabilities explicit: native builds
+            prioritize full compatibility, WASM constrains host capabilities and
+            memory, and SBF remains an experimental spike with deterministic,
+            bounded execution goals.
+          </p>
+        </div>
+        <div class="profile-list">
+          <div>
+            <strong>Native full</strong>
+            <span>x86_64/aarch64 compatibility-first runtime validation.</span>
+          </div>
+          <div>
+            <strong>WASM constrained</strong>
+            <span>Capability-gated standard library and bounded memory checks.</span>
+          </div>
+          <div>
+            <strong>SBF experimental</strong>
+            <span>Toolchain and feasibility spike, not a full compatibility promise.</span>
+          </div>
+        </div>
+      </section>
+
+      <section id="validation" class="section">
+        <div class="section-heading">
+          <p class="eyebrow">Validation report summary</p>
+          <h2>93/93 assertions passed</h2>
+          <p>
+            Final synthesis reported <strong>status: pass</strong> with
+            <strong>93 passed</strong>, <strong>0 failed</strong>, and
+            <strong>0 blocked</strong>. Coverage included baseline, build/profile
+            matrix, runtime, execution, advanced semantics, and cross-target areas.
+          </p>
+        </div>
+        <div class="validation-grid">
+          <article>
+            <h3>Baseline</h3>
+            <p>Stock C Lua build, Lua 5.5.1 version check, selected PUC tests, corpus listing, and classification passed.</p>
+          </article>
+          <article>
+            <h3>Build profiles</h3>
+            <p>Zig profile and feature-flag matrix accepted valid values and rejected invalid or disallowed combinations.</p>
+          </article>
+          <article>
+            <h3>Runtime</h3>
+            <p>Value, object, string, table, function, allocator, and <code>lua_Alloc</code> bridge tests passed.</p>
+          </article>
+          <article>
+            <h3>Execution</h3>
+            <p>VM Level 0/1, dynamic fallback, selected PUC, AOT eligibility, artifacts, fallback, and parity checks passed.</p>
+          </article>
+          <article>
+            <h3>Advanced semantics</h3>
+            <p>Advanced fallback plus debug and C API gates passed with unsupported and capability-denied paths accounted for.</p>
+          </article>
+          <article>
+            <h3>Cross-target</h3>
+            <p>Packaging, profile matrix, SBF spike report, integration validation, and validator discovery passed.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="commands" class="section commands">
+        <div class="section-heading">
+          <p class="eyebrow">Reproducibility</p>
+          <h2>Key local commands</h2>
+        </div>
+        <pre><code>python3 -m unittest discover -s tools/validation -p 'test_*.py'
+zig build test --summary all
+python3 tools/validation/baseline_oracle.py --repo /Users/davirian/dev/active/lua cross-area-integration-validation
+make -s -j12 MYCFLAGS='-std=c99 -DLUA_USE_MACOSX' MYLDFLAGS= MYLIBS=
+python3 -m http.server 8787 --directory site</code></pre>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <p>
+        Static HTML/CSS only. Ready for Cloudflare Pages default
+        <code>pages.dev</code> deployment from the <code>site</code> directory.
+      </p>
+    </footer>
+  </body>
+</html>

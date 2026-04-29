@@ -3,6 +3,11 @@
 *.so
 *.o
 *.a
+__pycache__/
+build/
+.zig-cache/
+zig-out/
+.wrangler/
 
 manual/manual.html
 
