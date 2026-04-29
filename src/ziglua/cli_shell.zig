@@ -19,10 +19,12 @@ const Command = enum {
 var stdout_buffer: [4096]u8 = undefined;
 var stderr_buffer: [4096]u8 = undefined;
 var stdin_buffer: [4096]u8 = undefined;
+var process_env: ?*std.process.Environ.Map = null;
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const allocator = init.arena.allocator();
+    process_env = init.environ_map;
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args.deinit();
 
@@ -53,10 +55,10 @@ pub fn main(init: std.process.Init) !void {
 
     switch (command) {
         .run => try runCommand(allocator, io, &args),
-        .build, .check => try registeredRouteCommand(io, command, &args),
-        .test_cmd => try testCommand(io, &args),
-        .profile => try profileCommand(io, &args),
-        .report => try reportCommand(io, &args),
+        .build, .check => try registeredRouteCommand(allocator, io, command, &args),
+        .test_cmd => try testCommand(allocator, io, &args),
+        .profile => try profileCommand(allocator, io, &args),
+        .report => try reportCommand(allocator, io, &args),
         .capability => try capabilityCommand(io, &args),
     }
 }
@@ -155,13 +157,21 @@ fn printCommandHelp(io: std.Io, command: Command) !void {
     try stdout_writer.interface.flush();
 }
 
-fn registeredRouteCommand(io: std.Io, command: Command, args: *std.process.Args.Iterator) !void {
+fn registeredRouteCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    command: Command,
+    args: *std.process.Args.Iterator,
+) !void {
     if (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try printCommandHelp(io, command);
             return;
         }
     }
+    const timestamp = timestampMillis(io);
+    const entry = try buildRouteEvidence(allocator, command, timestamp);
+    try writeEvidenceRecord(allocator, io, entry, commandName(command), timestamp);
     try printRegisteredRoute(io, command);
 }
 
@@ -182,9 +192,10 @@ fn printRegisteredRoute(io: std.Io, command: Command) !void {
     try stdout_writer.interface.flush();
 }
 
-fn testCommand(io: std.Io, args: *std.process.Args.Iterator) !void {
+fn testCommand(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     var suite: []const u8 = "cli-ledger";
     var target: []const u8 = profile_name;
+    var fixture_path: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try printCommandHelp(io, .test_cmd);
@@ -192,6 +203,8 @@ fn testCommand(io: std.Io, args: *std.process.Args.Iterator) !void {
         } else if (std.mem.eql(u8, arg, "--suite")) {
             suite = args.next() orelse return failMissingValue(io, "--suite");
             if (!isKnownSuite(suite)) return failUnknownValue(io, "suite", suite);
+        } else if (std.mem.eql(u8, arg, "--fixture")) {
+            fixture_path = args.next() orelse return failMissingValue(io, "--fixture");
         } else if (std.mem.eql(u8, arg, "--target") or std.mem.eql(u8, arg, "--profile")) {
             target = args.next() orelse return failMissingValue(io, arg);
             if (!isKnownProfile(target)) return failUnknownValue(io, "profile", target);
@@ -200,44 +213,143 @@ fn testCommand(io: std.Io, args: *std.process.Args.Iterator) !void {
         }
     }
 
+    const source = if (fixture_path) |path|
+        try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024))
+    else
+        "print(21 + 21)\n";
+    const resolved_fixture = if (fixture_path) |path|
+        try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator)
+    else
+        "builtin:cli-ledger-smoke";
+    const timestamp = timestampMillis(io);
+    const command_id = try std.fmt.allocPrint(allocator, "test-{d}", .{timestamp});
+
+    var state: []const u8 = "pass";
+    var implementation_mode: []const u8 = "native";
+    var diagnostic: []const u8 = "";
+    var exit_code: u8 = 0;
+    var validates: []const u8 = "\"VAL-CLI-011\", \"VAL-NATIVE-018\", \"VAL-NATIVE-019\", \"VAL-NATIVE-020\"";
+
+    if (std.mem.eql(u8, target, "wasm-full")) {
+        state = "unsupported";
+        implementation_mode = "not-executed";
+        diagnostic = "wasm-full compatibility execution is not available in the CLI ledger milestone";
+        validates = "\"VAL-CLI-012\"";
+    } else if (std.mem.eql(u8, target, "sbf-experimental")) {
+        state = "expected-skip";
+        implementation_mode = "metadata-only";
+        diagnostic = "sbf-experimental remains a constrained metadata/profile track";
+        validates = "\"VAL-CLI-012\"";
+    } else {
+        const result = try runWithNativeAdvancedFallback(allocator, io, source);
+        exit_code = result.exit_code;
+        diagnostic = result.stderr;
+        if (std.mem.eql(u8, result.stderr[0..@min(result.stderr.len, "lua-zig run: fallback-pass".len)], "lua-zig run: fallback-pass")) {
+            state = "fallback-pass";
+            implementation_mode = "stock-lua-fallback";
+        } else {
+            switch (result.state) {
+                .pass => {
+                    state = "pass";
+                    implementation_mode = "native";
+                },
+                .runtime_error => {
+                    state = "fail";
+                    implementation_mode = "native";
+                },
+                .unsupported => {
+                    state = "unsupported";
+                    implementation_mode = "none";
+                },
+            }
+        }
+    }
+
+    const entry = try buildTestEvidence(
+        allocator,
+        command_id,
+        suite,
+        target,
+        state,
+        implementation_mode,
+        diagnostic,
+        resolved_fixture,
+        source,
+        timestamp,
+        validates,
+    );
+    try writeEvidenceRecord(allocator, io, entry, "test", timestamp);
+
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
-    try stdout_writer.interface.print(
+    try printLedgerSummary(
+        &stdout_writer.interface,
+        "test",
+        suite,
+        target,
+        state,
+        entry,
+    );
+    try stdout_writer.interface.flush();
+    if (std.mem.eql(u8, state, "fail")) std.process.exit(if (exit_code == 0) 1 else exit_code);
+}
+
+fn printLedgerSummary(
+    writer: *std.Io.Writer,
+    command: []const u8,
+    suite: []const u8,
+    target: []const u8,
+    state: []const u8,
+    entry: []const u8,
+) !void {
+    const native_pass_count: u8 = if (std.mem.eql(u8, state, "pass") and hasJsonStringField(entry, "implementation_mode", "native")) 1 else 0;
+    const fallback_pass_count: u8 = if (std.mem.eql(u8, state, "fallback-pass")) 1 else 0;
+    const unsupported_count: u8 = if (std.mem.eql(u8, state, "unsupported")) 1 else 0;
+    const capability_denied_count: u8 = if (std.mem.eql(u8, state, "capability-denied")) 1 else 0;
+    const expected_skip_count: u8 = if (std.mem.eql(u8, state, "expected-skip")) 1 else 0;
+    const fail_count: u8 = if (std.mem.eql(u8, state, "fail")) 1 else 0;
+    const blocked_count: u8 = if (std.mem.eql(u8, state, "blocked")) 1 else 0;
+
+    try writer.print(
         \\{{
         \\  "accounting": {{
-        \\    "blocked_count": 0,
-        \\    "capability_denied_count": 0,
-        \\    "expected_skip_count": 0,
-        \\    "fail_count": 0,
-        \\    "fallback_pass_count": 0,
-        \\    "native_pass_count": 1,
-        \\    "unsupported_count": 0
+        \\    "blocked_count": {d},
+        \\    "capability_denied_count": {d},
+        \\    "expected_skip_count": {d},
+        \\    "fail_count": {d},
+        \\    "fallback_pass_count": {d},
+        \\    "native_pass_count": {d},
+        \\    "unsupported_count": {d}
         \\  }},
         \\  "cli": "lua-zig",
-        \\  "command": "test",
+        \\  "command": "{s}",
         \\  "ledger": [
-        \\    {{
-        \\      "id": "cli-ledger-command-surface",
-        \\      "implementation_mode": "native",
-        \\      "profile": "{s}",
-        \\      "provenance": "built-in deterministic CLI ledger smoke",
-        \\      "state": "pass",
-        \\      "suite": "{s}",
-        \\      "validates": ["VAL-CLI-011", "VAL-NATIVE-018", "VAL-NATIVE-019", "VAL-NATIVE-020"]
-        \\    }}
+        \\    {s}
         \\  ],
         \\  "selected_suite": "{s}",
-        \\  "state": "pass",
+        \\  "state": "{s}",
         \\  "states": ["pass", "fallback-pass", "unsupported", "capability-denied", "expected-skip", "fail", "blocked"],
         \\  "target_profile": "{s}"
         \\}}
         \\
     ,
-        .{ target, suite, suite, target },
+        .{
+            blocked_count,
+            capability_denied_count,
+            expected_skip_count,
+            fail_count,
+            fallback_pass_count,
+            native_pass_count,
+            unsupported_count,
+            command,
+            entry,
+            suite,
+            state,
+            target,
+        },
     );
-    try stdout_writer.interface.flush();
 }
 
-fn profileCommand(io: std.Io, args: *std.process.Args.Iterator) !void {
+fn profileCommand(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const maybe_action = args.next();
     if (maybe_action) |action| {
         if (std.mem.eql(u8, action, "--help") or std.mem.eql(u8, action, "-h")) {
@@ -245,7 +357,7 @@ fn profileCommand(io: std.Io, args: *std.process.Args.Iterator) !void {
             return;
         }
         if (std.mem.eql(u8, action, "metrics") or std.mem.eql(u8, action, "perf")) {
-            try printProfileMetrics(io);
+            try printProfileMetrics(allocator, io, args);
             return;
         }
         if (std.mem.eql(u8, action, "show")) {
@@ -267,7 +379,7 @@ fn profileCommand(io: std.Io, args: *std.process.Args.Iterator) !void {
     try printProfileList(io);
 }
 
-fn reportCommand(io: std.Io, args: *std.process.Args.Iterator) !void {
+fn reportCommand(allocator: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try printCommandHelp(io, .report);
@@ -281,38 +393,70 @@ fn reportCommand(io: std.Io, args: *std.process.Args.Iterator) !void {
         }
     }
 
+    const evidence_dir = try evidenceDir(allocator);
+    try std.Io.Dir.cwd().createDirPath(io, evidence_dir);
+    const resolved_evidence_dir = try std.Io.Dir.cwd().realPathFileAlloc(io, evidence_dir, allocator);
+    const aggregate = try loadEvidenceAggregate(allocator, io, evidence_dir);
+
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
-    try stdout_writer.interface.writeAll(
-        \\{
-        \\  "accounting": {
-        \\    "blocked_count": 0,
-        \\    "capability_denied_count": 1,
-        \\    "expected_skip_count": 1,
-        \\    "fail_count": 0,
-        \\    "fallback_pass_count": 1,
-        \\    "native_implementation_compatibility_count": 1,
-        \\    "native_pass_count": 1,
-        \\    "unsupported_count": 1
-        \\  },
-        \\  "build_id": "lua-zig-0.1.0-zig-0.16.0",
+    try stdout_writer.interface.print(
+        \\{{
+        \\  "accounting": {{
+        \\    "blocked_count": {d},
+        \\    "capability_denied_count": {d},
+        \\    "expected_skip_count": {d},
+        \\    "fail_count": {d},
+        \\    "fallback_pass_count": {d},
+        \\    "native_implementation_compatibility_count": {d},
+        \\    "native_pass_count": {d},
+        \\    "unsupported_count": {d}
+        \\  }},
+        \\  "build_id": "lua-zig-{s}-zig-{s}",
         \\  "cli": "lua-zig",
         \\  "command": "report",
-        \\  "compatibility_policy": {
+        \\  "compatibility_policy": {{
         \\    "fallback_counts_as_native": false,
         \\    "unsupported_counts_as_native": false
+        \\  }},
+        \\  "evidence": {{
+        \\    "record_count": {d},
+        \\    "source":
+    ,
+        .{
+            aggregate.blocked_count,
+            aggregate.capability_denied_count,
+            aggregate.expected_skip_count,
+            aggregate.fail_count,
+            aggregate.fallback_pass_count,
+            aggregate.native_pass_count,
+            aggregate.native_pass_count,
+            aggregate.unsupported_count,
+            cli_version,
+            builtin.zig_version_string,
+            aggregate.record_count,
+        },
+    );
+    try writeJsonString(&stdout_writer.interface, resolved_evidence_dir);
+    try stdout_writer.interface.writeAll(
+        \\
         \\  },
         \\  "ledger": [
-        \\    {"id": "cli-help-version", "profile": "native-full", "state": "pass", "implementation_mode": "native", "provenance": "zig build installed lua-zig help/version surface"},
-        \\    {"id": "run-advanced-fallback", "profile": "native-full", "state": "fallback-pass", "implementation_mode": "stock-lua-fallback", "fallback_reason": "advanced dynamic semantics", "provenance": "lua-zig run emits fallback-pass marker on stderr"},
-        \\    {"id": "wasm-host-process", "profile": "wasm-full", "state": "capability-denied", "implementation_mode": "host-capability-contract", "reason": "process spawning unavailable in WASM host profile", "provenance": "profile capability matrix"},
-        \\    {"id": "wasm-dynamic-c-loading", "profile": "wasm-full", "state": "unsupported", "implementation_mode": "none", "reason": "dynamic C loading is not available in current WASM contract", "provenance": "profile capability matrix"},
-        \\    {"id": "sbf-deployable-artifact", "profile": "sbf-experimental", "state": "expected-skip", "implementation_mode": "metadata-only", "reason": "SBF remains experimental spike scope", "provenance": "SBF profile contract"}
+        \\
+    );
+    for (aggregate.records, 0..) |record, i| {
+        if (i != 0) try stdout_writer.interface.writeAll(",\n");
+        try stdout_writer.interface.print("    {s}", .{record});
+    }
+    try stdout_writer.interface.print(
+        \\
         \\  ],
         \\  "ledger_format_version": 1,
-        \\  "state": "pass",
+        \\  "state": "{s}",
         \\  "states": ["pass", "fallback-pass", "unsupported", "capability-denied", "expected-skip", "fail", "blocked"]
-        \\}
+        \\}}
         \\
+    ,
+        .{if (aggregate.fail_count == 0) "pass" else "fail"},
     );
     try stdout_writer.interface.flush();
 }
@@ -491,24 +635,524 @@ fn printProfileShow(io: std.Io, profile: []const u8) !void {
     try stdout_writer.interface.flush();
 }
 
-fn printProfileMetrics(io: std.Io) !void {
+fn printProfileMetrics(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    args: *std.process.Args.Iterator,
+) !void {
+    var workload_path: ?[]const u8 = null;
+    var workload_args: std.ArrayList([]const u8) = .empty;
+    var after_delimiter = false;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--format")) {
+            const format = args.next() orelse return failMissingValue(io, "--format");
+            if (!std.mem.eql(u8, format, "json")) return failUnknownValue(io, "format", format);
+        } else if (std.mem.eql(u8, arg, "--")) {
+            if (workload_path == null) return failMissingValue(io, "workload");
+            after_delimiter = true;
+        } else if (workload_path == null) {
+            if (std.mem.startsWith(u8, arg, "-")) return failUnknownValue(io, "profile-option", arg);
+            workload_path = arg;
+        } else if (after_delimiter) {
+            try workload_args.append(allocator, arg);
+        } else {
+            return failUnknownValue(io, "trailing-args", arg);
+        }
+    }
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.append(allocator, "./lua");
+    var workload_display: []const u8 = "inline:profile-smoke";
+    var workload_source: []const u8 = "print(42)\n";
+    if (workload_path) |path| {
+        const resolved = try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator);
+        workload_display = resolved;
+        workload_source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
+        try argv.append(allocator, path);
+    } else {
+        try argv.append(allocator, "-e");
+        try argv.append(allocator, workload_source);
+    }
+    for (workload_args.items) |arg| try argv.append(allocator, arg);
+
+    const started = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv.items,
+        .stdout_limit = .unlimited,
+        .stderr_limit = .unlimited,
+    });
+    const ended = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    const duration_ms: i128 = @intCast(ended - started);
+    const timestamp = timestampMillis(io);
+    const exit_code = termExitCode(result.term);
+    const state: []const u8 = if (exit_code == 0) "pass" else "fail";
+    const command_id = try std.fmt.allocPrint(allocator, "profile-{d}", .{timestamp});
+
+    const entry = try buildProfileEvidence(
+        allocator,
+        command_id,
+        state,
+        workload_display,
+        workload_source,
+        workload_args.items,
+        result.stdout,
+        result.stderr,
+        exit_code,
+        duration_ms,
+        timestamp,
+    );
+    try writeEvidenceRecord(allocator, io, entry, "profile", timestamp);
+
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
-    try stdout_writer.interface.writeAll(
-        \\{
+    try stdout_writer.interface.print(
+        \\{{
         \\  "cli": "lua-zig",
         \\  "command": "profile",
-        \\  "metrics": {
+        \\  "command_id":
+    ,
+        .{},
+    );
+    try writeJsonString(&stdout_writer.interface, command_id);
+    try stdout_writer.interface.print(
+        \\,
+        \\  "metrics": {{
         \\    "allocation_bytes": 0,
-        \\    "timing_ms": 0
-        \\  },
+        \\    "timing_ms": {d}
+        \\  }},
         \\  "mode": "runtime-metrics",
+        \\  "program": {{
+        \\    "exit_code": {d},
+        \\    "stderr":
+    ,
+        .{ duration_ms, exit_code },
+    );
+    try writeJsonString(&stdout_writer.interface, result.stderr);
+    try stdout_writer.interface.writeAll(
+        \\,
+        \\    "stdout":
+    );
+    try writeJsonString(&stdout_writer.interface, result.stdout);
+    try stdout_writer.interface.writeAll(
+        \\
+        \\  },
         \\  "profiler_output": "json",
         \\  "program_output": "separate-stdout-stderr",
-        \\  "state": "pass"
+        \\  "state":
+    );
+    try writeJsonString(&stdout_writer.interface, state);
+    try stdout_writer.interface.writeAll(
+        \\,
+        \\  "timestamp_unix_ms":
+    );
+    try stdout_writer.interface.print("{d}", .{timestamp});
+    try stdout_writer.interface.writeAll(
+        \\,
+        \\  "workload": {
+        \\    "args": [
+    );
+    for (workload_args.items, 0..) |arg, i| {
+        if (i != 0) try stdout_writer.interface.writeAll(", ");
+        try writeJsonString(&stdout_writer.interface, arg);
+    }
+    try stdout_writer.interface.writeAll(
+        \\],
+        \\    "path":
+    );
+    try writeJsonString(&stdout_writer.interface, workload_display);
+    try stdout_writer.interface.writeAll(
+        \\,
+        \\    "source_bytes":
+    );
+    try stdout_writer.interface.print("{d}", .{workload_source.len});
+    try stdout_writer.interface.writeAll(
+        \\,
+        \\    "source_sha256":
+    );
+    const digest = try sourceDigestHex(allocator, workload_source);
+    try writeJsonString(&stdout_writer.interface, digest);
+    try stdout_writer.interface.writeAll(
+        \\
+        \\  }
         \\}
         \\
     );
     try stdout_writer.interface.flush();
+    if (exit_code != 0) std.process.exit(exit_code);
+}
+
+const EvidenceAggregate = struct {
+    records: []const []const u8,
+    record_count: usize,
+    native_pass_count: usize,
+    fallback_pass_count: usize,
+    unsupported_count: usize,
+    capability_denied_count: usize,
+    expected_skip_count: usize,
+    fail_count: usize,
+    blocked_count: usize,
+};
+
+fn buildRouteEvidence(
+    allocator: std.mem.Allocator,
+    command: Command,
+    timestamp: i128,
+) ![]const u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    try out.writer.print(
+        \\{{
+        \\  "cli": "lua-zig",
+        \\  "command": "{s}",
+        \\  "command_id": "{s}-{d}",
+        \\  "id": "{s}-registered-route",
+        \\  "implementation_mode": "route-only",
+        \\  "profile": "{s}",
+        \\  "provenance": "registered CLI route evidence captured at command execution time",
+        \\  "state": "blocked",
+        \\  "timestamp_unix_ms": {d}
+        \\}}
+    ,
+        .{ commandName(command), commandName(command), timestamp, commandName(command), profile_name, timestamp },
+    );
+    return try out.toOwnedSlice();
+}
+
+fn buildTestEvidence(
+    allocator: std.mem.Allocator,
+    command_id: []const u8,
+    suite: []const u8,
+    target: []const u8,
+    state: []const u8,
+    implementation_mode: []const u8,
+    diagnostic: []const u8,
+    fixture_path: []const u8,
+    source: []const u8,
+    timestamp: i128,
+    validates: []const u8,
+) ![]const u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    try out.writer.writeAll(
+        \\{
+        \\  "cli": "lua-zig",
+        \\  "command": "test",
+        \\  "command_id":
+    );
+    try writeJsonString(&out.writer, command_id);
+    try out.writer.writeAll(
+        \\,
+        \\  "diagnostic":
+    );
+    try writeJsonString(&out.writer, diagnostic);
+    try out.writer.writeAll(
+        \\,
+        \\  "fixture": {
+        \\    "path":
+    );
+    try writeJsonString(&out.writer, fixture_path);
+    try out.writer.print(
+        \\,
+        \\    "source_bytes": {d},
+        \\    "source_sha256":
+    ,
+        .{source.len},
+    );
+    const digest = try sourceDigestHex(allocator, source);
+    try writeJsonString(&out.writer, digest);
+    try out.writer.writeAll(
+        \\
+        \\  },
+        \\  "id": "compatibility-fixture",
+        \\  "implementation_mode":
+    );
+    try writeJsonString(&out.writer, implementation_mode);
+    try out.writer.writeAll(
+        \\,
+        \\  "profile":
+    );
+    try writeJsonString(&out.writer, target);
+    try out.writer.writeAll(
+        \\,
+        \\  "provenance": "lua-zig test executed fixture or built-in suite source during this invocation",
+        \\  "state":
+    );
+    try writeJsonString(&out.writer, state);
+    try out.writer.writeAll(
+        \\,
+        \\  "suite":
+    );
+    try writeJsonString(&out.writer, suite);
+    try out.writer.print(
+        \\,
+        \\  "timestamp_unix_ms": {d},
+        \\  "validates": [{s}]
+        \\}}
+    ,
+        .{ timestamp, validates },
+    );
+    return try out.toOwnedSlice();
+}
+
+fn buildProfileEvidence(
+    allocator: std.mem.Allocator,
+    command_id: []const u8,
+    state: []const u8,
+    workload_path: []const u8,
+    workload_source: []const u8,
+    workload_args: []const []const u8,
+    program_stdout: []const u8,
+    program_stderr: []const u8,
+    exit_code: u8,
+    duration_ms: i128,
+    timestamp: i128,
+) ![]const u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    try out.writer.writeAll(
+        \\{
+        \\  "cli": "lua-zig",
+        \\  "command": "profile",
+        \\  "command_id":
+    );
+    try writeJsonString(&out.writer, command_id);
+    try out.writer.print(
+        \\,
+        \\  "id": "runtime-profile-workload",
+        \\  "implementation_mode": "stock-lua-workload-runner",
+        \\  "metrics": {{
+        \\    "allocation_bytes": 0,
+        \\    "timing_ms": {d}
+        \\  }},
+        \\  "profile": "{s}",
+        \\  "program": {{
+        \\    "exit_code": {d},
+        \\    "stderr":
+    ,
+        .{ duration_ms, profile_name, exit_code },
+    );
+    try writeJsonString(&out.writer, program_stderr);
+    try out.writer.writeAll(
+        \\,
+        \\    "stdout":
+    );
+    try writeJsonString(&out.writer, program_stdout);
+    try out.writer.writeAll(
+        \\
+        \\  },
+        \\  "provenance": "lua-zig profile metrics executed the workload and captured stdout/stderr separately from profiler JSON",
+        \\  "state":
+    );
+    try writeJsonString(&out.writer, state);
+    try out.writer.print(
+        \\,
+        \\  "timestamp_unix_ms": {d},
+        \\  "workload": {{
+        \\    "args": [
+    ,
+        .{timestamp},
+    );
+    for (workload_args, 0..) |arg, i| {
+        if (i != 0) try out.writer.writeAll(", ");
+        try writeJsonString(&out.writer, arg);
+    }
+    try out.writer.writeAll(
+        \\],
+        \\    "path":
+    );
+    try writeJsonString(&out.writer, workload_path);
+    try out.writer.print(
+        \\,
+        \\    "source_bytes": {d},
+        \\    "source_sha256":
+    ,
+        .{workload_source.len},
+    );
+    const digest = try sourceDigestHex(allocator, workload_source);
+    try writeJsonString(&out.writer, digest);
+    try out.writer.writeAll(
+        \\
+        \\  }
+        \\}
+    );
+    return try out.toOwnedSlice();
+}
+
+fn buildRunEvidence(
+    allocator: std.mem.Allocator,
+    command_id: []const u8,
+    state: []const u8,
+    implementation_mode: []const u8,
+    source: []const u8,
+    program_stdout: []const u8,
+    program_stderr: []const u8,
+    exit_code: u8,
+    timestamp: i128,
+) ![]const u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    try out.writer.writeAll(
+        \\{
+        \\  "cli": "lua-zig",
+        \\  "command": "run",
+        \\  "command_id":
+    );
+    try writeJsonString(&out.writer, command_id);
+    try out.writer.writeAll(
+        \\,
+        \\  "id": "stdin-run",
+        \\  "implementation_mode":
+    );
+    try writeJsonString(&out.writer, implementation_mode);
+    try out.writer.print(
+        \\,
+        \\  "profile": "{s}",
+        \\  "program": {{
+        \\    "exit_code": {d},
+        \\    "stderr":
+    ,
+        .{ profile_name, exit_code },
+    );
+    try writeJsonString(&out.writer, program_stderr);
+    try out.writer.writeAll(
+        \\,
+        \\    "stdout":
+    );
+    try writeJsonString(&out.writer, program_stdout);
+    try out.writer.writeAll(
+        \\
+        \\  },
+        \\  "provenance": "lua-zig run executed stdin source through the native VM route or explicit fallback path",
+        \\  "state":
+    );
+    try writeJsonString(&out.writer, state);
+    try out.writer.print(
+        \\,
+        \\  "timestamp_unix_ms": {d},
+        \\  "fixture": {{
+        \\    "path": "stdin",
+        \\    "source_bytes": {d},
+        \\    "source_sha256":
+    ,
+        .{ timestamp, source.len },
+    );
+    const digest = try sourceDigestHex(allocator, source);
+    try writeJsonString(&out.writer, digest);
+    try out.writer.writeAll(
+        \\
+        \\  }
+        \\}
+    );
+    return try out.toOwnedSlice();
+}
+
+fn evidenceDir(allocator: std.mem.Allocator) ![]const u8 {
+    if (process_env) |env| {
+        if (env.get("LUA_ZIG_EVIDENCE_DIR")) |value| return try allocator.dupe(u8, value);
+    }
+    return ".zig-cache/lua-zig-evidence";
+}
+
+fn writeEvidenceRecord(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    entry: []const u8,
+    command: []const u8,
+    timestamp: i128,
+) !void {
+    const dir = try evidenceDir(allocator);
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    const filename = try std.fmt.allocPrint(allocator, "{s}-{d}.json", .{ command, timestamp });
+    const path = try std.fs.path.join(allocator, &.{ dir, filename });
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, entry, 0);
+    try file.writePositionalAll(io, "\n", entry.len);
+}
+
+fn loadEvidenceAggregate(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8) !EvidenceAggregate {
+    var records: std.ArrayList([]const u8) = .empty;
+    var aggregate = EvidenceAggregate{
+        .records = &.{},
+        .record_count = 0,
+        .native_pass_count = 0,
+        .fallback_pass_count = 0,
+        .unsupported_count = 0,
+        .capability_denied_count = 0,
+        .expected_skip_count = 0,
+        .fail_count = 0,
+        .blocked_count = 0,
+    };
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return aggregate,
+        else => return err,
+    };
+    defer dir.close(io);
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const content = try dir.readFileAlloc(io, entry.name, allocator, .limited(1024 * 1024));
+        try records.append(allocator, std.mem.trim(u8, content, " \n\r\t"));
+        aggregate.record_count += 1;
+        if (hasState(content, "pass") and hasJsonStringField(content, "implementation_mode", "native")) {
+            aggregate.native_pass_count += 1;
+        } else if (hasState(content, "fallback-pass")) {
+            aggregate.fallback_pass_count += 1;
+        } else if (hasState(content, "unsupported")) {
+            aggregate.unsupported_count += 1;
+        } else if (hasState(content, "capability-denied")) {
+            aggregate.capability_denied_count += 1;
+        } else if (hasState(content, "expected-skip")) {
+            aggregate.expected_skip_count += 1;
+        } else if (hasState(content, "fail")) {
+            aggregate.fail_count += 1;
+        } else if (hasState(content, "blocked")) {
+            aggregate.blocked_count += 1;
+        }
+    }
+    aggregate.records = try records.toOwnedSlice(allocator);
+    return aggregate;
+}
+
+fn hasState(content: []const u8, state: []const u8) bool {
+    return hasJsonStringField(content, "state", state);
+}
+
+fn hasJsonStringField(content: []const u8, field: []const u8, value: []const u8) bool {
+    var spaced_buf: [96]u8 = undefined;
+    const spaced = std.fmt.bufPrint(&spaced_buf, "\"{s}\": \"{s}\"", .{ field, value }) catch return false;
+    if (std.mem.indexOf(u8, content, spaced) != null) return true;
+    var compact_buf: [96]u8 = undefined;
+    const compact = std.fmt.bufPrint(&compact_buf, "\"{s}\":\"{s}\"", .{ field, value }) catch return false;
+    return std.mem.indexOf(u8, content, compact) != null;
+}
+
+fn timestampMillis(io: std.Io) i128 {
+    return @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds());
+}
+
+fn sourceDigestHex(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
+    const hex_array = std.fmt.bytesToHex(digest, .lower);
+    return try allocator.dupe(u8, &hex_array);
+}
+
+fn writeJsonString(writer: *std.Io.Writer, text: []const u8) !void {
+    try writer.writeByte('"');
+    for (text) |byte| {
+        if (byte == '"') {
+            try writer.writeAll("\\\"");
+        } else if (byte == '\\') {
+            try writer.writeAll("\\\\");
+        } else if (byte == '\n') {
+            try writer.writeAll("\\n");
+        } else if (byte == '\r') {
+            try writer.writeAll("\\r");
+        } else if (byte == '\t') {
+            try writer.writeAll("\\t");
+        } else if (byte < 0x20) {
+            try writer.print("\\u{x:0>4}", .{byte});
+        } else {
+            try writer.writeByte(byte);
+        }
+    }
+    try writer.writeByte('"');
 }
 
 fn profileTarget(profile: []const u8) []const u8 {
@@ -662,6 +1306,33 @@ fn runCommand(
     var stdin_reader = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
     const source = try stdin_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
     const result = try runWithNativeAdvancedFallback(allocator, io, source);
+    const timestamp = timestampMillis(io);
+    const state: []const u8 = if (std.mem.eql(u8, result.stderr[0..@min(result.stderr.len, "lua-zig run: fallback-pass".len)], "lua-zig run: fallback-pass"))
+        "fallback-pass"
+    else switch (result.state) {
+        .pass => "pass",
+        .runtime_error => "fail",
+        .unsupported => "unsupported",
+    };
+    const implementation_mode: []const u8 = if (std.mem.eql(u8, state, "fallback-pass"))
+        "stock-lua-fallback"
+    else if (std.mem.eql(u8, state, "unsupported"))
+        "none"
+    else
+        "native";
+    const command_id = try std.fmt.allocPrint(allocator, "run-{d}", .{timestamp});
+    const entry = try buildRunEvidence(
+        allocator,
+        command_id,
+        state,
+        implementation_mode,
+        source,
+        result.stdout,
+        result.stderr,
+        result.exit_code,
+        timestamp,
+    );
+    try writeEvidenceRecord(allocator, io, entry, "run", timestamp);
 
     var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
     try stdout_writer.interface.writeAll(result.stdout);
