@@ -1611,6 +1611,71 @@ class BaselineOracleTests(unittest.TestCase):
         self.assertTrue(any("cannot be satisfied" in error for error in errors))
         self.assertTrue(any("no_host_lua" in error for error in errors))
 
+    def test_native_protected_coroutine_validator_records_required_val_adv2_012_tags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            fake_results = [result(baseline_oracle.ZIG_VM_CANDIDATE_REFRESH_COMMAND, repo)]
+            for _case in baseline_oracle.NATIVE_PROTECTED_COROUTINE_CASES:
+                fake_results.append(result(["./lua", "-"], repo))
+                fake_results.append(result(["./zig-out/bin/lua-zig", "run", "-"], repo))
+            fake = FakeRunner(fake_results)
+            oracle = baseline_oracle.BaselineOracle(repo, repo / "build", runner=fake)
+
+            summary = oracle.run_native_protected_coroutines(["./zig-out/bin/lua-zig", "run", "-"])
+
+            self.assertEqual(summary["state"], "pass")
+            self.assertEqual(summary["coverage_error_count"], 0)
+            coverage = summary["native_assertion_coverage"]["VAL-ADV2-012"]
+            self.assertGreaterEqual(
+                coverage["case_count"],
+                baseline_oracle.NATIVE_PROTECTED_COROUTINE_COVERAGE_REQUIREMENTS["VAL-ADV2-012"]["min_cases"],
+            )
+            for tag in baseline_oracle.NATIVE_PROTECTED_COROUTINE_COVERAGE_REQUIREMENTS["VAL-ADV2-012"]["required_tags"]:
+                self.assertIn(tag, coverage["tags"])
+            self.assertEqual(set(coverage["puc_files"]), {"coroutine.lua", "errors.lua"})
+            candidate_calls = [call for call in fake.calls if call["command"] == ["./zig-out/bin/lua-zig", "run", "-"]]
+            self.assertEqual(len(candidate_calls), len(baseline_oracle.NATIVE_PROTECTED_COROUTINE_CASES))
+            self.assertTrue(all(call["env_overrides"] == {"LUA_ZIG_RUN_NO_HOST_LUA": "1"} for call in candidate_calls))
+
+    def test_native_protected_coroutine_coverage_rejects_missing_or_non_native_evidence(self):
+        entries = []
+        for case in baseline_oracle.NATIVE_PROTECTED_COROUTINE_CASES:
+            tags = [
+                tag
+                for tag in case["coverage_tags"]
+                if tag != "VAL-ADV2-012:running"
+            ]
+            is_wrap_close = case["name"] == "coroutine-wrap-close-error"
+            entries.append(
+                {
+                    "name": case["name"],
+                    "puc_file": case["puc_file"],
+                    "validates": case["validates"],
+                    "coverage_tags": tags,
+                    "state": "pass",
+                    "implementation_mode": "stock-lua-fallback" if is_wrap_close else "native",
+                    "no_host_lua": False if is_wrap_close else True,
+                    "fallback_observed": True if is_wrap_close else False,
+                    "unsupported_observed": False,
+                }
+            )
+
+        coverage, errors = baseline_oracle.validate_native_protected_coroutine_coverage(entries)
+
+        self.assertNotIn("VAL-ADV2-012:running", coverage["VAL-ADV2-012"]["tags"])
+        self.assertNotIn("VAL-ADV2-012:wrap", coverage["VAL-ADV2-012"]["tags"])
+        self.assertTrue(any("without native/no_host_lua evidence" in error for error in errors), errors)
+        self.assertTrue(any("observed fallback=True" in error for error in errors), errors)
+        self.assertTrue(
+            any(
+                "VAL-ADV2-012 missing required native coverage tags" in error
+                and "VAL-ADV2-012:running" in error
+                and "VAL-ADV2-012:wrap" in error
+                for error in errors
+            ),
+            errors,
+        )
+
     def test_native_core_coverage_requires_multiple_native_no_host_fixtures(self):
         entries = []
         for case in baseline_oracle.NATIVE_CORE_LANGUAGE_CASES:

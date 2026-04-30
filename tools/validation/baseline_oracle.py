@@ -202,6 +202,22 @@ NATIVE_CORE_COVERAGE_REQUIREMENTS = {
         ],
     },
 }
+NATIVE_PROTECTED_COROUTINE_COVERAGE_REQUIREMENTS = {
+    "VAL-ADV2-012": {
+        "min_cases": 8,
+        "required_puc_files": ["coroutine.lua", "errors.lua"],
+        "required_tags": [
+            "VAL-ADV2-012:resume",
+            "VAL-ADV2-012:yield",
+            "VAL-ADV2-012:status",
+            "VAL-ADV2-012:close",
+            "VAL-ADV2-012:wrap",
+            "VAL-ADV2-012:running",
+            "VAL-ADV2-012:protected-frame",
+            "VAL-ADV2-012:error-value",
+        ],
+    },
+}
 NATIVE_CORE_LANGUAGE_CASES = [
     {
         "name": "literals-core",
@@ -1007,7 +1023,15 @@ NATIVE_PROTECTED_COROUTINE_CASES = [
         "puc_file": "errors.lua",
         "description": "pcall/xpcall/error propagation preserves Lua status booleans, error values, and handler results without host fallback",
         "validates": ["VAL-ADV2-012"],
-        "coverage_tags": ["protected-error", "pcall", "xpcall", "error", "error-value-preservation", "error-level"],
+        "coverage_tags": [
+            "protected-error",
+            "pcall",
+            "xpcall",
+            "error",
+            "error-value-preservation",
+            "error-level",
+            "VAL-ADV2-012:error-value",
+        ],
         "source": 'local ok, err = pcall(function() error("boom", 0) end)\nprint(ok, err)\nlocal token = {}\nlocal ok_table, table_err = pcall(function() error(token, 0) end)\nprint(ok_table, table_err == token, type(table_err))\nlocal ok2, msg = xpcall(function() error("bad", 0) end, function(e) return "handled:" .. e end)\nprint(ok2, msg)\nlocal handled = {}\nlocal ok3, got = xpcall(function() error(token, 0) end, function(e) print("handler", e == token, type(e)) return handled end)\nprint(ok3, got == handled, type(got))\nlocal first, second = {}, {}\nlocal count = 0\nlocal ok4, got4 = xpcall(function() error(first, 0) end, function(e)\n  count = count + 1\n  print("handler-error", count, e == first, e == second, type(e))\n  if count == 1 then error(second, 0) end\n  return e\nend)\nprint(ok4, got4 == first, got4 == second, type(got4), count)\nlocal function leveled() error("level boom") end\nlocal ok5, msg5 = pcall(leveled)\nprint(ok5, msg5)\nlocal ok6, msg6 = pcall(function() error("level zero", 0) end)\nprint(ok6, msg6)\n',
     },
     {
@@ -1015,8 +1039,33 @@ NATIVE_PROTECTED_COROUTINE_CASES = [
         "puc_file": "coroutine.lua",
         "description": "coroutine.create/resume/yield/status transfers resume and yield values and reaches dead status after return",
         "validates": ["VAL-ADV2-012"],
-        "coverage_tags": ["coroutine.lua", "create", "resume", "yield", "status", "vararg-transfer"],
+        "coverage_tags": [
+            "coroutine.lua",
+            "create",
+            "resume",
+            "yield",
+            "status",
+            "vararg-transfer",
+            "VAL-ADV2-012:resume",
+            "VAL-ADV2-012:yield",
+            "VAL-ADV2-012:status",
+        ],
         "source": 'local co = coroutine.create(function(a)\n  local b = coroutine.yield(a + 1)\n  return b + 2\nend)\nprint(coroutine.resume(co, 4))\nprint(coroutine.resume(co, 7))\nprint(coroutine.status(co))\n',
+    },
+    {
+        "name": "coroutine-running-status-puc",
+        "puc_file": "coroutine.lua",
+        "description": "coroutine.running and coroutine.status report the active thread as running while the created coroutine body executes",
+        "validates": ["VAL-ADV2-012"],
+        "coverage_tags": [
+            "coroutine.lua",
+            "running",
+            "status",
+            "isyieldable",
+            "VAL-ADV2-012:running",
+            "VAL-ADV2-012:status",
+        ],
+        "source": 'local co\nco = coroutine.create(function()\n  local running, ismain = coroutine.running()\n  return running == co, ismain, coroutine.status(co), coroutine.isyieldable()\nend)\nprint(coroutine.resume(co))\nprint(coroutine.status(co))\n',
     },
     {
         "name": "coroutine-nested-frame-assignment-return",
@@ -1039,7 +1088,16 @@ NATIVE_PROTECTED_COROUTINE_CASES = [
         "puc_file": "coroutine.lua",
         "description": "pcall frames remain suspended across yield and resume with the protected-call success/value prefix restored in order",
         "validates": ["VAL-ADV2-012"],
-        "coverage_tags": ["coroutine.lua", "pcall", "protected-frame", "yield", "resume-values"],
+        "coverage_tags": [
+            "coroutine.lua",
+            "pcall",
+            "protected-frame",
+            "yield",
+            "resume-values",
+            "VAL-ADV2-012:protected-frame",
+            "VAL-ADV2-012:yield",
+            "VAL-ADV2-012:resume",
+        ],
         "source": 'local co = coroutine.create(function()\n  local ok, val = pcall(function()\n    local a = coroutine.yield("pause")\n    return a .. "!"\n  end)\n  return ok, val\nend)\nprint(coroutine.resume(co))\nprint(coroutine.resume(co, "go"))\n',
     },
     {
@@ -1047,7 +1105,14 @@ NATIVE_PROTECTED_COROUTINE_CASES = [
         "puc_file": "coroutine.lua",
         "description": "coroutine.wrap, coroutine.close, and resume error propagation expose Lua-compatible status and values",
         "validates": ["VAL-ADV2-012"],
-        "coverage_tags": ["coroutine.lua", "wrap", "close", "error-propagation"],
+        "coverage_tags": [
+            "coroutine.lua",
+            "wrap",
+            "close",
+            "error-propagation",
+            "VAL-ADV2-012:wrap",
+            "VAL-ADV2-012:close",
+        ],
         "source": 'local f = coroutine.wrap(function(a) return a + 1 end)\nprint(f(4))\nlocal co = coroutine.create(function() error("co boom", 0) end)\nprint(coroutine.resume(co))\nprint(coroutine.status(co))\nlocal closed = coroutine.create(function() return 1 end)\nprint(coroutine.close(closed))\nprint(coroutine.status(closed))\n',
     },
     {
@@ -1055,7 +1120,16 @@ NATIVE_PROTECTED_COROUTINE_CASES = [
         "puc_file": "coroutine.lua",
         "description": "coroutine.close validates main/normal/dead/suspended states and preserves close-time error propagation",
         "validates": ["VAL-ADV2-012"],
-        "coverage_tags": ["coroutine.lua", "close", "main-thread", "normal", "dead", "suspended", "error-propagation"],
+        "coverage_tags": [
+            "coroutine.lua",
+            "close",
+            "main-thread",
+            "normal",
+            "dead",
+            "suspended",
+            "error-propagation",
+            "VAL-ADV2-012:close",
+        ],
         "source": 'local ok, err = pcall(coroutine.close)\nprint("main", ok, err)\nlocal fresh = coroutine.create(function() return 1 end)\nprint("fresh", coroutine.close(fresh), coroutine.status(fresh))\nprint("fresh-again", coroutine.close(fresh))\nlocal failed = coroutine.create(function() error(100, 0) end)\nprint("failed-resume", coroutine.resume(failed))\nprint("failed-close", coroutine.close(failed))\nprint("failed-again", coroutine.close(failed))\nlocal outer\nouter = coroutine.create(function()\n  local inner = coroutine.create(function()\n    local close_ok, close_err = pcall(coroutine.close, outer)\n    return coroutine.status(outer), close_ok, close_err\n  end)\n  return coroutine.resume(inner)\nend)\nprint("normal", coroutine.resume(outer))\nprint("outer-final", coroutine.status(outer))\n',
     },
 ]
@@ -2093,6 +2167,10 @@ class BaselineOracle:
                 "unsupported_count": 0,
                 "validated_assertions": [],
                 "missing_assertions": ["VAL-ADV2-012"],
+                "native_assertion_coverage": native_protected_coroutine_assertion_coverage([]),
+                "coverage_requirements": NATIVE_PROTECTED_COROUTINE_COVERAGE_REQUIREMENTS,
+                "coverage_errors": ["candidate refresh failed before VAL-ADV2-012 coverage could be evaluated"],
+                "coverage_error_count": 1,
                 "classification": "Native protected-error/coroutine validation was not run because the lua-zig candidate failed to refresh.",
             }
             self.write_json("native-protected-coroutines/summary.json", summary)
@@ -2159,6 +2237,9 @@ class BaselineOracle:
         missing_ids = sorted({"VAL-ADV2-012"}.difference(validated_ids))
         if missing_ids:
             state = "fail"
+        assertion_coverage, coverage_errors = validate_native_protected_coroutine_coverage(entries)
+        if coverage_errors:
+            state = "fail"
         staged_files = sorted({str(case["puc_file"]) for case in NATIVE_PROTECTED_COROUTINE_CASES})
         summary = {
             "state": state,
@@ -2178,10 +2259,14 @@ class BaselineOracle:
             "unsupported_count": unsupported_count,
             "validated_assertions": sorted(validated_ids),
             "missing_assertions": missing_ids,
+            "native_assertion_coverage": assertion_coverage,
+            "coverage_requirements": NATIVE_PROTECTED_COROUTINE_COVERAGE_REQUIREMENTS,
+            "coverage_errors": coverage_errors,
+            "coverage_error_count": len(coverage_errors),
             "staged_puc_files": staged_files,
             "required_puc_files": ["coroutine.lua", "errors.lua"],
             "compared_fields": ["stdout", "stderr", "exit_code"],
-            "classification": "M7 protected-error and coroutine fixtures, including coroutine.lua-derived create/resume/yield/status/wrap/close/error cases, execute through lua-zig run with LUA_ZIG_RUN_NO_HOST_LUA=1; fallback and unsupported markers fail VAL-ADV2-012 accounting.",
+            "classification": "M7 protected-error and coroutine.lua-derived staged fixtures map resume/yield/status/close/wrap/running/protected-frame/error-value behavior tags to VAL-ADV2-012 and execute through lua-zig run with LUA_ZIG_RUN_NO_HOST_LUA=1; fallback, unsupported, and host-Lua-backed evidence fail coverage accounting.",
         }
         self.write_json("native-protected-coroutines/summary.json", summary)
         return summary
@@ -4573,6 +4658,102 @@ def validate_native_core_coverage(entries: Iterable[dict[str, object]]) -> tuple
 
     coverage = native_core_assertion_coverage(materialized)
     for assertion, requirement in NATIVE_CORE_COVERAGE_REQUIREMENTS.items():
+        actual = coverage[assertion]
+        min_cases = int(requirement["min_cases"])
+        if int(actual["case_count"]) < min_cases:
+            errors.append(f"{assertion} requires at least {min_cases} native/no-host cases; observed {actual['case_count']}")
+        actual_tags = set(actual["tags"])
+        missing_tags = sorted(set(requirement["required_tags"]) - actual_tags)
+        if missing_tags:
+            errors.append(f"{assertion} missing required native coverage tags: {missing_tags}")
+        actual_puc = set(actual["puc_files"])
+        missing_puc = sorted(set(requirement["required_puc_files"]) - actual_puc)
+        if missing_puc:
+            errors.append(f"{assertion} missing required staged PUC file evidence: {missing_puc}")
+    return coverage, errors
+
+
+def native_protected_coroutine_assertion_coverage(entries: Iterable[dict[str, object]]) -> dict[str, dict[str, object]]:
+    coverage = {
+        assertion: {"cases": [], "puc_files": [], "tags": []}
+        for assertion in NATIVE_PROTECTED_COROUTINE_COVERAGE_REQUIREMENTS
+    }
+    case_sets: dict[str, set[str]] = {assertion: set() for assertion in NATIVE_PROTECTED_COROUTINE_COVERAGE_REQUIREMENTS}
+    puc_sets: dict[str, set[str]] = {assertion: set() for assertion in NATIVE_PROTECTED_COROUTINE_COVERAGE_REQUIREMENTS}
+    tag_sets: dict[str, set[str]] = {assertion: set() for assertion in NATIVE_PROTECTED_COROUTINE_COVERAGE_REQUIREMENTS}
+
+    for entry in entries:
+        validates = entry.get("validates", [])
+        if not isinstance(validates, list):
+            continue
+        eligible_native_pass = (
+            entry.get("state") == "pass"
+            and entry.get("implementation_mode") == "native"
+            and entry.get("no_host_lua") is True
+            and entry.get("fallback_observed") is False
+            and entry.get("unsupported_observed") is False
+        )
+        if not eligible_native_pass:
+            continue
+        tags = entry.get("coverage_tags", [])
+        if not isinstance(tags, list):
+            tags = []
+        case_name = str(entry.get("name", ""))
+        puc_file = str(entry.get("puc_file", ""))
+        for assertion in validates:
+            assertion = str(assertion)
+            if assertion not in NATIVE_PROTECTED_COROUTINE_COVERAGE_REQUIREMENTS:
+                continue
+            case_sets[assertion].add(case_name)
+            if puc_file:
+                puc_sets[assertion].add(puc_file)
+            tag_sets[assertion].update(str(tag) for tag in tags)
+
+    for assertion in coverage:
+        coverage[assertion] = {
+            "cases": sorted(case_sets[assertion]),
+            "case_count": len(case_sets[assertion]),
+            "puc_files": sorted(puc_sets[assertion]),
+            "tags": sorted(tag_sets[assertion]),
+        }
+    return coverage
+
+
+def validate_native_protected_coroutine_coverage(entries: Iterable[dict[str, object]]) -> tuple[dict[str, dict[str, object]], list[str]]:
+    materialized = list(entries)
+    errors: list[str] = []
+    for entry in materialized:
+        validates = entry.get("validates", [])
+        if not isinstance(validates, list):
+            continue
+        claimed_native = [
+            str(assertion)
+            for assertion in validates
+            if str(assertion) in NATIVE_PROTECTED_COROUTINE_COVERAGE_REQUIREMENTS
+        ]
+        if not claimed_native:
+            continue
+        missing_fields = [
+            field
+            for field in ("implementation_mode", "no_host_lua", "coverage_tags", "fallback_observed", "unsupported_observed")
+            if field not in entry
+        ]
+        if missing_fields:
+            errors.append(f"{entry.get('name', '<unknown>')} claims {claimed_native} but is missing evidence fields: {missing_fields}")
+        if entry.get("state") == "pass":
+            if entry.get("implementation_mode") != "native" or entry.get("no_host_lua") is not True:
+                errors.append(
+                    f"{entry.get('name', '<unknown>')} claims {claimed_native} without native/no_host_lua evidence: "
+                    f"implementation_mode={entry.get('implementation_mode')!r}, no_host_lua={entry.get('no_host_lua')!r}"
+                )
+            if entry.get("fallback_observed") is not False or entry.get("unsupported_observed") is not False:
+                errors.append(
+                    f"{entry.get('name', '<unknown>')} claims {claimed_native} but observed "
+                    f"fallback={entry.get('fallback_observed')!r}, unsupported={entry.get('unsupported_observed')!r}"
+                )
+
+    coverage = native_protected_coroutine_assertion_coverage(materialized)
+    for assertion, requirement in NATIVE_PROTECTED_COROUTINE_COVERAGE_REQUIREMENTS.items():
         actual = coverage[assertion]
         min_cases = int(requirement["min_cases"])
         if int(actual["case_count"]) < min_cases:
