@@ -139,6 +139,112 @@ class LuaZigCliShellTests(unittest.TestCase):
             self.assertEqual(wasm_summary["accounting"]["capability_denied_count"], 1)
             self.assertIn("filesystem", wasm_summary["ledger"][0]["capability"])
 
+    def test_check_preserves_loader_chunks_for_composite_inputs_and_syntax_attribution(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            script = temp_path / "script.lua"
+            script.write_text("local script_value = 42\n")
+            module = temp_path / "fixture_module.lua"
+            module.write_text("local module_value = 7\nreturn {value = module_value}\n")
+            env = {
+                "LUA_PATH": f"{temp_path}/?.lua",
+                "LUA_ZIG_EVIDENCE_DIR": str(temp_path / "evidence"),
+            }
+
+            completed = run(
+                str(CLI),
+                "check",
+                "-e",
+                "local inline_value = 1",
+                "-l",
+                "fixture_module",
+                str(script),
+                env=env,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            self.assertEqual(completed.stderr, "")
+            summary = json.loads(completed.stdout)
+            self.assertEqual(summary["state"], "pass")
+            ledger = summary["ledger"][0]
+            self.assertFalse(ledger["artifacts_emitted"])
+            chunks = ledger["chunks"]
+            self.assertEqual([chunk["kind"] for chunk in chunks], ["inline", "module", "source"])
+            self.assertEqual([chunk["state"] for chunk in chunks], ["pass", "pass", "pass"])
+            self.assertEqual(chunks[0]["name"], "=(command line)")
+            self.assertEqual(chunks[0]["path"], "(command line)")
+            self.assertEqual(chunks[1]["name"], "@fixture_module")
+            self.assertEqual(chunks[1]["path"], str(module.resolve()))
+            self.assertEqual(chunks[2]["name"], f"@{script}")
+            self.assertEqual(chunks[2]["path"], str(script.resolve()))
+
+            stdin = run(str(CLI), "check", "-", stdin="local stdin_value = 3\n", env=env)
+            self.assertEqual(stdin.returncode, 0, stdin.stderr + stdin.stdout)
+            stdin_chunk = json.loads(stdin.stdout)["ledger"][0]["chunks"][0]
+            self.assertEqual(stdin_chunk["kind"], "stdin")
+            self.assertEqual(stdin_chunk["name"], "=stdin")
+            self.assertEqual(stdin_chunk["path"], "stdin")
+
+            syntax = run(
+                str(CLI),
+                "check",
+                "-e",
+                "local ok = true",
+                "-e",
+                "function broken(",
+                str(script),
+                env=env,
+            )
+            self.assertNotEqual(syntax.returncode, 0, syntax.stderr + syntax.stdout)
+            syntax_summary = json.loads(syntax.stdout)
+            self.assertEqual(syntax_summary["state"], "fail")
+            self.assertEqual(syntax_summary["accounting"]["fail_count"], 1)
+            syntax_chunks = syntax_summary["ledger"][0]["chunks"]
+            self.assertEqual([chunk["kind"] for chunk in syntax_chunks], ["inline", "inline", "source"])
+            self.assertEqual([chunk["state"] for chunk in syntax_chunks], ["pass", "fail", "pass"])
+            self.assertIn("(command line)", syntax_chunks[1]["diagnostic"])
+            self.assertEqual(syntax_summary["ledger"][0]["chunk"], syntax_chunks[1])
+
+    def test_check_profile_limitation_scanner_ignores_comments_and_strings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            comments_and_strings = temp_path / "comments-and-strings.lua"
+            comments_and_strings.write_text(
+                "\n".join(
+                    [
+                        "-- debug.getinfo(1)",
+                        "-- io.open('comment.txt', 'w')",
+                        "local a = \"debug.getinfo(1)\"",
+                        "local b = 'io.open(\"string.txt\", \"w\")'",
+                        "local c = [[os.exit(1) and load('return 1')]]",
+                        "--[[ loadfile('commented.lua') ]]",
+                        "local d = [=[debug.sethook(function() end)]=]",
+                        "local ok = 21 + 21",
+                    ]
+                )
+                + "\n"
+            )
+            real_debug = temp_path / "real-debug.lua"
+            real_debug.write_text("debug.getinfo(1)\n")
+
+            native = run(str(CLI), "check", str(comments_and_strings))
+            self.assertEqual(native.returncode, 0, native.stderr + native.stdout)
+            native_summary = json.loads(native.stdout)
+            self.assertEqual(native_summary["state"], "pass")
+            self.assertEqual(native_summary["accounting"]["unsupported_count"], 0)
+
+            wasm = run(str(CLI), "check", "--profile", "wasm-full", str(comments_and_strings))
+            self.assertEqual(wasm.returncode, 0, wasm.stderr + wasm.stdout)
+            wasm_summary = json.loads(wasm.stdout)
+            self.assertEqual(wasm_summary["state"], "pass")
+            self.assertEqual(wasm_summary["accounting"]["capability_denied_count"], 0)
+
+            unsupported = run(str(CLI), "check", str(real_debug))
+            self.assertNotEqual(unsupported.returncode, 0, unsupported.stderr + unsupported.stdout)
+            unsupported_summary = json.loads(unsupported.stdout)
+            self.assertEqual(unsupported_summary["state"], "unsupported")
+            self.assertEqual(unsupported_summary["ledger"][0]["profile_limitation"], "debug-api-not-yet-native")
+
     def test_check_reports_binary_chunk_loader_limitation(self):
         with tempfile.TemporaryDirectory() as temp:
             temp_path = Path(temp)

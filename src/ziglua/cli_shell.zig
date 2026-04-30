@@ -991,9 +991,9 @@ fn buildCheckEvidence(
     target: []const u8,
     implementation_mode: []const u8,
     diagnostic: []const u8,
-    chunk_kind: []const u8,
-    chunk_path: []const u8,
-    source: []const u8,
+    input: CheckInput,
+    classifications: []const CheckClassification,
+    primary_index: usize,
     profile_limitation: []const u8,
     capability: []const u8,
     timestamp: i128,
@@ -1008,26 +1008,22 @@ fn buildCheckEvidence(
     try out.writer.writeAll(
         \\,
         \\  "chunk": {
-        \\    "kind":
     );
-    try writeJsonString(&out.writer, chunk_kind);
+    if (input.chunks.len > 0) {
+        try writeCheckChunkJson(&out.writer, allocator, input.chunks[primary_index], classifications[primary_index]);
+    }
     try out.writer.writeAll(
-        \\,
-        \\    "path":
+        \\},
+        \\  "chunks": [
     );
-    try writeJsonString(&out.writer, chunk_path);
-    try out.writer.print(
-        \\,
-        \\    "source_bytes": {d},
-        \\    "source_sha256":
-    ,
-        .{source.len},
-    );
-    const digest = try sourceDigestHex(allocator, source);
-    try writeJsonString(&out.writer, digest);
+    for (input.chunks, 0..) |chunk, i| {
+        if (i != 0) try out.writer.writeAll(", ");
+        try out.writer.writeAll("{");
+        try writeCheckChunkJson(&out.writer, allocator, chunk, classifications[i]);
+        try out.writer.writeAll("}");
+    }
     try out.writer.writeAll(
-        \\
-        \\  },
+        \\],
         \\  "cli": "lua-zig",
         \\  "command": "check",
         \\  "command_id":
@@ -1070,6 +1066,59 @@ fn buildCheckEvidence(
         .{timestamp},
     );
     return try out.toOwnedSlice();
+}
+
+fn writeCheckChunkJson(
+    writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    chunk: CheckChunk,
+    classification: CheckClassification,
+) !void {
+    try writer.writeAll(
+        \\
+        \\    "capability":
+    );
+    try writeJsonString(writer, classification.capability);
+    try writer.writeAll(
+        \\,
+        \\    "diagnostic":
+    );
+    try writeJsonString(writer, classification.diagnostic);
+    try writer.writeAll(
+        \\,
+        \\    "kind":
+    );
+    try writeJsonString(writer, chunk.chunk_kind);
+    try writer.writeAll(
+        \\,
+        \\    "name":
+    );
+    try writeJsonString(writer, chunk.chunk_name);
+    try writer.writeAll(
+        \\,
+        \\    "path":
+    );
+    try writeJsonString(writer, chunk.display_path);
+    try writer.writeAll(
+        \\,
+        \\    "profile_limitation":
+    );
+    try writeJsonString(writer, classification.profile_limitation);
+    try writer.print(
+        \\,
+        \\    "source_bytes": {d},
+        \\    "source_sha256":
+    ,
+        .{chunk.source.len},
+    );
+    const digest = try sourceDigestHex(allocator, chunk.source);
+    try writeJsonString(writer, digest);
+    try writer.writeAll(
+        \\,
+        \\    "state":
+    );
+    try writeJsonString(writer, classification.state);
+    try writer.writeAll("\n  ");
 }
 
 fn buildRunEvidence(
@@ -1245,12 +1294,16 @@ const NativeRun = struct {
     chunk_name: []const u8,
 };
 
-const CheckInput = struct {
+const CheckChunk = struct {
     source: []const u8,
     chunk_name: []const u8,
     display_path: []const u8,
     chunk_kind: []const u8,
     loader_error: ?[]const u8,
+};
+
+const CheckInput = struct {
+    chunks: []const CheckChunk,
 };
 
 const CheckClassification = struct {
@@ -1260,6 +1313,17 @@ const CheckClassification = struct {
     profile_limitation: []const u8,
     capability: []const u8,
     exit_code: u8,
+};
+
+const CheckResult = struct {
+    state: []const u8,
+    implementation_mode: []const u8,
+    diagnostic: []const u8,
+    profile_limitation: []const u8,
+    capability: []const u8,
+    exit_code: u8,
+    classifications: []const CheckClassification,
+    primary_index: usize,
 };
 
 fn timestampMillis(io: std.Io) i128 {
@@ -1612,6 +1676,19 @@ fn readLuaModule(
     io: std.Io,
     module: []const u8,
 ) ![]const u8 {
+    return (try readLuaModuleWithPath(allocator, io, module)).source;
+}
+
+const LuaModuleLoad = struct {
+    source: []const u8,
+    display_path: []const u8,
+};
+
+fn readLuaModuleWithPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    module: []const u8,
+) !LuaModuleLoad {
     const module_path = try modulePathName(allocator, module);
     const lua_path = if (process_env) |env| env.get("LUA_PATH") orelse "?.lua" else "?.lua";
     var patterns = std.mem.splitScalar(u8, lua_path, ';');
@@ -1619,10 +1696,12 @@ fn readLuaModule(
         if (pattern.len == 0) continue;
         if (std.mem.indexOfScalar(u8, pattern, '?') == null) continue;
         const path = try replaceQuestion(allocator, pattern, module_path);
-        return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
         };
+        const display_path = try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator);
+        return .{ .source = source, .display_path = display_path };
     }
     return error.FileNotFound;
 }
@@ -1714,9 +1793,9 @@ fn checkCommand(
         target,
         classification.implementation_mode,
         classification.diagnostic,
-        input.chunk_kind,
-        input.display_path,
-        input.source,
+        input,
+        classification.classifications,
+        classification.primary_index,
         classification.profile_limitation,
         classification.capability,
         timestamp,
@@ -1742,77 +1821,64 @@ fn loadCheckInput(
     check_args: []const []const u8,
 ) !CheckInput {
     const parsed = try parseRunArgs(allocator, check_args);
-    var source = std.Io.Writer.Allocating.init(allocator);
-    const display_path = if (parsed.script_path) |path|
-        try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator)
-    else if (parsed.read_stdin or parsed.options.len == 0)
-        "stdin"
-    else
-        "(command line)";
-    const chunk_name = if (parsed.script_path) |path|
-        try std.fmt.allocPrint(allocator, "@{s}", .{path})
-    else if (parsed.read_stdin or parsed.options.len == 0)
-        "=stdin"
-    else
-        "=(command line)";
+    var chunks: std.ArrayList(CheckChunk) = .empty;
 
-    if (parsed.script_path) |path| {
-        if (parsed.options.len == 0 and !parsed.read_stdin and parsed.script_args.len == 0) {
-            const file_source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
-            return .{
-                .source = file_source,
-                .chunk_name = chunk_name,
-                .display_path = display_path,
-                .chunk_kind = if (isLuaBinaryChunk(file_source)) "binary" else "source",
-                .loader_error = null,
-            };
-        }
-    }
-
-    try appendLuaArgPrelude(&source.writer, parsed.script_path, parsed.read_stdin, parsed.script_args);
     for (parsed.options) |option| {
         switch (option.kind) {
             .chunk => {
-                try source.writer.writeAll(option.value);
-                try source.writer.writeByte('\n');
+                try chunks.append(allocator, .{
+                    .source = option.value,
+                    .chunk_name = "=(command line)",
+                    .display_path = "(command line)",
+                    .chunk_kind = "inline",
+                    .loader_error = null,
+                });
             },
             .module => {
-                const module_source = readLuaModule(allocator, io, option.value) catch |err| switch (err) {
+                const module_load = readLuaModuleWithPath(allocator, io, option.value) catch |err| switch (err) {
                     error.FileNotFound => {
-                        return .{
+                        try chunks.append(allocator, .{
                             .source = "",
-                            .chunk_name = chunk_name,
-                            .display_path = display_path,
-                            .chunk_kind = "source",
+                            .chunk_name = try std.fmt.allocPrint(allocator, "@{s}", .{option.value}),
+                            .display_path = option.value,
+                            .chunk_kind = "module",
                             .loader_error = try std.fmt.allocPrint(allocator, "module '{s}' not found in LUA_PATH", .{option.value}),
-                        };
+                        });
+                        continue;
                     },
                     else => return err,
                 };
-                try source.writer.writeAll(try stripTopLevelModuleReturn(allocator, module_source));
-                try source.writer.writeByte('\n');
+                try chunks.append(allocator, .{
+                    .source = module_load.source,
+                    .chunk_name = try std.fmt.allocPrint(allocator, "@{s}", .{option.value}),
+                    .display_path = module_load.display_path,
+                    .chunk_kind = "module",
+                    .loader_error = null,
+                });
             },
         }
     }
     if (parsed.script_path) |path| {
         const file_source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
-        try source.writer.writeAll(file_source);
-        try source.writer.writeByte('\n');
+        try chunks.append(allocator, .{
+            .source = file_source,
+            .chunk_name = try std.fmt.allocPrint(allocator, "@{s}", .{path}),
+            .display_path = try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator),
+            .chunk_kind = if (isLuaBinaryChunk(file_source)) "binary" else "source",
+            .loader_error = null,
+        });
     } else if (parsed.read_stdin or parsed.options.len == 0) {
         var stdin_reader = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
         const stdin_source = try stdin_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
-        try source.writer.writeAll(stdin_source);
-        try source.writer.writeByte('\n');
+        try chunks.append(allocator, .{
+            .source = stdin_source,
+            .chunk_name = "=stdin",
+            .display_path = "stdin",
+            .chunk_kind = "stdin",
+            .loader_error = null,
+        });
     }
-
-    const loaded_source = try source.toOwnedSlice();
-    return .{
-        .source = loaded_source,
-        .chunk_name = chunk_name,
-        .display_path = display_path,
-        .chunk_kind = if (isLuaBinaryChunk(loaded_source)) "binary" else "source",
-        .loader_error = null,
-    };
+    return .{ .chunks = try chunks.toOwnedSlice(allocator) };
 }
 
 fn classifyCheckInput(
@@ -1820,8 +1886,56 @@ fn classifyCheckInput(
     io: std.Io,
     input: CheckInput,
     target: []const u8,
+) !CheckResult {
+    var classifications: std.ArrayList(CheckClassification) = .empty;
+    var aggregate_state: []const u8 = "pass";
+    var primary_index: usize = 0;
+    var exit_code: u8 = 0;
+
+    for (input.chunks, 0..) |chunk, i| {
+        const classification = try classifyCheckChunk(allocator, io, chunk, target);
+        try classifications.append(allocator, classification);
+        if (checkStateRank(classification.state) > checkStateRank(aggregate_state)) {
+            aggregate_state = classification.state;
+            primary_index = i;
+            exit_code = classification.exit_code;
+        }
+    }
+
+    const owned_classifications = try classifications.toOwnedSlice(allocator);
+    if (input.chunks.len == 0) {
+        return .{
+            .state = "pass",
+            .implementation_mode = "loader-parser-check",
+            .diagnostic = "no Lua loader chunks were provided",
+            .profile_limitation = "",
+            .capability = "",
+            .exit_code = 0,
+            .classifications = owned_classifications,
+            .primary_index = 0,
+        };
+    }
+
+    const primary = owned_classifications[primary_index];
+    return .{
+        .state = aggregate_state,
+        .implementation_mode = primary.implementation_mode,
+        .diagnostic = primary.diagnostic,
+        .profile_limitation = primary.profile_limitation,
+        .capability = primary.capability,
+        .exit_code = if (std.mem.eql(u8, aggregate_state, "pass")) 0 else if (exit_code != 0) exit_code else 1,
+        .classifications = owned_classifications,
+        .primary_index = primary_index,
+    };
+}
+
+fn classifyCheckChunk(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    chunk: CheckChunk,
+    target: []const u8,
 ) !CheckClassification {
-    if (input.loader_error) |loader_error| {
+    if (chunk.loader_error) |loader_error| {
         return .{
             .state = "fail",
             .implementation_mode = "loader-parser-check",
@@ -1831,7 +1945,7 @@ fn classifyCheckInput(
             .exit_code = 1,
         };
     }
-    if (std.mem.eql(u8, input.chunk_kind, "binary")) {
+    if (std.mem.eql(u8, chunk.chunk_kind, "binary")) {
         return .{
             .state = "unsupported",
             .implementation_mode = "loader-parser-check",
@@ -1842,7 +1956,7 @@ fn classifyCheckInput(
         };
     }
 
-    const syntax = try runLuaSyntaxCheck(allocator, io, input.source, input.chunk_name);
+    const syntax = try runLuaSyntaxCheck(allocator, io, chunk.source, chunk.chunk_name);
     if (syntax.exit_code != 0) {
         return .{
             .state = "fail",
@@ -1854,7 +1968,7 @@ fn classifyCheckInput(
         };
     }
 
-    if (checkProfileLimitation(input.source, target)) |limitation| {
+    if (try checkProfileLimitation(allocator, chunk.source, target)) |limitation| {
         return .{
             .state = limitation.state,
             .implementation_mode = "profile-compatibility-check",
@@ -1873,6 +1987,15 @@ fn classifyCheckInput(
         .capability = "",
         .exit_code = 0,
     };
+}
+
+fn checkStateRank(state: []const u8) u8 {
+    if (std.mem.eql(u8, state, "fail")) return 5;
+    if (std.mem.eql(u8, state, "unsupported")) return 4;
+    if (std.mem.eql(u8, state, "capability-denied")) return 3;
+    if (std.mem.eql(u8, state, "expected-skip")) return 2;
+    if (std.mem.eql(u8, state, "blocked")) return 1;
+    return 0;
 }
 
 const SyntaxCheckResult = struct {
@@ -1911,8 +2034,9 @@ const ProfileLimitation = struct {
     diagnostic: []const u8,
 };
 
-fn checkProfileLimitation(source: []const u8, target: []const u8) ?ProfileLimitation {
-    if (std.mem.indexOf(u8, source, "debug.") != null) {
+fn checkProfileLimitation(allocator: std.mem.Allocator, source: []const u8, target: []const u8) !?ProfileLimitation {
+    const code = try luaCodeForProfileScan(allocator, source);
+    if (containsLuaMemberAccess(code, "debug")) {
         return .{
             .state = "unsupported",
             .reason = "debug-api-not-yet-native",
@@ -1920,7 +2044,7 @@ fn checkProfileLimitation(source: []const u8, target: []const u8) ?ProfileLimita
             .diagnostic = "debug library compatibility is tracked explicitly and is not accepted by this check boundary yet",
         };
     }
-    if (std.mem.indexOf(u8, source, "load(") != null or std.mem.indexOf(u8, source, "loadfile(") != null) {
+    if (containsLuaCall(code, "load") or containsLuaCall(code, "loadfile")) {
         return .{
             .state = "unsupported",
             .reason = "dynamic-load-not-yet-native",
@@ -1929,7 +2053,7 @@ fn checkProfileLimitation(source: []const u8, target: []const u8) ?ProfileLimita
         };
     }
     if (std.mem.eql(u8, target, "wasm-full")) {
-        if (std.mem.indexOf(u8, source, "io.") != null or std.mem.indexOf(u8, source, "os.") != null) {
+        if (containsLuaMemberAccess(code, "io") or containsLuaMemberAccess(code, "os")) {
             return .{
                 .state = "capability-denied",
                 .reason = "wasm-host-filesystem-process-capability",
@@ -1947,6 +2071,126 @@ fn checkProfileLimitation(source: []const u8, target: []const u8) ?ProfileLimita
         };
     }
     return null;
+}
+
+fn luaCodeForProfileScan(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
+    const code = try allocator.dupe(u8, source);
+    var i: usize = 0;
+    while (i < code.len) {
+        if (i + 1 < code.len and code[i] == '-' and code[i + 1] == '-') {
+            const start = i;
+            i += 2;
+            if (if (i < code.len) luaLongBracketEquals(code, i) else null) |equals_count| {
+                i = skipLuaLongBracket(code, i, equals_count);
+            } else {
+                while (i < code.len and code[i] != '\n' and code[i] != '\r') : (i += 1) {}
+            }
+            blankProfileScanRange(code, start, i);
+            continue;
+        }
+        if (code[i] == '"' or code[i] == '\'') {
+            const start = i;
+            const quote = code[i];
+            i += 1;
+            while (i < code.len) : (i += 1) {
+                if (code[i] == '\\') {
+                    i += 1;
+                    continue;
+                }
+                if (code[i] == quote) {
+                    i += 1;
+                    break;
+                }
+            }
+            blankProfileScanRange(code, start, i);
+            continue;
+        }
+        if (code[i] == '[') {
+            if (luaLongBracketEquals(code, i)) |equals_count| {
+                const start = i;
+                i = skipLuaLongBracket(code, i, equals_count);
+                blankProfileScanRange(code, start, i);
+                continue;
+            }
+        }
+        i += 1;
+    }
+    return code;
+}
+
+fn blankProfileScanRange(code: []u8, start: usize, end: usize) void {
+    var i = start;
+    while (i < end and i < code.len) : (i += 1) {
+        if (code[i] != '\n' and code[i] != '\r') code[i] = ' ';
+    }
+}
+
+fn luaLongBracketEquals(source: []const u8, start: usize) ?usize {
+    if (start >= source.len or source[start] != '[') return null;
+    var i = start + 1;
+    while (i < source.len and source[i] == '=') : (i += 1) {}
+    if (i < source.len and source[i] == '[') return i - start - 1;
+    return null;
+}
+
+fn skipLuaLongBracket(source: []const u8, start: usize, equals_count: usize) usize {
+    var i = start + equals_count + 2;
+    while (i < source.len) : (i += 1) {
+        if (source[i] != ']') continue;
+        var j = i + 1;
+        var seen_equals: usize = 0;
+        while (j < source.len and seen_equals < equals_count and source[j] == '=') : ({
+            j += 1;
+            seen_equals += 1;
+        }) {}
+        if (seen_equals == equals_count and j < source.len and source[j] == ']') return j + 1;
+    }
+    return source.len;
+}
+
+fn containsLuaMemberAccess(code: []const u8, name: []const u8) bool {
+    var i: usize = 0;
+    while (i + name.len <= code.len) : (i += 1) {
+        if (!std.mem.eql(u8, code[i .. i + name.len], name)) continue;
+        if (!hasLuaNameBoundaryBefore(code, i)) continue;
+        if (!hasLuaNameBoundaryAfter(code, i + name.len)) continue;
+        var j = i + name.len;
+        while (j < code.len and isLuaWhitespace(code[j])) : (j += 1) {}
+        if (j < code.len and code[j] == '.') return true;
+    }
+    return false;
+}
+
+fn containsLuaCall(code: []const u8, name: []const u8) bool {
+    var i: usize = 0;
+    while (i + name.len <= code.len) : (i += 1) {
+        if (!std.mem.eql(u8, code[i .. i + name.len], name)) continue;
+        if (!hasLuaNameBoundaryBefore(code, i)) continue;
+        if (!hasLuaNameBoundaryAfter(code, i + name.len)) continue;
+        var j = i + name.len;
+        while (j < code.len and isLuaWhitespace(code[j])) : (j += 1) {}
+        if (j < code.len and code[j] == '(') return true;
+    }
+    return false;
+}
+
+fn hasLuaNameBoundaryBefore(code: []const u8, index: usize) bool {
+    return index == 0 or !isLuaIdentifierByte(code[index - 1]);
+}
+
+fn hasLuaNameBoundaryAfter(code: []const u8, index: usize) bool {
+    return index >= code.len or !isLuaIdentifierByte(code[index]);
+}
+
+fn isLuaIdentifierByte(byte: u8) bool {
+    return (byte >= 'a' and byte <= 'z') or
+        (byte >= 'A' and byte <= 'Z') or
+        (byte >= '0' and byte <= '9') or
+        byte == '_';
+}
+
+fn isLuaWhitespace(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\n' or byte == '\r' or byte == '\x0b' or byte == '\x0c';
 }
 
 fn isLuaBinaryChunk(source: []const u8) bool {
