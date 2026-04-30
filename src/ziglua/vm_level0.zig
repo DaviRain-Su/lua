@@ -130,7 +130,7 @@ const Cell = struct {
     value: Value,
 };
 
-const CoroutineStatus = enum { suspended, running, dead };
+const CoroutineStatus = enum { suspended, running, normal, dead };
 
 const CoroutineContinuationKind = enum {
     resume_body,
@@ -156,6 +156,7 @@ const Thread = struct {
     status: CoroutineStatus,
     continuations: std.ArrayList(CoroutineContinuation),
     yield_values: []const Value,
+    close_error: ?Value,
 };
 
 const Table = struct {
@@ -1807,6 +1808,7 @@ const Parser = struct {
                     .status = .suspended,
                     .continuations = .empty,
                     .yield_values = &.{},
+                    .close_error = null,
                 };
                 const values = try self.vm.allocator.alloc(Value, 1);
                 values[0] = .{ .thread = thread };
@@ -1830,16 +1832,31 @@ const Parser = struct {
                 values[0] = .{ .string = switch (args[0].thread.status) {
                     .suspended => "suspended",
                     .running => "running",
+                    .normal => "normal",
                     .dead => "dead",
                 } };
                 return values;
             },
             .coroutine_close => {
-                if (args.len < 1 or args[0] != .thread) return error.RuntimeError;
-                if (args[0].thread.status != .dead) args[0].thread.status = .dead;
-                const values = try self.vm.allocator.alloc(Value, 1);
-                values[0] = .{ .boolean = true };
-                return values;
+                const target = if (args.len == 0) blk: {
+                    if (self.vm.current_thread) |thread| break :blk thread;
+                    self.vm.setRuntimeErrorAt(self.active_call_line orelse self.peek().line, "cannot close main thread");
+                    return error.RuntimeError;
+                } else blk: {
+                    if (args[0] != .thread) {
+                        self.vm.setRuntimeErrorAt(
+                            self.active_call_line orelse self.peek().line,
+                            try std.fmt.allocPrint(
+                                self.vm.allocator,
+                                "bad argument #1 to 'close' (thread expected, got {s})",
+                                .{valueTypeName(args[0])},
+                            ),
+                        );
+                        return error.RuntimeError;
+                    }
+                    break :blk args[0].thread;
+                };
+                return self.closeThread(target);
             },
             .coroutine_wrap => {
                 if (args.len < 1 or args[0] != .function) return error.RuntimeError;
@@ -1850,6 +1867,7 @@ const Parser = struct {
                     .status = .suspended,
                     .continuations = .empty,
                     .yield_values = &.{},
+                    .close_error = null,
                 };
                 const values = try self.vm.allocator.alloc(Value, 1);
                 values[0] = .{ .wrapped_thread = thread };
@@ -1970,6 +1988,48 @@ const Parser = struct {
         return error.RuntimeError;
     }
 
+    fn closeThread(self: *Parser, thread: *Thread) anyerror![]const Value {
+        switch (thread.status) {
+            .dead => {
+                if (thread.close_error) |error_value| {
+                    thread.close_error = null;
+                    const values = try self.vm.allocator.alloc(Value, 2);
+                    values[0] = .{ .boolean = false };
+                    values[1] = error_value;
+                    return values;
+                }
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .boolean = true };
+                return values;
+            },
+            .suspended => {
+                thread.status = .dead;
+                self.cleanupThreadFrame(thread);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .boolean = true };
+                return values;
+            },
+            .normal => {
+                self.vm.setRuntimeErrorAt(self.active_call_line orelse self.peek().line, "cannot close a normal coroutine");
+                return error.RuntimeError;
+            },
+            .running => {
+                if (self.vm.current_thread == null) {
+                    self.vm.setRuntimeErrorAt(self.active_call_line orelse self.peek().line, "cannot close main thread");
+                    return error.RuntimeError;
+                }
+                if (self.vm.current_thread.? == thread) {
+                    thread.close_error = null;
+                    thread.status = .dead;
+                    self.cleanupThreadFrame(thread);
+                    return error.CoroutineClosed;
+                }
+                self.vm.setRuntimeErrorAt(self.active_call_line orelse self.peek().line, "cannot close a running coroutine");
+                return error.RuntimeError;
+            },
+        }
+    }
+
     fn resumeThread(self: *Parser, thread: *Thread, args: []const Value) anyerror![]const Value {
         if (thread.status == .dead) {
             const values = try self.vm.allocator.alloc(Value, 2);
@@ -1977,32 +2037,46 @@ const Parser = struct {
             values[1] = .{ .string = "cannot resume dead coroutine" };
             return values;
         }
-        if (thread.status == .running) {
+        if (thread.status == .running or thread.status == .normal) {
             const values = try self.vm.allocator.alloc(Value, 2);
             values[0] = .{ .boolean = false };
-            values[1] = .{ .string = "cannot resume running coroutine" };
+            values[1] = .{ .string = "cannot resume non-suspended coroutine" };
             return values;
         }
+        const caller_thread = self.vm.current_thread;
+        if (caller_thread) |caller| caller.status = .normal;
         thread.status = .running;
         thread.vm.current_thread = thread;
         const returns = self.resumeThreadBody(thread, args) catch |err| switch (err) {
             error.Yield => {
                 thread.status = .suspended;
                 thread.vm.current_thread = null;
+                if (caller_thread) |caller| caller.status = .running;
                 return self.coroutineResult(true, thread.yield_values);
             },
             error.RuntimeError => {
                 const error_value = thread.vm.currentRuntimeErrorValue();
                 thread.status = .dead;
+                thread.close_error = error_value;
                 thread.vm.current_thread = null;
                 self.cleanupThreadFrame(thread);
+                if (caller_thread) |caller| caller.status = .running;
                 return self.coroutineResult(false, &.{error_value});
+            },
+            error.CoroutineClosed => {
+                thread.status = .dead;
+                thread.close_error = null;
+                thread.vm.current_thread = null;
+                self.cleanupThreadFrame(thread);
+                if (caller_thread) |caller| caller.status = .running;
+                return self.coroutineResult(true, &.{});
             },
             else => return err,
         };
         thread.status = .dead;
         thread.vm.current_thread = null;
         self.cleanupThreadFrame(thread);
+        if (caller_thread) |caller| caller.status = .running;
         return self.coroutineResult(true, returns);
     }
 

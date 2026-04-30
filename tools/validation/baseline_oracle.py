@@ -1050,6 +1050,14 @@ NATIVE_PROTECTED_COROUTINE_CASES = [
         "coverage_tags": ["coroutine.lua", "wrap", "close", "error-propagation"],
         "source": 'local f = coroutine.wrap(function(a) return a + 1 end)\nprint(f(4))\nlocal co = coroutine.create(function() error("co boom", 0) end)\nprint(coroutine.resume(co))\nprint(coroutine.status(co))\nlocal closed = coroutine.create(function() return 1 end)\nprint(coroutine.close(closed))\nprint(coroutine.status(closed))\n',
     },
+    {
+        "name": "coroutine-close-state-validation",
+        "puc_file": "coroutine.lua",
+        "description": "coroutine.close validates main/normal/dead/suspended states and preserves close-time error propagation",
+        "validates": ["VAL-ADV2-012"],
+        "coverage_tags": ["coroutine.lua", "close", "main-thread", "normal", "dead", "suspended", "error-propagation"],
+        "source": 'local ok, err = pcall(coroutine.close)\nprint("main", ok, err)\nlocal fresh = coroutine.create(function() return 1 end)\nprint("fresh", coroutine.close(fresh), coroutine.status(fresh))\nprint("fresh-again", coroutine.close(fresh))\nlocal failed = coroutine.create(function() error(100, 0) end)\nprint("failed-resume", coroutine.resume(failed))\nprint("failed-close", coroutine.close(failed))\nprint("failed-again", coroutine.close(failed))\nlocal outer\nouter = coroutine.create(function()\n  local inner = coroutine.create(function()\n    local close_ok, close_err = pcall(coroutine.close, outer)\n    return coroutine.status(outer), close_ok, close_err\n  end)\n  return coroutine.resume(inner)\nend)\nprint("normal", coroutine.resume(outer))\nprint("outer-final", coroutine.status(outer))\n',
+    },
 ]
 
 AOT_RUNTIME_ERROR_FIXTURES = [
