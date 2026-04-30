@@ -41,18 +41,125 @@ ZIG_AOT_CANDIDATE_REFRESH_COMMAND = ["zig", "build", "--summary", "all"]
 SELECTED_TESTS = ["constructs.lua", "vararg.lua"]
 VM_SELECTED_PUC_TESTS = ["constructs.lua", "code.lua", "calls.lua", "closure.lua", "math.lua", "strings.lua"]
 CROSS_AREA_RUNTIME_SMOKE_SNIPPET = "print(1 + 2)\n"
+NATIVE_CORE_COVERAGE_REQUIREMENTS = {
+    "VAL-NATIVE-004": {
+        "min_cases": 4,
+        "required_puc_files": ["literals.lua"],
+        "required_tags": [
+            "literal:nil-boolean",
+            "literal:numeric",
+            "literal:string",
+            "literal:table-constructor",
+        ],
+    },
+    "VAL-NATIVE-005": {
+        "min_cases": 6,
+        "required_puc_files": ["constructs.lua"],
+        "required_tags": [
+            "construct:control-flow",
+            "construct:generic-for",
+            "construct:ordered-comparison",
+            "construct:diagnostic",
+        ],
+    },
+    "VAL-NATIVE-006": {
+        "min_cases": 4,
+        "required_puc_files": ["vararg.lua"],
+        "required_tags": [
+            "vararg:capture",
+            "vararg:forwarding",
+            "vararg:select",
+            "vararg:main-chunk",
+            "vararg:fixed-mixed",
+        ],
+    },
+    "VAL-NATIVE-007": {
+        "min_cases": 4,
+        "required_puc_files": ["bitwise.lua"],
+        "required_tags": [
+            "bitwise:operators",
+            "bitwise:precedence",
+            "bitwise:signed-width",
+            "bitwise:integral-float",
+        ],
+    },
+    "VAL-NATIVE-008": {
+        "min_cases": 5,
+        "required_puc_files": ["bwcoercion.lua"],
+        "required_tags": [
+            "coercion:integral-float",
+            "coercion:negative-integral-float",
+            "coercion:nonintegral-error",
+            "coercion:nan-error",
+            "coercion:overflow-error",
+        ],
+    },
+    "VAL-NATIVE-009": {
+        "min_cases": 6,
+        "required_puc_files": ["goto.lua"],
+        "required_tags": [
+            "goto:valid-forward",
+            "goto:valid-nested",
+            "goto:undefined",
+            "goto:duplicate",
+            "goto:malformed",
+            "goto:jump-into-local",
+        ],
+    },
+    "VAL-NATIVE-010": {
+        "min_cases": 10,
+        "required_puc_files": ["constructs.lua", "errors.lua", "goto.lua", "bwcoercion.lua"],
+        "required_tags": [
+            "diagnostic:runtime-arithmetic",
+            "diagnostic:runtime-concat",
+            "diagnostic:runtime-index",
+            "diagnostic:runtime-call",
+            "diagnostic:syntax-block",
+            "diagnostic:syntax-token",
+            "diagnostic:goto",
+            "diagnostic:comparison",
+            "diagnostic:bitwise-coercion",
+        ],
+    },
+}
 NATIVE_CORE_LANGUAGE_CASES = [
     {
         "name": "literals-core",
         "puc_file": "literals.lua",
         "validates": ["VAL-NATIVE-004"],
+        "coverage_tags": ["literal:nil-boolean", "literal:numeric", "literal:string", "literal:table-constructor"],
         "description": "nil/boolean/numeric/string/long-string/table-constructor literals",
         "source": 'print(nil, true, false, 123, 3.25, "a\\n", [[long string]])\nlocal t = {10; 20; name = "lua"}\nprint(t[1], t[2], t.name, #t)\n',
+    },
+    {
+        "name": "literals-escape-long-string-core",
+        "puc_file": "literals.lua",
+        "validates": ["VAL-NATIVE-004"],
+        "coverage_tags": ["literal:string"],
+        "description": "escaped strings, quoted strings, and long-string literal newlines",
+        "source": 'local a = "line\\n\\tquote\\"\\\\"\nlocal b = [[alpha\nbeta]]\nlocal c = \'single\\\\quote\'\nprint(a)\nprint(b)\nprint(c)\n',
+    },
+    {
+        "name": "literals-table-array-record-core",
+        "puc_file": "literals.lua",
+        "validates": ["VAL-NATIVE-004"],
+        "coverage_tags": ["literal:table-constructor", "literal:nil-boolean", "literal:string", "literal:numeric"],
+        "description": "mixed array/record table constructors with nested table literal values",
+        "source": 'local t = { "array", false, name = "lua", nested = { 1, 2 } }\nprint(t[1], t[2], t.name, t.nested[1], #t)\n',
+    },
+    {
+        "name": "literals-number-boolean-nil-core",
+        "puc_file": "literals.lua",
+        "validates": ["VAL-NATIVE-004"],
+        "coverage_tags": ["literal:nil-boolean", "literal:numeric"],
+        "description": "nil, booleans, zero, negative float, equality, and unary logical literal behavior",
+        "source": "local a,b,c,d,e = nil, false, true, 0, -12.5\nprint(a, b, c, d, e, a == nil, not b)\n",
     },
     {
         "name": "constructs-core",
         "puc_file": "constructs.lua",
         "validates": ["VAL-NATIVE-005"],
+        "coverage_tags": ["construct:control-flow", "construct:arithmetic", "construct:length", "construct:concat", "construct:ordered-comparison"],
         "description": "precedence, if/else, numeric for, while, repeat, break, length, concatenation, and comparisons",
         "source": 'local s = "lua" .. "-" .. 55\nlocal total = 0; for i = 1, 4 do if i % 2 == 0 then total = total + i else total = total + 1 end end\nlocal n = 0; while n < 2 do n = n + 1 end; repeat total = total + n; break until false\nprint(s, #s, total, n, total >= n)\n',
     },
@@ -60,6 +167,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "generic-for-core",
         "puc_file": "constructs.lua",
         "validates": ["VAL-NATIVE-005"],
+        "coverage_tags": ["construct:generic-for"],
         "description": "generic-for execution over pairs/ipairs-style iterator triples without fallback",
         "source": 'local acc = ""\nfor i, v in ipairs({"a", "b"}) do acc = acc .. i .. v end\nlocal total = 0\nfor k, v in pairs({3, 4, 5}) do total = total + k + v end\nprint(acc, total)\n',
     },
@@ -67,6 +175,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "ordered-comparison-core",
         "puc_file": "constructs.lua",
         "validates": ["VAL-NATIVE-005"],
+        "coverage_tags": ["construct:ordered-comparison"],
         "description": "Lua ordered comparisons for numbers and bytewise strings without numeric string coercion",
         "source": 'print(1 < 2, 2.0 <= 2, 3 > 2.5, 3 >= 3)\nprint("2" < "10", "abc" <= "abc", "b" > "aa", "b" >= "b")\n',
     },
@@ -74,6 +183,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "ordered-comparison-mixed-string-number-core",
         "puc_file": "constructs.lua",
         "validates": ["VAL-NATIVE-005", "VAL-NATIVE-010"],
+        "coverage_tags": ["construct:diagnostic", "diagnostic:comparison"],
         "description": "mixed string/number ordered comparisons reject numeric over-coercion with Lua diagnostics",
         "source": 'print("2" < 10)\n',
     },
@@ -81,6 +191,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "ordered-comparison-mixed-number-string-core",
         "puc_file": "constructs.lua",
         "validates": ["VAL-NATIVE-005", "VAL-NATIVE-010"],
+        "coverage_tags": ["construct:diagnostic", "diagnostic:comparison"],
         "description": "mixed number/string ordered comparisons reject numeric over-coercion with Lua diagnostics",
         "source": 'print(2 < "10")\n',
     },
@@ -88,6 +199,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "ordered-comparison-unsupported-table-core",
         "puc_file": "constructs.lua",
         "validates": ["VAL-NATIVE-005", "VAL-NATIVE-010"],
+        "coverage_tags": ["construct:diagnostic", "diagnostic:comparison"],
         "description": "unsupported ordered comparisons reject non-number/non-string operands with Lua diagnostics",
         "source": 'print({} < {})\n',
     },
@@ -95,34 +207,127 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "vararg-core",
         "puc_file": "vararg.lua",
         "validates": ["VAL-NATIVE-006"],
+        "coverage_tags": ["vararg:capture", "vararg:select", "vararg:nil-preservation", "vararg:return-adjustment"],
         "description": "vararg capture, select count, nil preservation, and return adjustment",
         "source": 'local function pack(...)\n  local n = select("#", ...)\n  local a, b, c = ...\n  return n, a, c\nend\nprint(pack(nil, "x", 3))\n',
+    },
+    {
+        "name": "vararg-forwarding-core",
+        "puc_file": "vararg.lua",
+        "validates": ["VAL-NATIVE-006"],
+        "coverage_tags": ["vararg:forwarding", "vararg:return-adjustment", "vararg:nil-preservation"],
+        "description": "forwarding through tail-position vararg calls preserves nils and tuple length",
+        "source": 'local function id(...) return ... end\nlocal function f(a, ...) return a, id(...) end\nprint(f("h", nil, "x", 4))\n',
+    },
+    {
+        "name": "vararg-select-tail-core",
+        "puc_file": "vararg.lua",
+        "validates": ["VAL-NATIVE-006"],
+        "coverage_tags": ["vararg:select", "vararg:nil-preservation"],
+        "description": "select count and select offset preserve nil values in vararg tuples",
+        "source": 'local function f(...)\n  print(select("#", ...))\n  print(select(2, ...))\nend\nf(1, nil, "x")\n',
+    },
+    {
+        "name": "vararg-fixed-mixed-core",
+        "puc_file": "vararg.lua",
+        "validates": ["VAL-NATIVE-006"],
+        "coverage_tags": ["vararg:fixed-mixed", "vararg:capture", "vararg:nil-preservation"],
+        "description": "mixed fixed and vararg parameter lists preserve missing and nil-adjusted positions",
+        "source": 'local function f(a, b, ...)\n  local x, y, z = ...\n  print(a, b, select("#", ...), x, y, z)\nend\nf("a", "b", nil, 3)\n',
+    },
+    {
+        "name": "vararg-main-empty-core",
+        "puc_file": "vararg.lua",
+        "validates": ["VAL-NATIVE-006"],
+        "coverage_tags": ["vararg:main-chunk"],
+        "description": "stdin main chunks expose an empty vararg tuple when invoked without script arguments",
+        "source": 'print(select("#", ...))\n',
     },
     {
         "name": "bitwise-core",
         "puc_file": "bitwise.lua",
         "validates": ["VAL-NATIVE-007"],
+        "coverage_tags": ["bitwise:operators", "bitwise:signed-width"],
         "description": "bitwise operators, precedence, signed edge cases, and integer-width shift behavior",
         "source": 'local a, b = 0x0f, 0x33\nprint(a & b, a | b, a ~ b, a << 2, b >> 1, ~a)\nprint(1 << 63, 1 << 64, -1 >> 1, -1 >> 64, 8 << -1, 8 >> -1)\n',
+    },
+    {
+        "name": "bitwise-precedence-core",
+        "puc_file": "bitwise.lua",
+        "validates": ["VAL-NATIVE-007"],
+        "coverage_tags": ["bitwise:operators", "bitwise:precedence"],
+        "description": "bitwise precedence across or/and/not/shift expressions",
+        "source": "print(1 | 2 & 4, (1 | 2) & 4, ~1 & 0xff, 1 << 2 + 1)\n",
+    },
+    {
+        "name": "bitwise-signed-boundary-core",
+        "puc_file": "bitwise.lua",
+        "validates": ["VAL-NATIVE-007"],
+        "coverage_tags": ["bitwise:signed-width"],
+        "description": "signed right/left shifts and high-bit results match Lua integer-width behavior",
+        "source": "print((-8) >> 1, (-8) << 1, (-1) & 0xff, (1 << 63) < 0)\n",
+    },
+    {
+        "name": "bitwise-integral-float-core",
+        "puc_file": "bitwise.lua",
+        "validates": ["VAL-NATIVE-007", "VAL-NATIVE-008"],
+        "coverage_tags": ["bitwise:integral-float", "coercion:integral-float", "coercion:negative-integral-float"],
+        "description": "integral float operands, including negative values, coerce for bitwise operations",
+        "source": "print((-8.0) >> 1, 7.0 & 3, 4.0 ~ 1)\n",
     },
     {
         "name": "bwcoercion-core",
         "puc_file": "bwcoercion.lua",
         "validates": ["VAL-NATIVE-008"],
+        "coverage_tags": ["coercion:integral-float"],
         "description": "integer coercion for integral floats in bitwise operators",
         "source": "print(15.0 & 7, 15.0 | 2, 8.0 << 1)\n",
+    },
+    {
+        "name": "bwcoercion-nonintegral-error-core",
+        "puc_file": "bwcoercion.lua",
+        "validates": ["VAL-NATIVE-008", "VAL-NATIVE-010"],
+        "coverage_tags": ["coercion:nonintegral-error", "diagnostic:bitwise-coercion"],
+        "description": "non-integral float operands produce Lua-compatible bitwise coercion diagnostics",
+        "source": "print(3.5 & 1)\n",
+    },
+    {
+        "name": "bwcoercion-nan-error-core",
+        "puc_file": "bwcoercion.lua",
+        "validates": ["VAL-NATIVE-008", "VAL-NATIVE-010"],
+        "coverage_tags": ["coercion:nan-error", "diagnostic:bitwise-coercion"],
+        "description": "NaN operands produce Lua-compatible bitwise coercion diagnostics instead of native traps",
+        "source": "print(0/0 & 1)\n",
+    },
+    {
+        "name": "bwcoercion-overflow-error-core",
+        "puc_file": "bwcoercion.lua",
+        "validates": ["VAL-NATIVE-008", "VAL-NATIVE-010"],
+        "coverage_tags": ["coercion:overflow-error", "diagnostic:bitwise-coercion"],
+        "description": "out-of-range integral float operands produce Lua-compatible bitwise coercion diagnostics without panicking",
+        "source": "print(9223372036854775808.0 & 1)\n",
     },
     {
         "name": "goto-core",
         "puc_file": "goto.lua",
         "validates": ["VAL-NATIVE-009"],
+        "coverage_tags": ["goto:valid-forward"],
         "description": "forward goto and label execution without running skipped statements",
         "source": 'local x = 0\ngoto skip\nx = 99\n::skip::\nx = x + 1\nprint(x)\n',
+    },
+    {
+        "name": "goto-valid-nested-core",
+        "puc_file": "goto.lua",
+        "validates": ["VAL-NATIVE-009"],
+        "coverage_tags": ["goto:valid-nested"],
+        "description": "valid forward goto within a nested block executes after skipped statements remain unobserved",
+        "source": 'local x = 0\ndo\n  goto inner\n  x = 10\n  ::inner::\n  x = x + 2\nend\nprint(x)\n',
     },
     {
         "name": "goto-undefined-label-core",
         "puc_file": "goto.lua",
         "validates": ["VAL-NATIVE-009", "VAL-NATIVE-010"],
+        "coverage_tags": ["goto:undefined", "diagnostic:goto"],
         "description": "undefined goto labels produce Lua-compatible syntax diagnostics and nonzero exit",
         "source": "goto missing\n",
     },
@@ -130,6 +335,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "goto-duplicate-label-core",
         "puc_file": "goto.lua",
         "validates": ["VAL-NATIVE-009", "VAL-NATIVE-010"],
+        "coverage_tags": ["goto:duplicate", "diagnostic:goto"],
         "description": "duplicate labels in the same block produce Lua-compatible syntax diagnostics and nonzero exit",
         "source": "::a::\n::a::\n",
     },
@@ -137,6 +343,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "goto-malformed-label-core",
         "puc_file": "goto.lua",
         "validates": ["VAL-NATIVE-009", "VAL-NATIVE-010"],
+        "coverage_tags": ["goto:malformed", "diagnostic:goto", "diagnostic:syntax-token"],
         "description": "malformed labels produce Lua-compatible syntax diagnostics and nonzero exit",
         "source": "::1::\n",
     },
@@ -144,6 +351,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "goto-jump-into-local-core",
         "puc_file": "goto.lua",
         "validates": ["VAL-NATIVE-009", "VAL-NATIVE-010"],
+        "coverage_tags": ["goto:jump-into-local", "diagnostic:goto"],
         "description": "forward gotos into local variable scope produce Lua-compatible syntax diagnostics and nonzero exit",
         "source": "goto L\nlocal x\n::L::\nprint(1)\n",
     },
@@ -151,6 +359,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "runtime-error-core",
         "puc_file": "errors.lua",
         "validates": ["VAL-NATIVE-010"],
+        "coverage_tags": ["diagnostic:runtime-arithmetic"],
         "description": "runtime error stderr and exit-status parity for a core arithmetic failure",
         "source": 'local x = "bad" + 1\nprint(x)\n',
     },
@@ -158,6 +367,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "runtime-error-nil-arithmetic-core",
         "puc_file": "errors.lua",
         "validates": ["VAL-NATIVE-010"],
+        "coverage_tags": ["diagnostic:runtime-arithmetic"],
         "description": "runtime diagnostics identify nil arithmetic operands without hardcoded string/number add output",
         "source": "local x = nil + 1\nprint(x)\n",
     },
@@ -165,6 +375,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "runtime-error-boolean-arithmetic-core",
         "puc_file": "errors.lua",
         "validates": ["VAL-NATIVE-010"],
+        "coverage_tags": ["diagnostic:runtime-arithmetic"],
         "description": "runtime diagnostics identify boolean arithmetic operands with nonzero exit parity",
         "source": "local x = true + 1\nprint(x)\n",
     },
@@ -172,6 +383,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "runtime-error-concat-table-core",
         "puc_file": "errors.lua",
         "validates": ["VAL-NATIVE-010"],
+        "coverage_tags": ["diagnostic:runtime-concat"],
         "description": "runtime diagnostics identify invalid concatenation operands with Lua stack context",
         "source": 'print({} .. "x")\n',
     },
@@ -179,6 +391,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "runtime-error-index-nil-core",
         "puc_file": "errors.lua",
         "validates": ["VAL-NATIVE-010"],
+        "coverage_tags": ["diagnostic:runtime-index"],
         "description": "runtime diagnostics include actual local indexing context and source line",
         "source": "local x = nil\nprint(x.y)\n",
     },
@@ -186,6 +399,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "runtime-error-call-nil-core",
         "puc_file": "errors.lua",
         "validates": ["VAL-NATIVE-010"],
+        "coverage_tags": ["diagnostic:runtime-call"],
         "description": "runtime diagnostics include actual local call context and source line",
         "source": "local f = nil\nf()\n",
     },
@@ -193,6 +407,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "syntax-error-core",
         "puc_file": "errors.lua",
         "validates": ["VAL-NATIVE-010"],
+        "coverage_tags": ["diagnostic:syntax-block"],
         "description": "syntax error stderr and exit-status parity for a missing block terminator",
         "source": 'if true then print("x")\n',
     },
@@ -200,6 +415,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "syntax-error-while-missing-end-core",
         "puc_file": "errors.lua",
         "validates": ["VAL-NATIVE-010"],
+        "coverage_tags": ["diagnostic:syntax-block"],
         "description": "syntax diagnostics identify the actual unclosed while block and opener line",
         "source": "while true do print(1)\n",
     },
@@ -207,6 +423,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "syntax-error-missing-paren-core",
         "puc_file": "errors.lua",
         "validates": ["VAL-NATIVE-010"],
+        "coverage_tags": ["diagnostic:syntax-token"],
         "description": "syntax diagnostics identify missing close parenthesis and source line",
         "source": "print(1\n",
     },
@@ -214,6 +431,7 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "name": "syntax-error-unexpected-end-core",
         "puc_file": "errors.lua",
         "validates": ["VAL-NATIVE-010"],
+        "coverage_tags": ["diagnostic:syntax-token"],
         "description": "syntax diagnostics reject unexpected block terminators with nonzero exit",
         "source": "end\n",
     },
@@ -1410,6 +1628,7 @@ class BaselineOracle:
                     "puc_file": case["puc_file"],
                     "description": case["description"],
                     "validates": case["validates"],
+                    "coverage_tags": case.get("coverage_tags", []),
                     "state": case_state,
                     "errors": errors,
                     "stock_result_file": stock_file,
@@ -1427,6 +1646,9 @@ class BaselineOracle:
         required_ids = {f"VAL-NATIVE-{i:03d}" for i in range(4, 11)}
         missing_ids = sorted(required_ids.difference(validated_ids))
         if missing_ids:
+            state = "fail"
+        assertion_coverage, coverage_errors = validate_native_core_coverage(entries)
+        if coverage_errors:
             state = "fail"
         summary = {
             "state": state,
@@ -1446,6 +1668,10 @@ class BaselineOracle:
             "unsupported_count": unsupported_count,
             "validated_assertions": sorted(validated_ids),
             "missing_assertions": missing_ids,
+            "native_assertion_coverage": assertion_coverage,
+            "coverage_requirements": NATIVE_CORE_COVERAGE_REQUIREMENTS,
+            "coverage_errors": coverage_errors,
+            "coverage_error_count": len(coverage_errors),
             "staged_puc_files": sorted({str(case["puc_file"]) for case in NATIVE_CORE_LANGUAGE_CASES}),
             "required_puc_files": ["bitwise.lua", "bwcoercion.lua", "constructs.lua", "errors.lua", "goto.lua", "literals.lua", "vararg.lua"],
             "compared_fields": ["stdout", "stderr", "exit_code"],
@@ -3633,6 +3859,98 @@ def is_optional_level1_unsupported(snippet: dict[str, object], candidate: Comman
         return False
     stderr = candidate.stderr.lower()
     return is_unsupported_result(candidate) and ("closure" in stderr or "upvalue" in stderr)
+
+
+def native_core_assertion_coverage(entries: Iterable[dict[str, object]]) -> dict[str, dict[str, object]]:
+    coverage = {
+        assertion: {"cases": [], "puc_files": [], "tags": []}
+        for assertion in NATIVE_CORE_COVERAGE_REQUIREMENTS
+    }
+    case_sets: dict[str, set[str]] = {assertion: set() for assertion in NATIVE_CORE_COVERAGE_REQUIREMENTS}
+    puc_sets: dict[str, set[str]] = {assertion: set() for assertion in NATIVE_CORE_COVERAGE_REQUIREMENTS}
+    tag_sets: dict[str, set[str]] = {assertion: set() for assertion in NATIVE_CORE_COVERAGE_REQUIREMENTS}
+
+    for entry in entries:
+        validates = entry.get("validates", [])
+        if not isinstance(validates, list):
+            continue
+        eligible_native_pass = (
+            entry.get("state") == "pass"
+            and entry.get("implementation_mode") == "native"
+            and entry.get("no_host_lua") is True
+            and entry.get("fallback_observed") is False
+            and entry.get("unsupported_observed") is False
+        )
+        if not eligible_native_pass:
+            continue
+        tags = entry.get("coverage_tags", [])
+        if not isinstance(tags, list):
+            tags = []
+        case_name = str(entry.get("name", ""))
+        puc_file = str(entry.get("puc_file", ""))
+        for assertion in validates:
+            assertion = str(assertion)
+            if assertion not in NATIVE_CORE_COVERAGE_REQUIREMENTS:
+                continue
+            case_sets[assertion].add(case_name)
+            if puc_file:
+                puc_sets[assertion].add(puc_file)
+            tag_sets[assertion].update(str(tag) for tag in tags)
+
+    for assertion in coverage:
+        coverage[assertion] = {
+            "cases": sorted(case_sets[assertion]),
+            "case_count": len(case_sets[assertion]),
+            "puc_files": sorted(puc_sets[assertion]),
+            "tags": sorted(tag_sets[assertion]),
+        }
+    return coverage
+
+
+def validate_native_core_coverage(entries: Iterable[dict[str, object]]) -> tuple[dict[str, dict[str, object]], list[str]]:
+    materialized = list(entries)
+    errors: list[str] = []
+    for entry in materialized:
+        validates = entry.get("validates", [])
+        if not isinstance(validates, list):
+            continue
+        claimed_native = [str(assertion) for assertion in validates if str(assertion) in NATIVE_CORE_COVERAGE_REQUIREMENTS]
+        if not claimed_native:
+            continue
+        missing_fields = [
+            field
+            for field in ("implementation_mode", "no_host_lua", "coverage_tags", "fallback_observed", "unsupported_observed")
+            if field not in entry
+        ]
+        if missing_fields:
+            errors.append(f"{entry.get('name', '<unknown>')} claims {claimed_native} but is missing evidence fields: {missing_fields}")
+        if entry.get("state") == "pass":
+            if entry.get("implementation_mode") != "native" or entry.get("no_host_lua") is not True:
+                errors.append(
+                    f"{entry.get('name', '<unknown>')} claims {claimed_native} without native/no_host_lua evidence: "
+                    f"implementation_mode={entry.get('implementation_mode')!r}, no_host_lua={entry.get('no_host_lua')!r}"
+                )
+            if entry.get("fallback_observed") is not False or entry.get("unsupported_observed") is not False:
+                errors.append(
+                    f"{entry.get('name', '<unknown>')} claims {claimed_native} but observed "
+                    f"fallback={entry.get('fallback_observed')!r}, unsupported={entry.get('unsupported_observed')!r}"
+                )
+
+    coverage = native_core_assertion_coverage(materialized)
+    for assertion, requirement in NATIVE_CORE_COVERAGE_REQUIREMENTS.items():
+        actual = coverage[assertion]
+        min_cases = int(requirement["min_cases"])
+        if int(actual["case_count"]) < min_cases:
+            errors.append(f"{assertion} requires at least {min_cases} native/no-host cases; observed {actual['case_count']}")
+        actual_tags = set(actual["tags"])
+        missing_tags = sorted(set(requirement["required_tags"]) - actual_tags)
+        if missing_tags:
+            errors.append(f"{assertion} missing required native coverage tags: {missing_tags}")
+        actual_puc = set(actual["puc_files"])
+        missing_puc = sorted(set(requirement["required_puc_files"]) - actual_puc)
+        if missing_puc:
+            errors.append(f"{assertion} missing required staged PUC file evidence: {missing_puc}")
+    return coverage, errors
 
 
 def contains_reason_token(text: str, expected_reason: str) -> bool:

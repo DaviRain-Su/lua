@@ -1611,6 +1611,61 @@ class BaselineOracleTests(unittest.TestCase):
         self.assertTrue(any("cannot be satisfied" in error for error in errors))
         self.assertTrue(any("no_host_lua" in error for error in errors))
 
+    def test_native_core_coverage_requires_multiple_native_no_host_fixtures(self):
+        entries = []
+        for case in baseline_oracle.NATIVE_CORE_LANGUAGE_CASES:
+            entries.append(
+                {
+                    "name": case["name"],
+                    "puc_file": case["puc_file"],
+                    "validates": case["validates"],
+                    "coverage_tags": case["coverage_tags"],
+                    "state": "pass",
+                    "implementation_mode": "native",
+                    "no_host_lua": True,
+                    "fallback_observed": False,
+                    "unsupported_observed": False,
+                }
+            )
+
+        coverage, errors = baseline_oracle.validate_native_core_coverage(entries)
+
+        self.assertEqual(errors, [])
+        self.assertGreaterEqual(coverage["VAL-NATIVE-004"]["case_count"], 4)
+        self.assertIn("literal:table-constructor", coverage["VAL-NATIVE-004"]["tags"])
+        self.assertGreaterEqual(coverage["VAL-NATIVE-006"]["case_count"], 4)
+        self.assertIn("vararg:main-chunk", coverage["VAL-NATIVE-006"]["tags"])
+        self.assertGreaterEqual(coverage["VAL-NATIVE-008"]["case_count"], 5)
+        self.assertIn("coercion:overflow-error", coverage["VAL-NATIVE-008"]["tags"])
+        self.assertIn("diagnostic:bitwise-coercion", coverage["VAL-NATIVE-010"]["tags"])
+
+    def test_native_core_coverage_rejects_fallback_or_missing_evidence(self):
+        entries = [
+            {
+                "name": "single-fallback-literal",
+                "puc_file": "literals.lua",
+                "validates": ["VAL-NATIVE-004"],
+                "coverage_tags": ["literal:nil-boolean"],
+                "state": "pass",
+                "implementation_mode": "stock-lua-fallback",
+                "no_host_lua": False,
+                "fallback_observed": True,
+                "unsupported_observed": False,
+            },
+            {
+                "name": "missing-evidence-vararg",
+                "puc_file": "vararg.lua",
+                "validates": ["VAL-NATIVE-006"],
+                "state": "pass",
+            },
+        ]
+
+        _, errors = baseline_oracle.validate_native_core_coverage(entries)
+
+        self.assertTrue(any("without native/no_host_lua evidence" in error for error in errors), errors)
+        self.assertTrue(any("missing evidence fields" in error for error in errors), errors)
+        self.assertTrue(any("VAL-NATIVE-004 requires at least" in error for error in errors), errors)
+
     def test_packaged_advanced_smokes_run_protected_and_metatable_native_fixtures(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

@@ -2334,8 +2334,7 @@ fn valueToInteger(value: Value) !i64 {
         .float => |f| {
             if (f != f) return error.RuntimeError;
             if (@floor(f) != f) return error.RuntimeError;
-            if (f < @as(f64, @floatFromInt(std.math.minInt(i64))) or
-                f > @as(f64, @floatFromInt(std.math.maxInt(i64)))) return error.RuntimeError;
+            if (f < -9223372036854775808.0 or f >= 9223372036854775808.0) return error.RuntimeError;
             return @intFromFloat(f);
         },
         else => error.RuntimeError,
@@ -2612,6 +2611,7 @@ test "vm level0 literals locals arithmetic strings tables control flow and bitwi
         .{ .source = "print(1 == 1.0, 1 ~= 1.0)\n", .stdout = "true\tfalse\n" },
         .{ .source = "local x = 0\ngoto skip\nx = 99\n::skip::\nx = x + 1\nprint(x)\n", .stdout = "1\n" },
         .{ .source = "local preload_value = \"debug words are data\"\nlocal loader_count = 9\nprint(preload_value, loader_count)\n", .stdout = "debug words are data\t9\n" },
+        .{ .source = "print((-9223372036854775808.0) & 1)\n", .stdout = "0\n" },
     };
     for (snippets) |snippet| {
         const result = try runLevel0(arena.allocator(), snippet.source);
@@ -2759,6 +2759,22 @@ test "ordered comparisons follow lua number string and invalid operand semantics
     const invalid = try runLevel0(arena.allocator(), "print(\"2\" < 10)\n");
     try std.testing.expectEqual(VmState.runtime_error, invalid.state);
     try std.testing.expect(std.mem.indexOf(u8, invalid.stderr, "attempt to compare string with number") != null);
+}
+
+test "bitwise float coercion rejects nan and overflow without panicking" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const snippets = [_][]const u8{
+        "print(0/0 & 1)\n",
+        "print(9223372036854775808.0 & 1)\n",
+    };
+    for (snippets) |source| {
+        const result = try runLevel0(arena.allocator(), source);
+        try std.testing.expectEqual(VmState.runtime_error, result.state);
+        try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "number has no integer representation") != null);
+        _ = arena.reset(.retain_capacity);
+    }
 }
 
 test "vm level1 closures and dynamic features are explicitly unsupported fallback" {
