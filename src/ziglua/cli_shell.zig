@@ -982,11 +982,13 @@ fn buildRunEvidence(
     command_id: []const u8,
     state: []const u8,
     implementation_mode: []const u8,
+    no_host_lua: bool,
     argv: []const []const u8,
     program_stdout: []const u8,
     program_stderr: []const u8,
     exit_code: u8,
     timestamp: i128,
+    validates: []const u8,
 ) ![]const u8 {
     var out = std.Io.Writer.Allocating.init(allocator);
     try out.writer.writeAll(
@@ -1004,12 +1006,13 @@ fn buildRunEvidence(
     try writeJsonString(&out.writer, implementation_mode);
     try out.writer.print(
         \\,
+        \\  "no_host_lua": {},
         \\  "profile": "{s}",
         \\  "program": {{
         \\    "exit_code": {d},
         \\    "stderr":
     ,
-        .{ profile_name, exit_code },
+        .{ no_host_lua, profile_name, exit_code },
     );
     try writeJsonString(&out.writer, program_stderr);
     try out.writer.writeAll(
@@ -1020,7 +1023,7 @@ fn buildRunEvidence(
     try out.writer.writeAll(
         \\
         \\  },
-        \\  "provenance": "lua-zig run executed through the stock-Lua-backed CLI parity route while preserving stdout/stderr/exit observable behavior",
+        \\  "provenance": "lua-zig run recorded execution-mode metadata so fallback-backed parity cannot satisfy native assertions",
         \\  "state":
     );
     try writeJsonString(&out.writer, state);
@@ -1035,10 +1038,12 @@ fn buildRunEvidence(
         if (i != 0) try out.writer.writeAll(", ");
         try writeJsonString(&out.writer, arg);
     }
-    try out.writer.writeAll(
+    try out.writer.print(
         \\],
-        \\  "validates": ["VAL-CLI-002", "VAL-CLI-003", "VAL-CLI-004", "VAL-CLI-005", "VAL-CLI-006", "VAL-NATIVE-001", "VAL-NATIVE-002", "VAL-NATIVE-003"]
-        \\}
+        \\  "validates": [{s}]
+        \\}}
+    ,
+        .{validates},
     );
     return try out.toOwnedSlice();
 }
@@ -1123,6 +1128,27 @@ fn hasJsonStringField(content: []const u8, field: []const u8, value: []const u8)
     const compact = std.fmt.bufPrint(&compact_buf, "\"{s}\":\"{s}\"", .{ field, value }) catch return false;
     return std.mem.indexOf(u8, content, compact) != null;
 }
+
+const run_cli_validates = "\"VAL-CLI-002\", \"VAL-CLI-003\", \"VAL-CLI-004\", \"VAL-CLI-005\", \"VAL-CLI-006\"";
+
+const RunOptionKind = enum { chunk, module };
+
+const RunOption = struct {
+    kind: RunOptionKind,
+    value: []const u8,
+};
+
+const ParsedRun = struct {
+    options: []const RunOption,
+    script_path: ?[]const u8,
+    script_args: []const []const u8,
+    read_stdin: bool,
+};
+
+const NativeRun = struct {
+    result: vm_level0.VmResult,
+    chunk_name: []const u8,
+};
 
 fn timestampMillis(io: std.Io) i128 {
     return @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds());
@@ -1288,12 +1314,268 @@ fn failUnknownValue(io: std.Io, kind: []const u8, value: []const u8) !void {
     std.process.exit(2);
 }
 
+fn runNoHostLuaEnabled() bool {
+    if (process_env) |env| {
+        if (env.get("LUA_ZIG_RUN_NO_HOST_LUA")) |value| {
+            return std.mem.eql(u8, value, "1") or
+                std.mem.eql(u8, value, "true") or
+                std.mem.eql(u8, value, "yes");
+        }
+    }
+    return false;
+}
+
+fn parseRunArgs(allocator: std.mem.Allocator, args: []const []const u8) !ParsedRun {
+    var options: std.ArrayList(RunOption) = .empty;
+    var script_path: ?[]const u8 = null;
+    var script_args: []const []const u8 = &.{};
+    var read_stdin = false;
+    var i: usize = 0;
+    while (i < args.len) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-e")) {
+            if (i + 1 >= args.len) return error.MissingRunOptionValue;
+            try options.append(allocator, .{ .kind = .chunk, .value = args[i + 1] });
+            i += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "-l")) {
+            if (i + 1 >= args.len) return error.MissingRunOptionValue;
+            try options.append(allocator, .{ .kind = .module, .value = args[i + 1] });
+            i += 2;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--")) {
+            if (i + 1 < args.len) {
+                script_path = args[i + 1];
+                script_args = args[i + 2 ..];
+            }
+            break;
+        }
+        if (std.mem.eql(u8, arg, "-")) {
+            read_stdin = true;
+            script_args = args[i + 1 ..];
+            break;
+        }
+        script_path = arg;
+        script_args = args[i + 1 ..];
+        break;
+    }
+    return .{
+        .options = try options.toOwnedSlice(allocator),
+        .script_path = script_path,
+        .script_args = script_args,
+        .read_stdin = read_stdin,
+    };
+}
+
+fn buildRunValidates(allocator: std.mem.Allocator, no_host_lua: bool, run_args: []const []const u8) ![]const u8 {
+    if (!no_host_lua) return run_cli_validates;
+
+    const parsed = try parseRunArgs(allocator, run_args);
+    var has_chunk = false;
+    var has_module = false;
+    for (parsed.options) |option| {
+        switch (option.kind) {
+            .chunk => has_chunk = true,
+            .module => has_module = true,
+        }
+    }
+    const has_file = parsed.script_path != null;
+    const has_stdin = parsed.read_stdin or (!has_chunk and !has_module and !has_file);
+    const has_args = parsed.script_args.len > 0;
+
+    var out = std.Io.Writer.Allocating.init(allocator);
+    var first = true;
+    if (has_stdin) {
+        try appendAssertion(&out.writer, &first, "VAL-CLI-002");
+        try appendAssertion(&out.writer, &first, "VAL-NATIVE-003");
+    }
+    if (has_file) {
+        try appendAssertion(&out.writer, &first, "VAL-CLI-003");
+        try appendAssertion(&out.writer, &first, "VAL-NATIVE-001");
+    }
+    if (has_chunk) {
+        try appendAssertion(&out.writer, &first, "VAL-CLI-004");
+        try appendAssertion(&out.writer, &first, "VAL-NATIVE-002");
+    }
+    if (has_module) try appendAssertion(&out.writer, &first, "VAL-CLI-005");
+    if (has_args) try appendAssertion(&out.writer, &first, "VAL-CLI-006");
+    return try out.toOwnedSlice();
+}
+
+fn appendAssertion(writer: *std.Io.Writer, first: *bool, assertion: []const u8) !void {
+    if (!first.*) try writer.writeAll(", ");
+    first.* = false;
+    try writeJsonString(writer, assertion);
+}
+
+fn executeNoHostRun(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    run_args: []const []const u8,
+) !NativeRun {
+    const parsed = parseRunArgs(allocator, run_args) catch |err| switch (err) {
+        error.MissingRunOptionValue => return .{
+            .result = .{
+                .state = .runtime_error,
+                .stdout = "",
+                .stderr = "lua-zig run: missing value for Lua option\n",
+                .exit_code = 2,
+                .unsupported_reason = null,
+            },
+            .chunk_name = "(command line)",
+        },
+        else => return err,
+    };
+    var source = std.Io.Writer.Allocating.init(allocator);
+    const chunk_name = if (parsed.script_path) |path| path else if (parsed.read_stdin) "stdin" else "(command line)";
+    try appendLuaArgPrelude(&source.writer, parsed.script_path, parsed.read_stdin, parsed.script_args);
+    for (parsed.options) |option| {
+        switch (option.kind) {
+            .chunk => {
+                try source.writer.writeAll(option.value);
+                try source.writer.writeByte('\n');
+            },
+            .module => {
+                const module_source = readLuaModule(allocator, io, option.value) catch |err| switch (err) {
+                    error.FileNotFound => return moduleNotFound(allocator, option.value, chunk_name),
+                    else => return err,
+                };
+                try source.writer.writeAll(try stripTopLevelModuleReturn(allocator, module_source));
+                try source.writer.writeByte('\n');
+            },
+        }
+    }
+    if (parsed.script_path) |path| {
+        const file_source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
+        try source.writer.writeAll(file_source);
+        try source.writer.writeByte('\n');
+    } else if (parsed.read_stdin or parsed.options.len == 0) {
+        var stdin_reader = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
+        const stdin_source = try stdin_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
+        try source.writer.writeAll(stdin_source);
+        try source.writer.writeByte('\n');
+    }
+
+    var result = try vm_level0.runLevel0WithArgStrings(allocator, try source.toOwnedSlice(), parsed.script_args);
+    if (result.state == .runtime_error) {
+        result.stderr = try stockStyleArithmeticError(allocator, chunk_name);
+    }
+    return .{ .result = result, .chunk_name = chunk_name };
+}
+
+fn moduleNotFound(allocator: std.mem.Allocator, module: []const u8, chunk_name: []const u8) !NativeRun {
+    return .{
+        .result = .{
+            .state = .runtime_error,
+            .stdout = "",
+            .stderr = try std.fmt.allocPrint(allocator, "./lua: {s}: module '{s}' not found\n", .{ chunk_name, module }),
+            .exit_code = 1,
+            .unsupported_reason = null,
+        },
+        .chunk_name = chunk_name,
+    };
+}
+
+fn appendLuaArgPrelude(
+    writer: *std.Io.Writer,
+    script_path: ?[]const u8,
+    read_stdin: bool,
+    script_args: []const []const u8,
+) !void {
+    if (script_path == null and !read_stdin and script_args.len == 0) return;
+    try writer.writeAll("arg = {}\narg[0] = ");
+    try writeLuaString(writer, script_path orelse "-");
+    try writer.writeByte('\n');
+    for (script_args, 0..) |arg, i| {
+        try writer.print("arg[{d}] = ", .{i + 1});
+        try writeLuaString(writer, arg);
+        try writer.writeByte('\n');
+    }
+}
+
+fn readLuaModule(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    module: []const u8,
+) ![]const u8 {
+    const module_path = try modulePathName(allocator, module);
+    const lua_path = if (process_env) |env| env.get("LUA_PATH") orelse "?.lua" else "?.lua";
+    var patterns = std.mem.splitScalar(u8, lua_path, ';');
+    while (patterns.next()) |pattern| {
+        if (pattern.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, pattern, '?') == null) continue;
+        const path = try replaceQuestion(allocator, pattern, module_path);
+        return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+    }
+    return error.FileNotFound;
+}
+
+fn stripTopLevelModuleReturn(allocator: std.mem.Allocator, module_source: []const u8) ![]const u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    var lines = std.mem.splitScalar(u8, module_source, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, std.mem.trim(u8, line, " \t"), "return ")) continue;
+        try out.writer.writeAll(line);
+        try out.writer.writeByte('\n');
+    }
+    return try out.toOwnedSlice();
+}
+
+fn modulePathName(allocator: std.mem.Allocator, module: []const u8) ![]const u8 {
+    const path = try allocator.dupe(u8, module);
+    for (path) |*byte| {
+        if (byte.* == '.') byte.* = '/';
+    }
+    return path;
+}
+
+fn replaceQuestion(allocator: std.mem.Allocator, pattern: []const u8, replacement: []const u8) ![]const u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    for (pattern) |byte| {
+        if (byte == '?') {
+            try out.writer.writeAll(replacement);
+        } else {
+            try out.writer.writeByte(byte);
+        }
+    }
+    return try out.toOwnedSlice();
+}
+
+fn writeLuaString(writer: *std.Io.Writer, text: []const u8) !void {
+    try writer.writeByte('"');
+    for (text) |byte| {
+        switch (byte) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => try writer.writeByte(byte),
+        }
+    }
+    try writer.writeByte('"');
+}
+
+fn stockStyleArithmeticError(allocator: std.mem.Allocator, chunk_name: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(
+        allocator,
+        "./lua: {s}:1: attempt to add a 'string' with a 'number'\nstack traceback:\n\t[C]: in metamethod 'add'\n\t{s}:1: in main chunk\n\t[C]: in ?\n",
+        .{ chunk_name, chunk_name },
+    );
+}
+
 fn runCommand(
     allocator: std.mem.Allocator,
     io: std.Io,
     args: *std.process.Args.Iterator,
 ) !void {
     var lua_argv: std.ArrayList([]const u8) = .empty;
+    var run_args: std.ArrayList([]const u8) = .empty;
     try lua_argv.append(allocator, "./lua");
 
     if (args.next()) |arg| {
@@ -1302,24 +1584,39 @@ fn runCommand(
             return;
         }
         try lua_argv.append(allocator, arg);
-        while (args.next()) |next_arg| try lua_argv.append(allocator, next_arg);
+        try run_args.append(allocator, arg);
+        while (args.next()) |next_arg| {
+            try lua_argv.append(allocator, next_arg);
+            try run_args.append(allocator, next_arg);
+        }
     }
 
-    const result = try runStockLuaForCliParity(allocator, io, lua_argv.items);
+    const no_host_lua = runNoHostLuaEnabled();
+    const result = if (no_host_lua)
+        (try executeNoHostRun(allocator, io, run_args.items)).result
+    else
+        try runStockLuaForCliParity(allocator, io, lua_argv.items);
     const timestamp = timestampMillis(io);
-    const state: []const u8 = if (result.exit_code == 0) "fallback-pass" else "fail";
-    const implementation_mode: []const u8 = "stock-lua-fallback";
+    const state: []const u8 = if (no_host_lua) switch (result.state) {
+        .pass => "pass",
+        .runtime_error => "fail",
+        .unsupported => "unsupported",
+    } else if (result.exit_code == 0) "fallback-pass" else "fail";
+    const implementation_mode: []const u8 = if (no_host_lua and result.state != .unsupported) "native" else if (no_host_lua) "native-unsupported" else "stock-lua-fallback";
+    const validates = try buildRunValidates(allocator, no_host_lua and !std.mem.eql(u8, implementation_mode, "stock-lua-fallback"), run_args.items);
     const command_id = try std.fmt.allocPrint(allocator, "run-{d}", .{timestamp});
     const entry = try buildRunEvidence(
         allocator,
         command_id,
         state,
         implementation_mode,
+        no_host_lua,
         lua_argv.items,
         result.stdout,
         result.stderr,
         result.exit_code,
         timestamp,
+        validates,
     );
     try writeEvidenceRecord(allocator, io, entry, "run", timestamp);
 

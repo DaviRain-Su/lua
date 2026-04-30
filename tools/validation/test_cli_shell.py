@@ -296,6 +296,43 @@ class LuaZigCliShellTests(unittest.TestCase):
         self.assertEqual(completed.stdout, "42\n")
         self.assertEqual(completed.stderr, "")
 
+    def test_run_no_host_mode_records_native_evidence_for_native_assertions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            evidence_dir = Path(temp) / "evidence"
+            completed = run(
+                str(CLI),
+                "run",
+                "-",
+                stdin="print(21 + 21)\n",
+                env={"LUA_ZIG_EVIDENCE_DIR": str(evidence_dir), "LUA_ZIG_RUN_NO_HOST_LUA": "1"},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            self.assertEqual(completed.stdout, "42\n")
+            evidence_files = list(evidence_dir.glob("run-*.json"))
+            self.assertEqual(len(evidence_files), 1)
+            evidence = json.loads(evidence_files[0].read_text())
+            self.assertEqual(evidence["implementation_mode"], "native")
+            self.assertIs(evidence["no_host_lua"], True)
+            self.assertIn("VAL-NATIVE-003", evidence["validates"])
+
+    def test_run_fallback_evidence_cannot_claim_native_assertions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            evidence_dir = Path(temp) / "evidence"
+            completed = run(
+                str(CLI),
+                "run",
+                "-",
+                stdin="print(21 + 21)\n",
+                env={"LUA_ZIG_EVIDENCE_DIR": str(evidence_dir)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            evidence = json.loads(next(evidence_dir.glob("run-*.json")).read_text())
+            self.assertEqual(evidence["implementation_mode"], "stock-lua-fallback")
+            self.assertIs(evidence["no_host_lua"], False)
+            self.assertFalse(any(assertion.startswith("VAL-NATIVE-") for assertion in evidence["validates"]))
+
     def assertRunParity(
         self,
         stock_args: list[str],

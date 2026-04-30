@@ -1598,6 +1598,19 @@ class BaselineOracleTests(unittest.TestCase):
         self.assertTrue(all(not entry["requires_service"] for entry in summary["validators"]))
         self.assertTrue(all("command" in entry for entry in summary["validators"]))
 
+    def test_run_parity_native_assertions_reject_stock_lua_fallback_evidence(self):
+        repo = Path("/repo")
+        oracle = baseline_oracle.BaselineOracle(repo, repo / "build")
+
+        errors = oracle.validate_run_evidence(
+            ["VAL-CLI-002", "VAL-NATIVE-003"],
+            {"implementation_mode": "stock-lua-fallback", "no_host_lua": False, "validates": ["VAL-CLI-002"]},
+            expected_no_host_lua=True,
+        )
+
+        self.assertTrue(any("cannot be satisfied" in error for error in errors))
+        self.assertTrue(any("no_host_lua" in error for error in errors))
+
     def test_packaged_advanced_smokes_run_protected_and_metatable_native_fixtures(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)

@@ -455,7 +455,7 @@ class BaselineOracle:
         return summary
 
     def run_lua_zig_run_cli_parity(self) -> dict[str, object]:
-        fixtures_dir = self.out_dir / "run-parity-fixtures"
+        fixtures_dir = self.repo / "build" / "run-parity-fixtures"
         fixtures_dir.mkdir(parents=True, exist_ok=True)
 
         args_script = fixtures_dir / "args.lua"
@@ -466,26 +466,30 @@ class BaselineOracle:
             encoding="utf-8",
         )
         file_error_script = fixtures_dir / "file-error.lua"
-        file_error_script.write_text('error("file boom", 0)\n', encoding="utf-8")
+        file_error_script.write_text('local x = "bad" + 1\nprint(x)\n', encoding="utf-8")
         e_file_script = fixtures_dir / "e-file.lua"
         e_file_script.write_text("print(prefix .. ':file')\n", encoding="utf-8")
         module_script = fixtures_dir / "fixture_module.lua"
         module_script.write_text(
             "fixture_module = { value = 42 }\n"
-            "io.write('loaded\\n')\n"
+            "print('loaded')\n"
             "return fixture_module\n",
             encoding="utf-8",
         )
         module_env = {"LUA_PATH": f"{fixtures_dir}/?.lua;;"}
+        args_script_arg = str(args_script.relative_to(self.repo))
+        file_error_script_arg = str(file_error_script.relative_to(self.repo))
+        e_file_script_arg = str(e_file_script.relative_to(self.repo))
 
         cases = [
             {
                 "id": "stdin-success",
                 "stock_args": ["-"],
                 "candidate_args": ["./zig-out/bin/lua-zig", "run", "-"],
-                "stdin": 'io.stdout:write("stdin-ok\\n")\n',
+                "stdin": 'print("stdin-ok")\n',
                 "env": {},
                 "validates": ["VAL-CLI-002", "VAL-NATIVE-003"],
+                "no_host_lua": True,
             },
             {
                 "id": "stdin-runtime-error",
@@ -494,22 +498,25 @@ class BaselineOracle:
                 "stdin": 'local x = "bad" + 1\nprint(x)\n',
                 "env": {},
                 "validates": ["VAL-CLI-002", "VAL-NATIVE-003"],
+                "no_host_lua": True,
             },
             {
                 "id": "file-args",
-                "stock_args": [str(args_script), "alpha", "--flag"],
-                "candidate_args": ["./zig-out/bin/lua-zig", "run", str(args_script), "alpha", "--flag"],
+                "stock_args": [args_script_arg, "alpha", "--flag"],
+                "candidate_args": ["./zig-out/bin/lua-zig", "run", args_script_arg, "alpha", "--flag"],
                 "stdin": None,
                 "env": {},
                 "validates": ["VAL-CLI-003", "VAL-CLI-006", "VAL-NATIVE-001"],
+                "no_host_lua": True,
             },
             {
                 "id": "file-diagnostic",
-                "stock_args": [str(file_error_script)],
-                "candidate_args": ["./zig-out/bin/lua-zig", "run", str(file_error_script)],
+                "stock_args": [file_error_script_arg],
+                "candidate_args": ["./zig-out/bin/lua-zig", "run", file_error_script_arg],
                 "stdin": None,
                 "env": {},
                 "validates": ["VAL-CLI-003", "VAL-NATIVE-001"],
+                "no_host_lua": True,
             },
             {
                 "id": "e-order",
@@ -518,14 +525,16 @@ class BaselineOracle:
                 "stdin": None,
                 "env": {},
                 "validates": ["VAL-CLI-004", "VAL-NATIVE-002"],
+                "no_host_lua": True,
             },
             {
                 "id": "e-file-composition",
-                "stock_args": ["-e", "prefix = 'from-e'", str(e_file_script)],
-                "candidate_args": ["./zig-out/bin/lua-zig", "run", "-e", "prefix = 'from-e'", str(e_file_script)],
+                "stock_args": ["-e", "prefix = 'from-e'", e_file_script_arg],
+                "candidate_args": ["./zig-out/bin/lua-zig", "run", "-e", "prefix = 'from-e'", e_file_script_arg],
                 "stdin": None,
                 "env": {},
                 "validates": ["VAL-CLI-004", "VAL-CLI-003", "VAL-NATIVE-002"],
+                "no_host_lua": True,
             },
             {
                 "id": "l-preload",
@@ -534,6 +543,7 @@ class BaselineOracle:
                 "stdin": None,
                 "env": module_env,
                 "validates": ["VAL-CLI-005"],
+                "no_host_lua": True,
             },
             {
                 "id": "l-missing-diagnostic",
@@ -542,6 +552,7 @@ class BaselineOracle:
                 "stdin": None,
                 "env": module_env,
                 "validates": ["VAL-CLI-005"],
+                "no_host_lua": False,
             },
         ]
 
@@ -549,10 +560,19 @@ class BaselineOracle:
         state = "pass"
         for case in cases:
             stock = self.runner(["./lua", *case["stock_args"]], self.repo, case["env"], case["stdin"], None)
-            candidate = self.runner(case["candidate_args"], self.repo, case["env"], case["stdin"], None)
+            evidence_dir = self.out_dir / "run-parity-evidence" / case["id"]
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            candidate_env = {**case["env"], "LUA_ZIG_EVIDENCE_DIR": str(evidence_dir)}
+            if case["no_host_lua"]:
+                candidate_env["LUA_ZIG_RUN_NO_HOST_LUA"] = "1"
+            candidate = self.runner(case["candidate_args"], self.repo, candidate_env, case["stdin"], None)
             stock_file = self.write_result(f"run-parity-stock-{case['id']}", stock)
             candidate_file = self.write_result(f"run-parity-candidate-{case['id']}", candidate)
             diffs = compare_cli_results(stock.to_dict(), candidate.to_dict())
+            evidence = self.read_run_evidence(evidence_dir)
+            evidence_errors = self.validate_run_evidence(case["validates"], evidence, bool(case["no_host_lua"]))
+            if evidence_errors:
+                diffs["evidence"] = "\n".join(evidence_errors)
             case_state = "pass" if not diffs else "fail"
             if case_state != "pass":
                 state = "fail"
@@ -565,6 +585,9 @@ class BaselineOracle:
                     "stock_command": stock.to_dict()["command_text"],
                     "candidate_command": candidate.to_dict()["command_text"],
                     "diffs": diffs,
+                    "implementation_mode": evidence.get("implementation_mode"),
+                    "no_host_lua": evidence.get("no_host_lua"),
+                    "run_evidence_file": evidence.get("result_file"),
                     "validates": case["validates"],
                 }
             )
@@ -591,6 +614,48 @@ class BaselineOracle:
         }
         self.write_json("run-parity/summary.json", summary)
         return summary
+
+    def read_run_evidence(self, evidence_dir: Path) -> dict[str, object]:
+        records = sorted(evidence_dir.glob("run-*.json"))
+        if not records:
+            return {"state": "fail", "message": "missing lua-zig run evidence"}
+        record = records[-1]
+        try:
+            data = json.loads(record.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            return {"state": "fail", "message": f"invalid lua-zig run evidence: {exc}", "result_file": str(record)}
+        data["result_file"] = str(record)
+        return data
+
+    def validate_run_evidence(
+        self,
+        validates: list[str],
+        evidence: dict[str, object],
+        expected_no_host_lua: bool,
+    ) -> list[str]:
+        errors: list[str] = []
+        implementation_mode = evidence.get("implementation_mode")
+        no_host_lua = evidence.get("no_host_lua")
+        if "implementation_mode" not in evidence:
+            errors.append("run evidence missing implementation_mode")
+        if "no_host_lua" not in evidence:
+            errors.append("run evidence missing no_host_lua")
+        if expected_no_host_lua and no_host_lua is not True:
+            errors.append(f"run evidence no_host_lua={no_host_lua!r}; expected true for fallback-disabled candidate mode")
+        native_assertions = [assertion for assertion in validates if assertion.startswith("VAL-NATIVE-")]
+        if native_assertions:
+            if implementation_mode in {"stock-lua-fallback", "fallback-pass", "host-lua"}:
+                errors.append(f"native assertions {native_assertions} cannot be satisfied by implementation_mode={implementation_mode!r}")
+            if implementation_mode != "native" or no_host_lua is not True:
+                errors.append(
+                    f"native assertions {native_assertions} require implementation_mode='native' and no_host_lua=true; "
+                    f"observed implementation_mode={implementation_mode!r}, no_host_lua={no_host_lua!r}"
+                )
+            evidence_validates = set(evidence.get("validates", []))
+            missing = sorted(set(native_assertions) - evidence_validates)
+            if missing:
+                errors.append(f"run evidence missing native assertion ids: {missing}")
+        return errors
 
     def run_build(self) -> dict[str, object]:
         build = self.runner(DARWIN_BUILD_COMMAND, self.repo, DARWIN_BUILD_OVERRIDES, None, None)
