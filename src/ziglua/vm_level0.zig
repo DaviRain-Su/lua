@@ -292,6 +292,7 @@ const CallFrame = struct {
     env: ?*Table,
     captures: *std.StringHashMap(*Cell),
     body_end: usize,
+    call_line: ?usize,
 };
 
 const ExecSignal = union(enum) {
@@ -318,17 +319,30 @@ const Vm = struct {
     scopes: std.ArrayList(Scope),
     frames: std.ArrayList(CallFrame),
     runtime_error_message: ?[]const u8,
+    runtime_error_value: ?Value,
     runtime_error_line: usize,
     runtime_error_metamethod: ?[]const u8,
     current_thread: ?*Thread,
     syntax_error_message: ?[]const u8,
     syntax_error_line: usize,
+    error_chunk_name: []const u8,
+    error_line_offset: usize,
 
     fn init(allocator: std.mem.Allocator, tokens: []const Token) !Vm {
         return initWithVarargs(allocator, tokens, &.{});
     }
 
     fn initWithVarargs(allocator: std.mem.Allocator, tokens: []const Token, varargs: []const Value) !Vm {
+        return initWithContext(allocator, tokens, varargs, "stdin", 0);
+    }
+
+    fn initWithContext(
+        allocator: std.mem.Allocator,
+        tokens: []const Token,
+        varargs: []const Value,
+        error_chunk_name: []const u8,
+        error_line_offset: usize,
+    ) !Vm {
         var vm = Vm{
             .allocator = allocator,
             .tokens = tokens,
@@ -336,11 +350,14 @@ const Vm = struct {
             .scopes = .empty,
             .frames = .empty,
             .runtime_error_message = null,
+            .runtime_error_value = null,
             .runtime_error_line = 1,
             .runtime_error_metamethod = null,
             .current_thread = null,
             .syntax_error_message = null,
             .syntax_error_line = 1,
+            .error_chunk_name = error_chunk_name,
+            .error_line_offset = error_line_offset,
         };
         try vm.pushScope(varargs, varargs.len > 0);
         const default_env = try Table.create(allocator);
@@ -552,18 +569,45 @@ const Vm = struct {
 
     fn setRuntimeError(self: *Vm, message: []const u8) void {
         self.runtime_error_message = message;
+        self.runtime_error_value = .{ .string = message };
     }
 
     fn setRuntimeErrorAt(self: *Vm, line: usize, message: []const u8) void {
         self.runtime_error_line = line;
         self.runtime_error_message = message;
+        self.runtime_error_value = .{ .string = message };
+        self.runtime_error_metamethod = null;
+    }
+
+    fn setRuntimeErrorValueAt(self: *Vm, line: usize, value: Value, message: []const u8) void {
+        self.runtime_error_line = line;
+        self.runtime_error_message = message;
+        self.runtime_error_value = value;
         self.runtime_error_metamethod = null;
     }
 
     fn setRuntimeMetamethodErrorAt(self: *Vm, line: usize, metamethod: []const u8, message: []const u8) void {
         self.runtime_error_line = line;
         self.runtime_error_message = message;
+        self.runtime_error_value = .{ .string = message };
         self.runtime_error_metamethod = metamethod;
+    }
+
+    fn clearRuntimeError(self: *Vm) void {
+        self.runtime_error_message = null;
+        self.runtime_error_value = null;
+        self.runtime_error_metamethod = null;
+    }
+
+    fn currentRuntimeErrorValue(self: *Vm) Value {
+        if (self.runtime_error_value) |value| return value;
+        if (self.runtime_error_message) |message| return .{ .string = message };
+        return .{ .string = "runtime error" };
+    }
+
+    fn errorSourceLine(self: *Vm, line: usize) usize {
+        if (line > self.error_line_offset) return line - self.error_line_offset;
+        return line;
     }
 
     fn setSyntaxErrorAt(self: *Vm, line: usize, message: []const u8) void {
@@ -1730,8 +1774,20 @@ const Parser = struct {
                 return values;
             },
             .lua_error => {
-                const message = if (args.len > 0) try valueToStringForTostring(self.vm.allocator, args[0]) else "error";
-                self.vm.setRuntimeErrorAt(self.active_call_line orelse self.peek().line, message);
+                const raw_value = if (args.len > 0) args[0] else Value{ .nil = {} };
+                const error_value = if (raw_value.isNil()) Value{ .string = "<no error object>" } else raw_value;
+                const level = if (args.len > 1 and !args[1].isNil()) try valueToInteger(args[1]) else 1;
+                const raw_line = self.active_call_line orelse self.peek().line;
+                const final_value = if (error_value == .string and level > 0) blk: {
+                    const source_line = self.errorLevelLine(level) orelse break :blk error_value;
+                    break :blk Value{ .string = try std.fmt.allocPrint(
+                        self.vm.allocator,
+                        "{s}:{d}: {s}",
+                        .{ self.vm.error_chunk_name, self.vm.errorSourceLine(source_line), error_value.string },
+                    ) };
+                } else error_value;
+                const message = try valueToStringForTostring(self.vm.allocator, final_value);
+                self.vm.setRuntimeErrorValueAt(raw_line, final_value, message);
                 return error.RuntimeError;
             },
             .pcall => {
@@ -1746,7 +1802,7 @@ const Parser = struct {
                 if (args.len < 1 or args[0] != .function) return error.RuntimeError;
                 const thread = try self.vm.allocator.create(Thread);
                 thread.* = .{
-                    .vm = try Vm.init(self.vm.allocator, self.vm.tokens),
+                    .vm = try Vm.initWithContext(self.vm.allocator, self.vm.tokens, &.{}, self.vm.error_chunk_name, self.vm.error_line_offset),
                     .function = args[0].function,
                     .status = .suspended,
                     .continuations = .empty,
@@ -1789,7 +1845,7 @@ const Parser = struct {
                 if (args.len < 1 or args[0] != .function) return error.RuntimeError;
                 const thread = try self.vm.allocator.create(Thread);
                 thread.* = .{
-                    .vm = try Vm.init(self.vm.allocator, self.vm.tokens),
+                    .vm = try Vm.initWithContext(self.vm.allocator, self.vm.tokens, &.{}, self.vm.error_chunk_name, self.vm.error_line_offset),
                     .function = args[0].function,
                     .status = .suspended,
                     .continuations = .empty,
@@ -1818,12 +1874,21 @@ const Parser = struct {
         }
     }
 
+    fn errorLevelLine(self: *Parser, level: i64) ?usize {
+        if (level <= 0) return null;
+        if (level == 1) return self.active_call_line orelse self.peek().line;
+        const frame_level: usize = @intCast(level - 1);
+        if (self.vm.frames.items.len < frame_level) return null;
+        const frame_index = self.vm.frames.items.len - frame_level;
+        return self.vm.frames.items[frame_index].call_line;
+    }
+
     fn protectedCall(self: *Parser, callee: Value, args: []const Value, handler: ?Value) anyerror![]const Value {
         const saved_message = self.vm.runtime_error_message;
+        const saved_value = self.vm.runtime_error_value;
         const saved_line = self.vm.runtime_error_line;
         const saved_metamethod = self.vm.runtime_error_metamethod;
-        self.vm.runtime_error_message = null;
-        self.vm.runtime_error_metamethod = null;
+        self.vm.clearRuntimeError();
         const returns = self.invokeProtectedTarget(callee, args) catch |err| switch (err) {
             error.Yield => {
                 try self.appendThreadContinuation(.{
@@ -1838,21 +1903,17 @@ const Parser = struct {
                 return err;
             },
             error.RuntimeError => {
-                const message = self.vm.runtime_error_message orelse "runtime error";
+                const error_value = self.vm.currentRuntimeErrorValue();
                 self.vm.runtime_error_message = saved_message;
+                self.vm.runtime_error_value = saved_value;
                 self.vm.runtime_error_line = saved_line;
                 self.vm.runtime_error_metamethod = saved_metamethod;
-                const handled = if (handler) |h| blk: {
-                    const hret = self.invokeCallable(h, &.{.{ .string = message }}) catch |handler_err| switch (handler_err) {
-                        error.RuntimeError => break :blk self.vm.runtime_error_message orelse "runtime error",
-                        else => return handler_err,
-                    };
-                    break :blk if (hret.len > 0) try valueToStringForTostring(self.vm.allocator, hret[0]) else "nil";
-                } else message;
+                const handled = if (handler) |h| try self.applyErrorHandler(h, error_value) else error_value;
                 const values = try self.vm.allocator.alloc(Value, 2);
                 values[0] = .{ .boolean = false };
-                values[1] = .{ .string = handled };
+                values[1] = handled;
                 self.vm.runtime_error_message = saved_message;
+                self.vm.runtime_error_value = saved_value;
                 self.vm.runtime_error_line = saved_line;
                 self.vm.runtime_error_metamethod = saved_metamethod;
                 return values;
@@ -1860,12 +1921,31 @@ const Parser = struct {
             else => return err,
         };
         self.vm.runtime_error_message = saved_message;
+        self.vm.runtime_error_value = saved_value;
         self.vm.runtime_error_line = saved_line;
         self.vm.runtime_error_metamethod = saved_metamethod;
         const values = try self.vm.allocator.alloc(Value, returns.len + 1);
         values[0] = .{ .boolean = true };
         @memcpy(values[1..], returns);
         return values;
+    }
+
+    fn applyErrorHandler(self: *Parser, handler: Value, initial_error: Value) anyerror!Value {
+        var current_error = initial_error;
+        var attempts: usize = 0;
+        while (true) {
+            self.vm.clearRuntimeError();
+            const returns = self.invokeCallable(handler, &.{current_error}) catch |handler_err| switch (handler_err) {
+                error.RuntimeError => {
+                    current_error = self.vm.currentRuntimeErrorValue();
+                    attempts += 1;
+                    if (attempts >= 64) return current_error;
+                    continue;
+                },
+                else => return handler_err,
+            };
+            return if (returns.len > 0) returns[0] else Value{ .nil = {} };
+        }
     }
 
     fn invokeProtectedTarget(self: *Parser, callee: Value, args: []const Value) anyerror![]const Value {
@@ -1884,8 +1964,9 @@ const Parser = struct {
     fn callWrappedThread(self: *Parser, thread: *Thread, args: []const Value) anyerror![]const Value {
         const resumed = try self.resumeThread(thread, args);
         if (resumed.len > 0 and resumed[0] == .boolean and resumed[0].boolean) return resumed[1..];
-        const message = if (resumed.len > 1) try valueToStringForTostring(self.vm.allocator, resumed[1]) else "cannot resume dead coroutine";
-        self.vm.setRuntimeErrorAt(self.active_call_line orelse self.peek().line, message);
+        const error_value = if (resumed.len > 1) resumed[1] else Value{ .string = "cannot resume dead coroutine" };
+        const message = try valueToStringForTostring(self.vm.allocator, error_value);
+        self.vm.setRuntimeErrorValueAt(self.active_call_line orelse self.peek().line, error_value, message);
         return error.RuntimeError;
     }
 
@@ -1911,11 +1992,11 @@ const Parser = struct {
                 return self.coroutineResult(true, thread.yield_values);
             },
             error.RuntimeError => {
-                const message = thread.vm.runtime_error_message orelse "runtime error";
+                const error_value = thread.vm.currentRuntimeErrorValue();
                 thread.status = .dead;
                 thread.vm.current_thread = null;
                 self.cleanupThreadFrame(thread);
-                return self.coroutineResult(false, &.{.{ .string = message }});
+                return self.coroutineResult(false, &.{error_value});
             },
             else => return err,
         };
@@ -2108,6 +2189,7 @@ const Parser = struct {
             .env = function.env,
             .captures = &function.captures,
             .body_end = function.body_end,
+            .call_line = self.active_call_line,
         });
         for (function.params, 0..) |param, i| {
             try self.vm.declare(param, if (i < args.len) args[i] else Value{ .nil = {} });
@@ -2367,6 +2449,16 @@ pub fn runLevel0WithArgStrings(
     source: []const u8,
     args: []const []const u8,
 ) !VmResult {
+    return runLevel0WithRunContext(allocator, source, args, "stdin", 0);
+}
+
+pub fn runLevel0WithRunContext(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    args: []const []const u8,
+    error_chunk_name: []const u8,
+    error_line_offset: usize,
+) !VmResult {
     var tokens = lex(allocator, source) catch |err| switch (err) {
         error.UnsupportedFeature => return unsupported(allocator, "lexer"),
         else => return err,
@@ -2382,7 +2474,7 @@ pub fn runLevel0WithArgStrings(
     }
     var varargs: std.ArrayList(Value) = .empty;
     for (args) |arg| try varargs.append(allocator, .{ .string = arg });
-    var vm = try Vm.initWithVarargs(allocator, token_slice, try varargs.toOwnedSlice(allocator));
+    var vm = try Vm.initWithContext(allocator, token_slice, try varargs.toOwnedSlice(allocator), error_chunk_name, error_line_offset);
     var parser = Parser{ .vm = &vm, .pos = 0, .limit = token_slice.len, .evaluate = true };
     _ = parser.parseBlock() catch |err| switch (err) {
         error.RuntimeError => return runtimeErrorAt(
@@ -3952,6 +4044,18 @@ test "protected errors and coroutine smoke execute natively" {
         .{
             .source = "local ok, err = pcall(function() error(\"boom\", 0) end)\nprint(ok, err)\nlocal ok2, msg = xpcall(function() error(\"bad\", 0) end, function(e) return \"handled:\" .. e end)\nprint(ok2, msg)\n",
             .stdout = "false\tboom\nfalse\thandled:bad\n",
+        },
+        .{
+            .source = "local token = {}\nlocal ok, err = pcall(function() error(token, 0) end)\nprint(ok, err == token, type(err))\nlocal handled = {}\nlocal ok2, got = xpcall(function() error(token, 0) end, function(e) print(\"handler\", e == token, type(e)) return handled end)\nprint(ok2, got == handled, type(got))\n",
+            .stdout = "false\ttrue\ttable\nhandler\ttrue\ttable\nfalse\ttrue\ttable\n",
+        },
+        .{
+            .source = "local first, second = {}, {}\nlocal count = 0\nlocal ok, got = xpcall(function() error(first, 0) end, function(e)\n  count = count + 1\n  print(\"handler-error\", count, e == first, e == second, type(e))\n  if count == 1 then error(second, 0) end\n  return e\nend)\nprint(ok, got == first, got == second, type(got), count)\n",
+            .stdout = "handler-error\t1\ttrue\tfalse\ttable\nhandler-error\t2\tfalse\ttrue\ttable\nfalse\tfalse\ttrue\ttable\t2\n",
+        },
+        .{
+            .source = "local function leveled() error(\"level boom\") end\nlocal ok, err = pcall(leveled)\nprint(ok, err)\nlocal ok0, err0 = pcall(function() error(\"level zero\", 0) end)\nprint(ok0, err0)\nlocal function g() error(\"caller level\", 2) end\nlocal function f() g() end\nlocal ok2, err2 = pcall(f)\nprint(ok2, err2)\n",
+            .stdout = "false\tstdin:1: level boom\nfalse\tlevel zero\nfalse\tstdin:7: caller level\n",
         },
         .{
             .source = "local co = coroutine.create(function(a)\n  local b = coroutine.yield(a + 1)\n  return b + 2\nend)\nprint(coroutine.resume(co, 4))\nprint(coroutine.resume(co, 7))\nprint(coroutine.status(co))\n",

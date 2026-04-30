@@ -1635,7 +1635,13 @@ fn executeNoHostRun(
     }
 
     const source_slice = try source.toOwnedSlice();
-    var result = try vm_level0.runLevel0WithArgStrings(allocator, source_slice, parsed.script_args);
+    var result = try vm_level0.runLevel0WithRunContext(
+        allocator,
+        source_slice,
+        parsed.script_args,
+        chunk_name,
+        runPreludeLineCount(parsed),
+    );
     if (result.state == .runtime_error) {
         result.stderr = try stockStyleNativeError(allocator, chunk_name, source_slice, parsed, result.stderr);
     }

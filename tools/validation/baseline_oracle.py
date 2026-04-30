@@ -1007,8 +1007,8 @@ NATIVE_PROTECTED_COROUTINE_CASES = [
         "puc_file": "errors.lua",
         "description": "pcall/xpcall/error propagation preserves Lua status booleans, error values, and handler results without host fallback",
         "validates": ["VAL-ADV2-012"],
-        "coverage_tags": ["protected-error", "pcall", "xpcall", "error"],
-        "source": 'local ok, err = pcall(function() error("boom", 0) end)\nprint(ok, err)\nlocal ok2, msg = xpcall(function() error("bad", 0) end, function(e) return "handled:" .. e end)\nprint(ok2, msg)\n',
+        "coverage_tags": ["protected-error", "pcall", "xpcall", "error", "error-value-preservation", "error-level"],
+        "source": 'local ok, err = pcall(function() error("boom", 0) end)\nprint(ok, err)\nlocal token = {}\nlocal ok_table, table_err = pcall(function() error(token, 0) end)\nprint(ok_table, table_err == token, type(table_err))\nlocal ok2, msg = xpcall(function() error("bad", 0) end, function(e) return "handled:" .. e end)\nprint(ok2, msg)\nlocal handled = {}\nlocal ok3, got = xpcall(function() error(token, 0) end, function(e) print("handler", e == token, type(e)) return handled end)\nprint(ok3, got == handled, type(got))\nlocal first, second = {}, {}\nlocal count = 0\nlocal ok4, got4 = xpcall(function() error(first, 0) end, function(e)\n  count = count + 1\n  print("handler-error", count, e == first, e == second, type(e))\n  if count == 1 then error(second, 0) end\n  return e\nend)\nprint(ok4, got4 == first, got4 == second, type(got4), count)\nlocal function leveled() error("level boom") end\nlocal ok5, msg5 = pcall(leveled)\nprint(ok5, msg5)\nlocal ok6, msg6 = pcall(function() error("level zero", 0) end)\nprint(ok6, msg6)\n',
     },
     {
         "name": "coroutine-resume-yield-status",
