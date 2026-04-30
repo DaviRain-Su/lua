@@ -212,6 +212,44 @@ class VmLevel0Tests(unittest.TestCase):
                 self.assertEqual(candidate.stdout, stock.stdout)
                 self.assertEqual(candidate.stderr, stock.stderr)
 
+    def test_no_host_lua_loop_closure_captures_match_stock_lua(self):
+        cases = {
+            "numeric-for-control-variable": """local a = {}
+for i = 1, 3 do
+  a[i] = function() return i end
+end
+print(a[1](), a[2](), a[3]())
+""",
+            "numeric-for-body-local": """local a = {}
+for i = 1, 3 do
+  local k = i * 10
+  a[i] = function() return i, k end
+end
+print(a[1](), a[2](), a[3]())
+""",
+            "generic-for-key-value": """local a = {}
+for k, v in ipairs({"a", "b", "c"}) do
+  a[k] = function() return k, v end
+end
+print(a[1](), a[2](), a[3]())
+""",
+        }
+        for name, source in cases.items():
+            with self.subTest(case=name):
+                stock = run("./lua", "-", stdin=source)
+                candidate = run(
+                    "./zig-out/bin/lua-zig",
+                    "run",
+                    "-",
+                    stdin=source,
+                    env={"LUA_ZIG_RUN_NO_HOST_LUA": "1"},
+                )
+
+                self.assertEqual(stock.returncode, 0, name)
+                self.assertEqual(candidate.returncode, stock.returncode, candidate.stderr)
+                self.assertEqual(candidate.stdout, stock.stdout)
+                self.assertEqual(candidate.stderr, stock.stderr)
+
     def test_baseline_oracle_vm_level0_corpus_command_reports_pass(self):
         completed = run(
             "python3",

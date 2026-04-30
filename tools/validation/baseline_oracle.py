@@ -384,6 +384,46 @@ print(get())
 """,
     },
     {
+        "name": "closure-numeric-for-control-variable-core",
+        "puc_file": "closure.lua",
+        "validates": ["VAL-NATIVE-012"],
+        "coverage_tags": ["closure:lexical-capture", "closure:closed-upvalue", "closure:loop-variable"],
+        "description": "numeric for-loop control variables captured by escaping closures use per-iteration cells",
+        "source": """local a = {}
+for i = 1, 3 do
+  a[i] = function() return i end
+end
+print(a[1](), a[2](), a[3]())
+""",
+    },
+    {
+        "name": "closure-numeric-for-body-local-core",
+        "puc_file": "closure.lua",
+        "validates": ["VAL-NATIVE-012"],
+        "coverage_tags": ["closure:lexical-capture", "closure:closed-upvalue", "closure:loop-variable"],
+        "description": "numeric for-loop body locals captured with the control variable are fresh per iteration",
+        "source": """local a = {}
+for i = 1, 3 do
+  local k = i * 10
+  a[i] = function() return i, k end
+end
+print(a[1](), a[2](), a[3]())
+""",
+    },
+    {
+        "name": "closure-generic-for-key-value-core",
+        "puc_file": "closure.lua",
+        "validates": ["VAL-NATIVE-012"],
+        "coverage_tags": ["closure:lexical-capture", "closure:closed-upvalue", "closure:loop-variable"],
+        "description": "generic for-loop key/value variables captured by escaping closures use per-iteration cells",
+        "source": """local a = {}
+for k, v in ipairs({"a", "b", "c"}) do
+  a[k] = function() return k, v end
+end
+print(a[1](), a[2](), a[3]())
+""",
+    },
+    {
         "name": "code-register-expression-core",
         "puc_file": "code.lua",
         "validates": ["VAL-NATIVE-013"],

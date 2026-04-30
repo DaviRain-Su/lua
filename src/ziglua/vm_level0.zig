@@ -668,15 +668,20 @@ const Parser = struct {
         const end_idx = try self.findEndFor(body_start, "for", opener.line);
         try self.vm.pushScope(&.{}, false);
         defer self.vm.popScope();
-        try self.vm.declare(name, .{ .nil = {} });
         var i = start;
         var guard: usize = 0;
         while ((step >= 0 and i <= stop) or (step < 0 and i >= stop)) : (i += step) {
             guard += 1;
             if (guard > 100000) return error.UnsupportedFeature;
-            try self.vm.assignName(name, numberFromFloatIntegral(i));
-            var body = Parser{ .vm = self.vm, .pos = body_start, .limit = end_idx, .evaluate = self.evaluate };
-            const signal = try body.parseBlock();
+            const signal = blk: {
+                try self.vm.pushScope(&.{}, false);
+                errdefer self.vm.popScope();
+                try self.vm.declare(name, numberFromFloatIntegral(i));
+                var body = Parser{ .vm = self.vm, .pos = body_start, .limit = end_idx, .evaluate = self.evaluate };
+                const body_signal = try body.parseBlock();
+                self.vm.popScope();
+                break :blk body_signal;
+            };
             switch (signal) {
                 .normal => {},
                 .break_loop => break,
@@ -707,7 +712,6 @@ const Parser = struct {
         const end_idx = try self.findEndFor(body_start, "for", opener_line);
         try self.vm.pushScope(&.{}, false);
         defer self.vm.popScope();
-        for (names.items) |loop_name| try self.vm.declare(loop_name, .{ .nil = {} });
 
         var guard: usize = 0;
         while (true) {
@@ -716,12 +720,18 @@ const Parser = struct {
             const returns = try self.invokeCallable(iterator, &.{ state, control });
             if (returns.len == 0 or returns[0].isNil()) break;
             control = returns[0];
-            for (names.items, 0..) |loop_name, i| {
-                try self.vm.assignName(loop_name, if (i < returns.len) returns[i] else Value{ .nil = {} });
-            }
 
-            var body = Parser{ .vm = self.vm, .pos = body_start, .limit = end_idx, .evaluate = self.evaluate };
-            const signal = try body.parseBlock();
+            const signal = blk: {
+                try self.vm.pushScope(&.{}, false);
+                errdefer self.vm.popScope();
+                for (names.items, 0..) |loop_name, i| {
+                    try self.vm.declare(loop_name, if (i < returns.len) returns[i] else Value{ .nil = {} });
+                }
+                var body = Parser{ .vm = self.vm, .pos = body_start, .limit = end_idx, .evaluate = self.evaluate };
+                const body_signal = try body.parseBlock();
+                self.vm.popScope();
+                break :blk body_signal;
+            };
             switch (signal) {
                 .normal => {},
                 .break_loop => break,
@@ -3054,6 +3064,9 @@ test "vm level1 closures upvalues aliases and method calls execute natively" {
         .{ .source = "local function outer(x)\n  local function inner() return x end\n  local first, second\n  first, second = nil, inner\n  return second\nend\nlocal f = outer(5)\nprint(f())\n", .stdout = "5\n" },
         .{ .source = "local function outer(x)\n  local function inner() return x end\n  escaped = inner\nend\nouter(5)\nprint(escaped())\nescaped = nil\n", .stdout = "5\n" },
         .{ .source = "local function outer(x)\n  local function inner() return x end\n  local box = {}\n  box.fn = inner\n  return box.fn\nend\nlocal f = outer(5)\nprint(f())\n", .stdout = "5\n" },
+        .{ .source = "local a = {}\nfor i = 1, 3 do\n  a[i] = function() return i end\nend\nprint(a[1](), a[2](), a[3]())\n", .stdout = "1\t2\t3\n" },
+        .{ .source = "local a = {}\nfor i = 1, 3 do\n  local k = i * 10\n  a[i] = function() return i, k end\nend\nprint(a[1](), a[2](), a[3]())\n", .stdout = "1\t2\t3\t30\n" },
+        .{ .source = "local a = {}\nfor k, v in ipairs({\"a\", \"b\", \"c\"}) do\n  a[k] = function() return k, v end\nend\nprint(a[1](), a[2](), a[3]())\n", .stdout = "1\t2\t3\tc\n" },
         .{ .source = "local box = { value = 7 }\nbox.get = function(self, extra) return self.value, extra end\nprint(box:get(3))\n", .stdout = "7\t3\n" },
         .{ .source = "local t = {}\nt.fn = function() return 1, 2 end\nprint(t.fn())\n", .stdout = "1\t2\n" },
     };
