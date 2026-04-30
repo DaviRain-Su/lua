@@ -289,10 +289,7 @@ class LuaZigCliShellTests(unittest.TestCase):
             fail_fixture = temp_path / "fail.lua"
             fail_fixture.write_text('local x = "bad" + 1\nprint(x)\n')
             fallback_fail_fixture = temp_path / "fallback-fail.lua"
-            fallback_fail_fixture.write_text(
-                'local t = setmetatable({}, { __index = function() error("fallback boom") end })\n'
-                "print(t.answer)\n"
-            )
+            fallback_fail_fixture.write_text('collectgarbage("not-a-valid-option")\n')
             env = {"LUA_ZIG_EVIDENCE_DIR": str(temp_path / "evidence")}
 
             passing = run(str(CLI), "test", "--fixture", str(pass_fixture), "--target", "native-full", env=env)
@@ -330,7 +327,7 @@ class LuaZigCliShellTests(unittest.TestCase):
             self.assertEqual(fallback_fail_summary["ledger"][0]["state"], "fail")
             self.assertEqual(fallback_fail_summary["ledger"][0]["implementation_mode"], "stock-lua-fallback")
             self.assertIn("fallback-fail", fallback_fail_summary["ledger"][0]["diagnostic"])
-            self.assertIn("fallback boom", fallback_fail_summary["ledger"][0]["diagnostic"])
+            self.assertIn("collectgarbage", fallback_fail_summary["ledger"][0]["diagnostic"])
 
             wasm = run(str(CLI), "test", "--fixture", str(pass_fixture), "--target", "wasm-full", env=env)
             self.assertEqual(wasm.returncode, 0, wasm.stderr + wasm.stdout)
@@ -405,12 +402,9 @@ class LuaZigCliShellTests(unittest.TestCase):
             fixture = temp_path / "fixture.lua"
             fixture.write_text("print(40 + 2)\n")
             advanced = temp_path / "advanced.lua"
-            advanced.write_text('local t = setmetatable({}, { __index = function() return 42 end })\nprint(t.answer)\n')
+            advanced.write_text('print(type(collectgarbage("count")))\n')
             advanced_fail = temp_path / "advanced-fail.lua"
-            advanced_fail.write_text(
-                'local t = setmetatable({}, { __index = function() error("fallback boom") end })\n'
-                "print(t.answer)\n"
-            )
+            advanced_fail.write_text('collectgarbage("not-a-valid-option")\n')
             workload = temp_path / "workload.lua"
             workload.write_text('print("profiled")\n')
 

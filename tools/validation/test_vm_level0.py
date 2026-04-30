@@ -76,7 +76,7 @@ class VmLevel0Tests(unittest.TestCase):
         self.assertIn("load", candidate.stderr)
 
     def test_advanced_semantics_fallback_passes_through_stock_lua_with_reason_marker(self):
-        native_reasons = {"metatable-dispatch", "raw-ops", "table-iteration"}
+        native_reasons = {"metatable-dispatch", "raw-ops", "table-iteration", "protected-error", "coroutine-model", "cross-boundary-advanced"}
         for fixture in advanced_semantics_fixtures():
             with self.subTest(fixture=fixture["name"]):
                 source = str(fixture["source"])

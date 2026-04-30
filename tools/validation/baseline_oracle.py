@@ -1001,6 +1001,33 @@ ADVANCED_SEMANTICS_FIXTURES = [
         "source": 'local t = setmetatable({}, { __call = function() error("meta boom", 0) end })\nlocal ok, err = pcall(t)\nprint(ok, err)\n',
     },
 ]
+NATIVE_PROTECTED_COROUTINE_CASES = [
+    {
+        "name": "protected-pcall-xpcall",
+        "puc_file": "errors.lua",
+        "description": "pcall/xpcall/error propagation preserves Lua status booleans, error values, and handler results without host fallback",
+        "validates": ["VAL-ADV2-012"],
+        "coverage_tags": ["protected-error", "pcall", "xpcall", "error"],
+        "source": 'local ok, err = pcall(function() error("boom", 0) end)\nprint(ok, err)\nlocal ok2, msg = xpcall(function() error("bad", 0) end, function(e) return "handled:" .. e end)\nprint(ok2, msg)\n',
+    },
+    {
+        "name": "coroutine-resume-yield-status",
+        "puc_file": "coroutine.lua",
+        "description": "coroutine.create/resume/yield/status transfers resume and yield values and reaches dead status after return",
+        "validates": ["VAL-ADV2-012"],
+        "coverage_tags": ["coroutine.lua", "create", "resume", "yield", "status", "vararg-transfer"],
+        "source": 'local co = coroutine.create(function(a)\n  local b = coroutine.yield(a + 1)\n  return b + 2\nend)\nprint(coroutine.resume(co, 4))\nprint(coroutine.resume(co, 7))\nprint(coroutine.status(co))\n',
+    },
+    {
+        "name": "coroutine-wrap-close-error",
+        "puc_file": "coroutine.lua",
+        "description": "coroutine.wrap, coroutine.close, and resume error propagation expose Lua-compatible status and values",
+        "validates": ["VAL-ADV2-012"],
+        "coverage_tags": ["coroutine.lua", "wrap", "close", "error-propagation"],
+        "source": 'local f = coroutine.wrap(function(a) return a + 1 end)\nprint(f(4))\nlocal co = coroutine.create(function() error("co boom", 0) end)\nprint(coroutine.resume(co))\nprint(coroutine.status(co))\nlocal closed = coroutine.create(function() return 1 end)\nprint(coroutine.close(closed))\nprint(coroutine.status(closed))\n',
+    },
+]
+
 AOT_RUNTIME_ERROR_FIXTURES = [
     {
         "name": "aot-arithmetic-runtime-error",
@@ -2009,6 +2036,122 @@ class BaselineOracle:
             "classification": "Selected PUC VM harness accounts pass and unsupported separately; unsupported diagnostics are not counted as semantic pass.",
         }
         self.write_json("vm-selected-puc/summary.json", summary)
+        return summary
+
+    def run_native_protected_coroutines(self, candidate_command: list[str]) -> dict[str, object]:
+        refresh = self.runner(ZIG_VM_CANDIDATE_REFRESH_COMMAND, self.repo, {}, None, None)
+        refresh_file = self.write_result("native-protected-coroutines-candidate-refresh", refresh)
+        env = {"LUA_ZIG_RUN_NO_HOST_LUA": "1"}
+        if refresh.exit_code != 0:
+            summary = {
+                "state": "fail",
+                "candidate_command": candidate_command,
+                "candidate_env": env,
+                "candidate_refresh": {
+                    "state": "fail",
+                    "refresh_command": ZIG_VM_CANDIDATE_REFRESH_COMMAND,
+                    "result_file": refresh_file,
+                    "result": refresh.to_dict(),
+                },
+                "cases": [],
+                "case_count": len(NATIVE_PROTECTED_COROUTINE_CASES),
+                "pass_count": 0,
+                "fail_count": len(NATIVE_PROTECTED_COROUTINE_CASES),
+                "fallback_count": 0,
+                "unsupported_count": 0,
+                "validated_assertions": [],
+                "missing_assertions": ["VAL-ADV2-012"],
+                "classification": "Native protected-error/coroutine validation was not run because the lua-zig candidate failed to refresh.",
+            }
+            self.write_json("native-protected-coroutines/summary.json", summary)
+            return summary
+
+        entries = []
+        state = "pass"
+        pass_count = 0
+        fail_count = 0
+        fallback_count = 0
+        unsupported_count = 0
+        validated_ids: set[str] = set()
+        for case in NATIVE_PROTECTED_COROUTINE_CASES:
+            name = str(case["name"])
+            source = str(case["source"])
+            stock = self.runner(["./lua", "-"], self.repo, {}, source, None)
+            candidate = self.runner(candidate_command, self.repo, env, source, None)
+            stock_file = self.write_result(f"native-protected-coroutines-stock-{name}", stock)
+            candidate_file = self.write_result(f"native-protected-coroutines-candidate-{name}", candidate)
+            diffs = compare_cli_results(stock.to_dict(), candidate.to_dict())
+            fallback_observed = "fallback" in candidate.stderr.lower() or "stock-lua-fallback" in candidate.stdout
+            unsupported_observed = "unsupported" in candidate.stderr.lower() or "native-unsupported" in candidate.stdout
+            errors: list[str] = []
+            if diffs:
+                errors.append("stock/native stdout, stderr, or exit_code differed")
+            if fallback_observed:
+                errors.append("fallback marker observed in protected/coroutine native validation")
+            if unsupported_observed:
+                errors.append("unsupported marker observed in protected/coroutine native validation")
+            if candidate.exit_code != stock.exit_code:
+                errors.append("candidate exit status does not match stock Lua")
+            case_state = "fail" if errors else "pass"
+            if errors:
+                state = "fail"
+                fail_count += 1
+            else:
+                pass_count += 1
+                validated_ids.update(str(assertion) for assertion in case["validates"])
+            if fallback_observed:
+                fallback_count += 1
+            if unsupported_observed:
+                unsupported_count += 1
+            entries.append(
+                {
+                    "name": name,
+                    "puc_file": case["puc_file"],
+                    "description": case["description"],
+                    "validates": case["validates"],
+                    "coverage_tags": case.get("coverage_tags", []),
+                    "state": case_state,
+                    "errors": errors,
+                    "stock_result_file": stock_file,
+                    "candidate_result_file": candidate_file,
+                    "stock": stock.to_dict(),
+                    "candidate": candidate.to_dict(),
+                    "diffs": diffs,
+                    "implementation_mode": "native",
+                    "no_host_lua": True,
+                    "fallback_observed": fallback_observed,
+                    "unsupported_observed": unsupported_observed,
+                }
+            )
+
+        missing_ids = sorted({"VAL-ADV2-012"}.difference(validated_ids))
+        if missing_ids:
+            state = "fail"
+        staged_files = sorted({str(case["puc_file"]) for case in NATIVE_PROTECTED_COROUTINE_CASES})
+        summary = {
+            "state": state,
+            "candidate_command": candidate_command,
+            "candidate_env": env,
+            "candidate_refresh": {
+                "state": "pass",
+                "refresh_command": ZIG_VM_CANDIDATE_REFRESH_COMMAND,
+                "result_file": refresh_file,
+                "result": refresh.to_dict(),
+            },
+            "cases": entries,
+            "case_count": len(entries),
+            "pass_count": pass_count,
+            "fail_count": fail_count,
+            "fallback_count": fallback_count,
+            "unsupported_count": unsupported_count,
+            "validated_assertions": sorted(validated_ids),
+            "missing_assertions": missing_ids,
+            "staged_puc_files": staged_files,
+            "required_puc_files": ["coroutine.lua", "errors.lua"],
+            "compared_fields": ["stdout", "stderr", "exit_code"],
+            "classification": "M7 protected-error and coroutine fixtures, including coroutine.lua-derived create/resume/yield/status/wrap/close/error cases, execute through lua-zig run with LUA_ZIG_RUN_NO_HOST_LUA=1; fallback and unsupported markers fail VAL-ADV2-012 accounting.",
+        }
+        self.write_json("native-protected-coroutines/summary.json", summary)
         return summary
 
     def run_native_core_language(self, candidate_command: list[str]) -> dict[str, object]:
@@ -4160,6 +4303,14 @@ def validator_registry(repo: Path) -> dict[str, object]:
             "requires_service": False,
             "artifacts_or_channels": ["stdout", "stderr", "exit_code", "build/validation/baseline-oracle/native-core-language/summary.json"],
         },
+        {
+            "id": "native-protected-coroutines",
+            "description": "Run M7 protected-error and coroutine.lua-derived fixtures through fallback-disabled lua-zig native execution for VAL-ADV2-012.",
+            "command": f"python3 {script} --repo {repo} native-protected-coroutines",
+            "surface": "cli",
+            "requires_service": False,
+            "artifacts_or_channels": ["stdout", "stderr", "exit_code", "build/validation/baseline-oracle/native-protected-coroutines/summary.json"],
+        },
     ]
     return {
         "state": "pass",
@@ -4621,6 +4772,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("lua-zig-run-cli-parity", help="compare lua-zig run source forms against stock ./lua")
     native_core = subparsers.add_parser("native-core-language", help="compare M4 staged PUC-derived core language snippets through fallback-disabled lua-zig native execution")
     native_core.add_argument("--candidate-command", default=shlex.join(DEFAULT_LUA_ZIG_NATIVE_RUN_COMMAND), help="lua-zig native run command that reads Lua source from stdin")
+    native_protected = subparsers.add_parser("native-protected-coroutines", help="compare M7 protected-error and coroutine snippets through fallback-disabled lua-zig native execution")
+    native_protected.add_argument("--candidate-command", default=shlex.join(DEFAULT_LUA_ZIG_NATIVE_RUN_COMMAND), help="lua-zig native run command that reads Lua source from stdin")
     subparsers.add_parser("list-validators", help="list CLI-only validators and their report/artifact surfaces")
     aot_errors = subparsers.add_parser("aot-runtime-error-parity", help="validate deterministic AOT runtime-error parity under normalized policy")
     aot_errors.add_argument("--vm-command", default=shlex.join(DEFAULT_ZIG_VM_CANDIDATE_COMMAND), help="Zig VM command that reads Lua source from stdin")
@@ -4700,6 +4853,8 @@ def main(argv: list[str] | None = None) -> int:
         return print_summary(oracle.run_lua_zig_run_cli_parity())
     if args.command == "native-core-language":
         return print_summary(oracle.run_native_core_language(shlex.split(args.candidate_command)))
+    if args.command == "native-protected-coroutines":
+        return print_summary(oracle.run_native_protected_coroutines(shlex.split(args.candidate_command)))
     if args.command == "list-validators":
         return print_summary(validator_registry(args.repo.resolve()))
     if args.command == "aot-runtime-error-parity":

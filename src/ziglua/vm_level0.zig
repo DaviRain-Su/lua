@@ -83,9 +83,20 @@ const Builtin = enum {
     getmetatable,
     tostring,
     type,
+    lua_error,
+    pcall,
+    xpcall,
+    coroutine_create,
+    coroutine_resume,
+    coroutine_yield,
+    coroutine_status,
+    coroutine_close,
+    coroutine_wrap,
+    coroutine_running,
+    coroutine_isyieldable,
 };
 
-const ValueTag = enum { nil, boolean, integer, float, string, table, function, builtin };
+const ValueTag = enum { nil, boolean, integer, float, string, table, function, builtin, thread, wrapped_thread };
 
 const Value = union(ValueTag) {
     nil: void,
@@ -96,6 +107,8 @@ const Value = union(ValueTag) {
     table: *Table,
     function: *Function,
     builtin: Builtin,
+    thread: *Thread,
+    wrapped_thread: *Thread,
 
     fn isTruthy(self: Value) bool {
         return switch (self) {
@@ -117,6 +130,22 @@ const Cell = struct {
     value: Value,
 };
 
+const CoroutineStatus = enum { suspended, running, dead };
+
+const CoroutineContinuation = struct {
+    local_name: ?[]const u8,
+    pos: usize,
+    body_end: usize,
+};
+
+const Thread = struct {
+    vm: Vm,
+    function: *Function,
+    status: CoroutineStatus,
+    continuation: ?CoroutineContinuation,
+    yield_values: []const Value,
+};
+
 const Table = struct {
     array: std.ArrayList(Value),
     integers: std.AutoHashMap(i64, Value),
@@ -125,6 +154,7 @@ const Table = struct {
     table_keys: std.AutoHashMap(*Table, Value),
     function_keys: std.AutoHashMap(*Function, Value),
     builtin_keys: std.AutoHashMap(Builtin, Value),
+    thread_keys: std.AutoHashMap(*Thread, Value),
     bool_true: Value,
     bool_false: Value,
     metatable: ?*Table,
@@ -139,6 +169,7 @@ const Table = struct {
             .table_keys = std.AutoHashMap(*Table, Value).init(allocator),
             .function_keys = std.AutoHashMap(*Function, Value).init(allocator),
             .builtin_keys = std.AutoHashMap(Builtin, Value).init(allocator),
+            .thread_keys = std.AutoHashMap(*Thread, Value).init(allocator),
             .bool_true = .{ .nil = {} },
             .bool_false = .{ .nil = {} },
             .metatable = null,
@@ -174,6 +205,8 @@ const Table = struct {
             .table => |t| try self.table_keys.put(t, value),
             .function => |f| try self.function_keys.put(f, value),
             .builtin => |b| try self.builtin_keys.put(b, value),
+            .thread => |t| try self.thread_keys.put(t, value),
+            .wrapped_thread => |t| try self.thread_keys.put(t, value),
             .boolean => |b| {
                 if (b) {
                     self.bool_true = value;
@@ -198,6 +231,8 @@ const Table = struct {
             .table => |t| self.table_keys.get(t) orelse .{ .nil = {} },
             .function => |f| self.function_keys.get(f) orelse .{ .nil = {} },
             .builtin => |b| self.builtin_keys.get(b) orelse .{ .nil = {} },
+            .thread => |t| self.thread_keys.get(t) orelse .{ .nil = {} },
+            .wrapped_thread => |t| self.thread_keys.get(t) orelse .{ .nil = {} },
             .boolean => |b| if (b) self.bool_true else self.bool_false,
         };
     }
@@ -244,6 +279,7 @@ const CallFrame = struct {
     lexical_scope_len: usize,
     env: ?*Table,
     captures: *std.StringHashMap(*Cell),
+    body_end: usize,
 };
 
 const ExecSignal = union(enum) {
@@ -272,6 +308,7 @@ const Vm = struct {
     runtime_error_message: ?[]const u8,
     runtime_error_line: usize,
     runtime_error_metamethod: ?[]const u8,
+    current_thread: ?*Thread,
     syntax_error_message: ?[]const u8,
     syntax_error_line: usize,
 
@@ -289,6 +326,7 @@ const Vm = struct {
             .runtime_error_message = null,
             .runtime_error_line = 1,
             .runtime_error_metamethod = null,
+            .current_thread = null,
             .syntax_error_message = null,
             .syntax_error_line = 1,
         };
@@ -307,6 +345,19 @@ const Vm = struct {
         try default_env.setString("getmetatable", .{ .builtin = .getmetatable });
         try default_env.setString("tostring", .{ .builtin = .tostring });
         try default_env.setString("type", .{ .builtin = .type });
+        try default_env.setString("error", .{ .builtin = .lua_error });
+        try default_env.setString("pcall", .{ .builtin = .pcall });
+        try default_env.setString("xpcall", .{ .builtin = .xpcall });
+        const coroutine_table = try Table.create(allocator);
+        try coroutine_table.setString("create", .{ .builtin = .coroutine_create });
+        try coroutine_table.setString("resume", .{ .builtin = .coroutine_resume });
+        try coroutine_table.setString("yield", .{ .builtin = .coroutine_yield });
+        try coroutine_table.setString("status", .{ .builtin = .coroutine_status });
+        try coroutine_table.setString("close", .{ .builtin = .coroutine_close });
+        try coroutine_table.setString("wrap", .{ .builtin = .coroutine_wrap });
+        try coroutine_table.setString("running", .{ .builtin = .coroutine_running });
+        try coroutine_table.setString("isyieldable", .{ .builtin = .coroutine_isyieldable });
+        try default_env.setString("coroutine", .{ .table = coroutine_table });
         try default_env.setString("_G", .{ .table = default_env });
         try vm.declare("_ENV", .{ .table = default_env });
         return vm;
@@ -482,6 +533,8 @@ const Vm = struct {
             .table => try self.stdout.writer.writeAll("table"),
             .function => try self.stdout.writer.writeAll("function"),
             .builtin => try self.stdout.writer.writeAll("function"),
+            .thread => try self.stdout.writer.writeAll("thread"),
+            .wrapped_thread => try self.stdout.writer.writeAll("function"),
         }
     }
 
@@ -619,6 +672,13 @@ const Parser = struct {
         }
         var values: std.ArrayList(Value) = .empty;
         if (self.match(.assign)) {
+            if (names.items.len == 1 and self.isCoroutineYieldCallAt(self.pos)) {
+                try self.parseCoroutineYieldCall();
+                if (self.vm.current_thread) |thread| {
+                    thread.continuation = .{ .local_name = names.items[0], .pos = self.pos, .body_end = self.limit };
+                }
+                return error.Yield;
+            }
             try self.parseExpressionList(&values);
         }
         for (names.items, 0..) |name, i| {
@@ -632,6 +692,34 @@ const Parser = struct {
         try self.consume(.coloncolon);
         _ = try self.consumeIdent();
         try self.consume(.coloncolon);
+    }
+
+    fn isCoroutineYieldCallAt(self: *Parser, start: usize) bool {
+        return start + 4 < self.limit and
+            self.tokens()[start].tag == .ident and std.mem.eql(u8, self.tokens()[start].lexeme, "coroutine") and
+            self.tokens()[start + 1].tag == .dot and
+            self.tokens()[start + 2].tag == .ident and std.mem.eql(u8, self.tokens()[start + 2].lexeme, "yield") and
+            self.tokens()[start + 3].tag == .lparen;
+    }
+
+    fn parseCoroutineYieldCall(self: *Parser) !void {
+        _ = try self.consumeIdent();
+        try self.consume(.dot);
+        const yield_name = try self.consumeIdent();
+        if (!std.mem.eql(u8, yield_name, "yield")) return error.UnsupportedFeature;
+        const open = self.peek();
+        try self.consume(.lparen);
+        var args: std.ArrayList(Value) = .empty;
+        if (!self.match(.rparen)) {
+            try self.parseExpressionList(&args);
+            try self.consumeCloseParen(open.line);
+        }
+        if (self.vm.current_thread) |thread| {
+            thread.yield_values = try args.toOwnedSlice(self.vm.allocator);
+            return;
+        }
+        self.vm.setRuntimeErrorAt(open.line, "attempt to yield from outside a coroutine");
+        return error.RuntimeError;
     }
 
     fn gotoStatement(self: *Parser) !ExecSignal {
@@ -1149,6 +1237,14 @@ const Parser = struct {
                 }
                 const call_line = self.peek().line;
                 const returns = self.callFunctionValue(value) catch |err| {
+                    if (err == error.Yield) {
+                        if (self.vm.current_thread) |thread| {
+                            if (thread.continuation == null) {
+                                thread.continuation = .{ .local_name = null, .pos = self.pos, .body_end = self.limit };
+                            }
+                        }
+                        return err;
+                    }
                     if (err == error.RuntimeError and value != .function and value != .builtin) {
                         self.vm.setRuntimeErrorAt(
                             call_line,
@@ -1331,7 +1427,7 @@ const Parser = struct {
                 return self.invokeCallable(metamethod, call_args.items);
             }
         }
-        if (callee != .function and callee != .builtin) {
+        if (callee != .function and callee != .builtin and callee != .wrapped_thread) {
             self.vm.setRuntimeErrorAt(open.line, try std.fmt.allocPrint(self.vm.allocator, "attempt to call a {s} value", .{valueTypeName(callee)}));
             return error.RuntimeError;
         }
@@ -1359,7 +1455,7 @@ const Parser = struct {
                 return self.invokeCallable(metamethod, args.items);
             }
         }
-        if (callee != .function and callee != .builtin) {
+        if (callee != .function and callee != .builtin and callee != .wrapped_thread) {
             self.vm.setRuntimeErrorAt(open.line, try std.fmt.allocPrint(self.vm.allocator, "attempt to call a {s} value", .{valueTypeName(callee)}));
             return error.RuntimeError;
         }
@@ -1373,6 +1469,7 @@ const Parser = struct {
         const function = switch (callee) {
             .function => |f| f,
             .builtin => |b| return self.executeBuiltin(b, args),
+            .wrapped_thread => |t| return self.callWrappedThread(t, args),
             else => {
                 if (self.vm.runtime_error_message == null) {
                     self.vm.setRuntimeErrorAt(
@@ -1508,7 +1605,218 @@ const Parser = struct {
                 values[0] = .{ .string = valueTypeName(args[0]) };
                 return values;
             },
+            .lua_error => {
+                const message = if (args.len > 0) try valueToStringForTostring(self.vm.allocator, args[0]) else "error";
+                self.vm.setRuntimeErrorAt(self.active_call_line orelse self.peek().line, message);
+                return error.RuntimeError;
+            },
+            .pcall => {
+                if (args.len < 1) return error.RuntimeError;
+                return self.protectedCall(args[0], args[1..], null);
+            },
+            .xpcall => {
+                if (args.len < 2) return error.RuntimeError;
+                return self.protectedCall(args[0], args[2..], args[1]);
+            },
+            .coroutine_create => {
+                if (args.len < 1 or args[0] != .function) return error.RuntimeError;
+                const thread = try self.vm.allocator.create(Thread);
+                thread.* = .{
+                    .vm = try Vm.init(self.vm.allocator, self.vm.tokens),
+                    .function = args[0].function,
+                    .status = .suspended,
+                    .continuation = null,
+                    .yield_values = &.{},
+                };
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .thread = thread };
+                return values;
+            },
+            .coroutine_resume => {
+                if (args.len < 1 or args[0] != .thread) return error.RuntimeError;
+                return self.resumeThread(args[0].thread, args[1..]);
+            },
+            .coroutine_yield => {
+                if (self.vm.current_thread) |thread| {
+                    thread.yield_values = try self.vm.allocator.dupe(Value, args);
+                    return error.Yield;
+                }
+                self.vm.setRuntimeErrorAt(self.active_call_line orelse self.peek().line, "attempt to yield from outside a coroutine");
+                return error.RuntimeError;
+            },
+            .coroutine_status => {
+                if (args.len < 1 or args[0] != .thread) return error.RuntimeError;
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .string = switch (args[0].thread.status) {
+                    .suspended => "suspended",
+                    .running => "running",
+                    .dead => "dead",
+                } };
+                return values;
+            },
+            .coroutine_close => {
+                if (args.len < 1 or args[0] != .thread) return error.RuntimeError;
+                if (args[0].thread.status != .dead) args[0].thread.status = .dead;
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .boolean = true };
+                return values;
+            },
+            .coroutine_wrap => {
+                if (args.len < 1 or args[0] != .function) return error.RuntimeError;
+                const thread = try self.vm.allocator.create(Thread);
+                thread.* = .{
+                    .vm = try Vm.init(self.vm.allocator, self.vm.tokens),
+                    .function = args[0].function,
+                    .status = .suspended,
+                    .continuation = null,
+                    .yield_values = &.{},
+                };
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .wrapped_thread = thread };
+                return values;
+            },
+            .coroutine_running => {
+                const values = try self.vm.allocator.alloc(Value, 2);
+                if (self.vm.current_thread) |thread| {
+                    values[0] = .{ .thread = thread };
+                    values[1] = .{ .boolean = false };
+                } else {
+                    values[0] = .{ .nil = {} };
+                    values[1] = .{ .boolean = true };
+                }
+                return values;
+            },
+            .coroutine_isyieldable => {
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .boolean = self.vm.current_thread != null };
+                return values;
+            },
         }
+    }
+
+    fn protectedCall(self: *Parser, callee: Value, args: []const Value, handler: ?Value) anyerror![]const Value {
+        const saved_message = self.vm.runtime_error_message;
+        const saved_line = self.vm.runtime_error_line;
+        const saved_metamethod = self.vm.runtime_error_metamethod;
+        self.vm.runtime_error_message = null;
+        self.vm.runtime_error_metamethod = null;
+        const returns = self.invokeProtectedTarget(callee, args) catch |err| switch (err) {
+            error.RuntimeError => {
+                const message = self.vm.runtime_error_message orelse "runtime error";
+                self.vm.runtime_error_message = saved_message;
+                self.vm.runtime_error_line = saved_line;
+                self.vm.runtime_error_metamethod = saved_metamethod;
+                const handled = if (handler) |h| blk: {
+                    const hret = self.invokeCallable(h, &.{.{ .string = message }}) catch |handler_err| switch (handler_err) {
+                        error.RuntimeError => break :blk self.vm.runtime_error_message orelse "runtime error",
+                        else => return handler_err,
+                    };
+                    break :blk if (hret.len > 0) try valueToStringForTostring(self.vm.allocator, hret[0]) else "nil";
+                } else message;
+                const values = try self.vm.allocator.alloc(Value, 2);
+                values[0] = .{ .boolean = false };
+                values[1] = .{ .string = handled };
+                self.vm.runtime_error_message = saved_message;
+                self.vm.runtime_error_line = saved_line;
+                self.vm.runtime_error_metamethod = saved_metamethod;
+                return values;
+            },
+            else => return err,
+        };
+        self.vm.runtime_error_message = saved_message;
+        self.vm.runtime_error_line = saved_line;
+        self.vm.runtime_error_metamethod = saved_metamethod;
+        const values = try self.vm.allocator.alloc(Value, returns.len + 1);
+        values[0] = .{ .boolean = true };
+        @memcpy(values[1..], returns);
+        return values;
+    }
+
+    fn invokeProtectedTarget(self: *Parser, callee: Value, args: []const Value) anyerror![]const Value {
+        if (callee == .table) {
+            const metamethod = callee.table.rawMetafield("__call");
+            if (metamethod == .function or metamethod == .builtin) {
+                var call_args: std.ArrayList(Value) = .empty;
+                try call_args.append(self.vm.allocator, callee);
+                try call_args.appendSlice(self.vm.allocator, args);
+                return self.invokeCallable(metamethod, call_args.items);
+            }
+        }
+        return self.invokeCallable(callee, args);
+    }
+
+    fn callWrappedThread(self: *Parser, thread: *Thread, args: []const Value) anyerror![]const Value {
+        const resumed = try self.resumeThread(thread, args);
+        if (resumed.len > 0 and resumed[0] == .boolean and resumed[0].boolean) return resumed[1..];
+        const message = if (resumed.len > 1) try valueToStringForTostring(self.vm.allocator, resumed[1]) else "cannot resume dead coroutine";
+        self.vm.setRuntimeErrorAt(self.active_call_line orelse self.peek().line, message);
+        return error.RuntimeError;
+    }
+
+    fn resumeThread(self: *Parser, thread: *Thread, args: []const Value) anyerror![]const Value {
+        if (thread.status == .dead) {
+            const values = try self.vm.allocator.alloc(Value, 2);
+            values[0] = .{ .boolean = false };
+            values[1] = .{ .string = "cannot resume dead coroutine" };
+            return values;
+        }
+        if (thread.status == .running) {
+            const values = try self.vm.allocator.alloc(Value, 2);
+            values[0] = .{ .boolean = false };
+            values[1] = .{ .string = "cannot resume running coroutine" };
+            return values;
+        }
+        thread.status = .running;
+        thread.vm.current_thread = thread;
+        const returns = self.resumeThreadBody(thread, args) catch |err| switch (err) {
+            error.Yield => {
+                thread.status = .suspended;
+                thread.vm.current_thread = null;
+                return self.coroutineResult(true, thread.yield_values);
+            },
+            error.RuntimeError => {
+                const message = thread.vm.runtime_error_message orelse "runtime error";
+                thread.status = .dead;
+                thread.vm.current_thread = null;
+                self.cleanupThreadFrame(thread);
+                return self.coroutineResult(false, &.{.{ .string = message }});
+            },
+            else => return err,
+        };
+        thread.status = .dead;
+        thread.vm.current_thread = null;
+        self.cleanupThreadFrame(thread);
+        return self.coroutineResult(true, returns);
+    }
+
+    fn resumeThreadBody(_: *Parser, thread: *Thread, args: []const Value) anyerror![]const Value {
+        if (thread.continuation) |cont| {
+            thread.continuation = null;
+            if (cont.local_name) |name| {
+                try thread.vm.declare(name, if (args.len > 0) args[0] else Value{ .nil = {} });
+            }
+            var body = Parser{ .vm = &thread.vm, .pos = cont.pos, .limit = cont.body_end, .evaluate = true };
+            const signal = try body.parseBlock();
+            return switch (signal) {
+                .normal => &.{},
+                .break_loop => error.UnsupportedFeature,
+                .returned => |values| values,
+            };
+        }
+        var entry = Parser{ .vm = &thread.vm, .pos = 0, .limit = thread.vm.tokens.len, .evaluate = true };
+        return entry.executeFunction(thread.function, args);
+    }
+
+    fn cleanupThreadFrame(_: *Parser, thread: *Thread) void {
+        if (thread.vm.frames.items.len > 0) _ = thread.vm.frames.pop();
+        if (thread.vm.scopes.items.len > 1) thread.vm.popScope();
+    }
+
+    fn coroutineResult(self: *Parser, ok: bool, payload: []const Value) ![]const Value {
+        const values = try self.vm.allocator.alloc(Value, payload.len + 1);
+        values[0] = .{ .boolean = ok };
+        @memcpy(values[1..], payload);
+        return values;
     }
 
     fn ipairsIter(self: *Parser, args: []const Value) ![]const Value {
@@ -1595,24 +1903,33 @@ const Parser = struct {
     fn executeFunction(self: *Parser, function: *Function, args: []const Value) anyerror![]const Value {
         const extra = if (args.len > function.params.len) args[function.params.len..] else &.{};
         try self.vm.pushScope(if (function.vararg) extra else &.{}, function.vararg);
-        defer self.vm.popScope();
         try self.vm.frames.append(self.vm.allocator, .{
             .scope_start = self.vm.scopes.items.len - 1,
             .lexical_scope_len = function.lexical_scope_len,
             .env = function.env,
             .captures = &function.captures,
+            .body_end = function.body_end,
         });
-        defer _ = self.vm.frames.pop();
         for (function.params, 0..) |param, i| {
             try self.vm.declare(param, if (i < args.len) args[i] else Value{ .nil = {} });
         }
         var body = Parser{ .vm = self.vm, .pos = function.body_start, .limit = function.body_end, .evaluate = self.evaluate };
-        const signal = try body.parseBlock();
-        return switch (signal) {
+        const signal = body.parseBlock() catch |err| switch (err) {
+            error.Yield => return error.Yield,
+            else => {
+                _ = self.vm.frames.pop();
+                self.vm.popScope();
+                return err;
+            },
+        };
+        const returns = switch (signal) {
             .normal => &.{},
-            .break_loop => error.UnsupportedFeature,
+            .break_loop => return error.UnsupportedFeature,
             .returned => |values| values,
         };
+        _ = self.vm.frames.pop();
+        self.vm.popScope();
+        return returns;
     }
 
     fn primary(self: *Parser) anyerror!Value {
@@ -2149,7 +2466,6 @@ const AdvancedScanState = struct {
         if (hasActiveBinding(bindings, token.lexeme)) return null;
 
         if (std.mem.eql(u8, token.lexeme, "collectgarbage")) return .gc_weak_finalization;
-        if (std.mem.eql(u8, token.lexeme, "coroutine")) return .coroutine_model;
         if (std.mem.eql(u8, token.lexeme, "close")) {
             const attr_left = i > 0 and tokens[i - 1].tag == .lt;
             const attr_right = i + 1 < tokens.len and tokens[i + 1].tag == .gt;
@@ -2162,12 +2478,6 @@ const AdvancedScanState = struct {
             self.saw_binary_dump = true;
         }
         if (std.mem.eql(u8, token.lexeme, "load") and self.saw_binary_dump) return .binary_dynamic_gates;
-        if (std.mem.eql(u8, token.lexeme, "pcall") or
-            std.mem.eql(u8, token.lexeme, "xpcall") or
-            std.mem.eql(u8, token.lexeme, "error"))
-        {
-            self.saw_protected = true;
-        }
         if (std.mem.eql(u8, token.lexeme, "setmetatable")) self.saw_metatable = true;
         return null;
     }
@@ -2175,7 +2485,6 @@ const AdvancedScanState = struct {
     fn finish(self: AdvancedScanState) ?advanced_hooks.HookBoundary {
         if (self.saw_metatable and self.saw_protected) return .cross_boundary_advanced;
         if (self.saw_binary_dump) return .binary_dynamic_gates;
-        if (self.saw_protected) return .protected_error;
         return null;
     }
 };
@@ -3085,7 +3394,8 @@ fn valueToStringForTostring(allocator: std.mem.Allocator, value: Value) ![]const
         .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
         .string => |s| s,
         .table => "table",
-        .function, .builtin => "function",
+        .function, .builtin, .wrapped_thread => "function",
+        .thread => "thread",
     };
 }
 
@@ -3116,6 +3426,8 @@ fn valuesEqual(left: Value, right: Value) bool {
         .table => |v| v == right.table,
         .function => |v| v == right.function,
         .builtin => |v| v == right.builtin,
+        .thread => |v| v == right.thread,
+        .wrapped_thread => |v| v == right.wrapped_thread,
     };
 }
 
@@ -3284,7 +3596,8 @@ fn valueTypeName(value: Value) []const u8 {
         .integer, .float => "number",
         .string => "string",
         .table => "table",
-        .function, .builtin => "function",
+        .function, .builtin, .wrapped_thread => "function",
+        .thread => "thread",
     };
 }
 
@@ -3433,17 +3746,29 @@ test "advanced api names are local bindings before fallback classification" {
     }
 }
 
-test "remaining advanced api globals still classify with stable fallback reasons" {
+test "protected errors and coroutine smoke execute natively" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const snippets = [_]struct { source: []const u8, reason: []const u8 }{
-        .{ .source = "print(pcall(function() error(\"boom\") end))\n", .reason = "protected-error" },
+    const snippets = [_]struct { source: []const u8, stdout: []const u8 }{
+        .{
+            .source = "local ok, err = pcall(function() error(\"boom\", 0) end)\nprint(ok, err)\nlocal ok2, msg = xpcall(function() error(\"bad\", 0) end, function(e) return \"handled:\" .. e end)\nprint(ok2, msg)\n",
+            .stdout = "false\tboom\nfalse\thandled:bad\n",
+        },
+        .{
+            .source = "local co = coroutine.create(function(a)\n  local b = coroutine.yield(a + 1)\n  return b + 2\nend)\nprint(coroutine.resume(co, 4))\nprint(coroutine.resume(co, 7))\nprint(coroutine.status(co))\n",
+            .stdout = "true\t5\ntrue\t9\ndead\n",
+        },
+        .{
+            .source = "local co = coroutine.create(function()\n  coroutine.yield(\"pause\")\n  return \"done\"\nend)\nprint(coroutine.resume(co))\nprint(coroutine.resume(co))\n",
+            .stdout = "true\tpause\ntrue\tdone\n",
+        },
     };
     for (snippets) |snippet| {
         const result = try runLevel0(arena.allocator(), snippet.source);
-        try std.testing.expectEqual(VmState.unsupported, result.state);
-        try std.testing.expectEqual(@as(u8, 1), result.exit_code);
-        try std.testing.expectEqualStrings(snippet.reason, result.unsupported_reason.?);
+        try std.testing.expectEqual(VmState.pass, result.state);
+        try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+        try std.testing.expectEqualSlices(u8, snippet.stdout, result.stdout);
+        try std.testing.expectEqualSlices(u8, "", result.stderr);
         _ = arena.reset(.retain_capacity);
     }
 }
