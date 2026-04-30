@@ -53,6 +53,7 @@ const TokenTag = enum {
 const Token = struct {
     tag: TokenTag,
     lexeme: []const u8,
+    line: usize,
 };
 
 const Function = struct {
@@ -975,7 +976,6 @@ const Parser = struct {
         return null;
     }
 
-
     fn tokens(self: *Parser) []const Token {
         return self.vm.tokens;
     }
@@ -984,7 +984,7 @@ const Parser = struct {
     }
     fn peekOffset(self: *Parser, offset: usize) Token {
         const idx = self.pos + offset;
-        if (idx >= self.limit) return .{ .tag = .eof, .lexeme = "" };
+        if (idx >= self.limit) return .{ .tag = .eof, .lexeme = "", .line = if (self.limit == 0) 1 else self.tokens()[@min(self.limit - 1, self.tokens().len - 1)].line };
         return self.tokens()[idx];
     }
     fn advance(self: *Parser) Token {
@@ -1036,8 +1036,12 @@ pub fn runLevel0WithArgStrings(
         error.UnsupportedFeature => return unsupported(allocator, "lexer"),
         else => return err,
     };
-    try tokens.append(allocator, .{ .tag = .eof, .lexeme = "" });
+    const eof_line = sourceEofLine(source);
+    try tokens.append(allocator, .{ .tag = .eof, .lexeme = "", .line = eof_line });
     const token_slice = try tokens.toOwnedSlice(allocator);
+    if (try validateGotoAndLabels(allocator, token_slice)) |diagnostic| {
+        return syntaxErrorAt(allocator, diagnostic.line, diagnostic.message);
+    }
     if (classifyUnsupportedTokens(token_slice)) |reason| {
         return unsupported(allocator, reason);
     }
@@ -1052,6 +1056,176 @@ pub fn runLevel0WithArgStrings(
         else => return err,
     };
     return .{ .state = .pass, .stdout = try vm.stdout.toOwnedSlice(), .stderr = "", .exit_code = 0, .unsupported_reason = null };
+}
+
+fn sourceEofLine(source: []const u8) usize {
+    var line: usize = 1;
+    for (source) |byte| {
+        if (byte == '\n') line += 1;
+    }
+    return line;
+}
+
+const GotoDiagnostic = struct {
+    line: usize,
+    message: []const u8,
+};
+
+const LabelInfo = struct {
+    name: []const u8,
+    line: usize,
+    index: usize,
+    block_id: usize,
+};
+
+const GotoInfo = struct {
+    name: []const u8,
+    line: usize,
+    index: usize,
+    block_id: usize,
+    block_path: []const usize,
+};
+
+const LocalInfo = struct {
+    name: []const u8,
+    index: usize,
+    block_id: usize,
+};
+
+fn validateGotoAndLabels(allocator: std.mem.Allocator, tokens: []const Token) !?GotoDiagnostic {
+    var labels: std.ArrayList(LabelInfo) = .empty;
+    var gotos: std.ArrayList(GotoInfo) = .empty;
+    var locals: std.ArrayList(LocalInfo) = .empty;
+    var block_stack: std.ArrayList(usize) = .empty;
+    try block_stack.append(allocator, 0);
+    var next_block_id: usize = 1;
+
+    var i: usize = 0;
+    while (i < tokens.len) : (i += 1) {
+        const token = tokens[i];
+        if (token.tag == .eof) break;
+
+        if (token.tag == .coloncolon) {
+            if (i + 1 >= tokens.len or tokens[i + 1].tag != .ident) {
+                return .{ .line = token.line, .message = try std.fmt.allocPrint(allocator, "<name> expected near {s}", .{try tokenNearText(allocator, if (i + 1 < tokens.len) tokens[i + 1] else token)}) };
+            }
+            if (i + 2 >= tokens.len or tokens[i + 2].tag != .coloncolon) {
+                return .{ .line = if (i + 2 < tokens.len) tokens[i + 2].line else token.line + 1, .message = try std.fmt.allocPrint(allocator, "'::' expected near {s}", .{try tokenNearText(allocator, if (i + 2 < tokens.len) tokens[i + 2] else Token{ .tag = .eof, .lexeme = "", .line = token.line })}) };
+            }
+            const label = tokens[i + 1];
+            const block_id = block_stack.items[block_stack.items.len - 1];
+            for (labels.items) |existing| {
+                if (existing.block_id == block_id and std.mem.eql(u8, existing.name, label.lexeme)) {
+                    return .{ .line = label.line, .message = try std.fmt.allocPrint(allocator, "label '{s}' already defined on line {d}", .{ label.lexeme, label.line }) };
+                }
+            }
+            try labels.append(allocator, .{ .name = label.lexeme, .line = label.line, .index = i, .block_id = block_id });
+            i += 2;
+            continue;
+        }
+
+        if (token.tag == .keyword and std.mem.eql(u8, token.lexeme, "goto")) {
+            if (i + 1 >= tokens.len or tokens[i + 1].tag != .ident) {
+                return .{ .line = token.line, .message = try std.fmt.allocPrint(allocator, "<name> expected near {s}", .{try tokenNearText(allocator, if (i + 1 < tokens.len) tokens[i + 1] else token)}) };
+            }
+            try gotos.append(allocator, .{
+                .name = tokens[i + 1].lexeme,
+                .line = token.line,
+                .index = i,
+                .block_id = block_stack.items[block_stack.items.len - 1],
+                .block_path = try allocator.dupe(usize, block_stack.items),
+            });
+            i += 1;
+            continue;
+        }
+
+        if (token.tag == .keyword and std.mem.eql(u8, token.lexeme, "local")) {
+            try collectLocalNames(allocator, tokens, i, block_stack.items[block_stack.items.len - 1], &locals);
+        }
+
+        if (token.tag == .keyword) {
+            if (std.mem.eql(u8, token.lexeme, "end") or std.mem.eql(u8, token.lexeme, "until")) {
+                if (block_stack.items.len > 1) _ = block_stack.pop();
+            } else if (std.mem.eql(u8, token.lexeme, "else")) {
+                if (block_stack.items.len > 1) _ = block_stack.pop();
+                try block_stack.append(allocator, next_block_id);
+                next_block_id += 1;
+            } else if (std.mem.eql(u8, token.lexeme, "then") or
+                std.mem.eql(u8, token.lexeme, "do") or
+                std.mem.eql(u8, token.lexeme, "repeat") or
+                std.mem.eql(u8, token.lexeme, "function"))
+            {
+                try block_stack.append(allocator, next_block_id);
+                next_block_id += 1;
+            }
+        }
+    }
+
+    for (gotos.items) |goto_ref| {
+        const label = findVisibleLabel(labels.items, goto_ref) orelse {
+            return .{ .line = goto_ref.line, .message = try std.fmt.allocPrint(allocator, "no visible label '{s}' for <goto> at line {d}", .{ goto_ref.name, goto_ref.line }) };
+        };
+        if (label.block_id == goto_ref.block_id and goto_ref.index < label.index) {
+            for (locals.items) |local_info| {
+                if (local_info.block_id == goto_ref.block_id and goto_ref.index < local_info.index and local_info.index < label.index) {
+                    return .{ .line = label.line + 1, .message = try std.fmt.allocPrint(allocator, "<goto {s}> at line {d} jumps into the scope of '{s}'", .{ goto_ref.name, goto_ref.line, local_info.name }) };
+                }
+            }
+        }
+    }
+
+    return null;
+}
+
+fn collectLocalNames(
+    allocator: std.mem.Allocator,
+    tokens: []const Token,
+    local_index: usize,
+    block_id: usize,
+    locals: *std.ArrayList(LocalInfo),
+) !void {
+    var p = local_index + 1;
+    if (p < tokens.len and tokens[p].tag == .keyword and std.mem.eql(u8, tokens[p].lexeme, "function")) {
+        p += 1;
+        if (p < tokens.len and tokens[p].tag == .ident) {
+            try locals.append(allocator, .{ .name = tokens[p].lexeme, .index = local_index, .block_id = block_id });
+        }
+        return;
+    }
+    while (p < tokens.len) {
+        if (tokens[p].tag != .ident) break;
+        try locals.append(allocator, .{ .name = tokens[p].lexeme, .index = local_index, .block_id = block_id });
+        p += 1;
+        if (p >= tokens.len or tokens[p].tag != .comma) break;
+        p += 1;
+    }
+}
+
+fn findVisibleLabel(labels: []const LabelInfo, goto_ref: GotoInfo) ?LabelInfo {
+    var best: ?LabelInfo = null;
+    var best_depth: usize = 0;
+    for (labels) |label| {
+        if (!std.mem.eql(u8, label.name, goto_ref.name)) continue;
+        if (blockDepthInPath(goto_ref.block_path, label.block_id)) |depth| {
+            if (best == null or depth >= best_depth) {
+                best = label;
+                best_depth = depth;
+            }
+        }
+    }
+    return best;
+}
+
+fn blockDepthInPath(path: []const usize, block_id: usize) ?usize {
+    for (path, 0..) |id, depth| {
+        if (id == block_id) return depth;
+    }
+    return null;
+}
+
+fn tokenNearText(allocator: std.mem.Allocator, token: Token) ![]const u8 {
+    if (token.tag == .eof) return "<eof>";
+    return try std.fmt.allocPrint(allocator, "'{s}'", .{token.lexeme});
 }
 
 fn classifyUnsupportedTokens(tokens: []const Token) ?[]const u8 {
@@ -1654,12 +1828,18 @@ fn syntaxError(allocator: std.mem.Allocator, reason: []const u8) !VmResult {
     return .{ .state = .runtime_error, .stdout = "", .stderr = try std.fmt.allocPrint(allocator, "ziglua-vm: syntax-error:{s}\n", .{reason}), .exit_code = 1, .unsupported_reason = null };
 }
 
+fn syntaxErrorAt(allocator: std.mem.Allocator, line: usize, message: []const u8) !VmResult {
+    return .{ .state = .runtime_error, .stdout = "", .stderr = try std.fmt.allocPrint(allocator, "ziglua-vm: syntax-error:{d}:{s}\n", .{ line, message }), .exit_code = 1, .unsupported_reason = null };
+}
+
 fn lex(allocator: std.mem.Allocator, source: []const u8) !std.ArrayList(Token) {
     var tokens: std.ArrayList(Token) = .empty;
     var i: usize = 0;
+    var line: usize = 1;
     while (i < source.len) {
         const c = source[i];
         if (std.ascii.isWhitespace(c)) {
+            if (c == '\n') line += 1;
             i += 1;
             continue;
         }
@@ -1667,7 +1847,9 @@ fn lex(allocator: std.mem.Allocator, source: []const u8) !std.ArrayList(Token) {
             i += 2;
             if (i + 1 < source.len and source[i] == '[' and source[i + 1] == '[') {
                 i += 2;
-                while (i + 1 < source.len and !(source[i] == ']' and source[i + 1] == ']')) i += 1;
+                while (i + 1 < source.len and !(source[i] == ']' and source[i + 1] == ']')) : (i += 1) {
+                    if (source[i] == '\n') line += 1;
+                }
                 if (i + 1 >= source.len) return error.UnsupportedFeature;
                 i += 2;
             } else {
@@ -1680,7 +1862,7 @@ fn lex(allocator: std.mem.Allocator, source: []const u8) !std.ArrayList(Token) {
             i += 1;
             while (i < source.len and (std.ascii.isAlphanumeric(source[i]) or source[i] == '_')) i += 1;
             const word = source[start..i];
-            try tokens.append(allocator, .{ .tag = if (isKeyword(word)) .keyword else .ident, .lexeme = word });
+            try tokens.append(allocator, .{ .tag = if (isKeyword(word)) .keyword else .ident, .lexeme = word, .line = line });
             continue;
         }
         if (std.ascii.isDigit(c)) {
@@ -1689,25 +1871,29 @@ fn lex(allocator: std.mem.Allocator, source: []const u8) !std.ArrayList(Token) {
                 i += 2;
                 while (i < source.len and std.ascii.isHex(source[i])) i += 1;
                 if (i == start + 2) return error.UnsupportedFeature;
-                try tokens.append(allocator, .{ .tag = .number, .lexeme = source[start..i] });
+                try tokens.append(allocator, .{ .tag = .number, .lexeme = source[start..i], .line = line });
                 continue;
             }
             i += 1;
             while (i < source.len and (std.ascii.isDigit(source[i]) or source[i] == '.')) i += 1;
-            try tokens.append(allocator, .{ .tag = .number, .lexeme = source[start..i] });
+            try tokens.append(allocator, .{ .tag = .number, .lexeme = source[start..i], .line = line });
             continue;
         }
         if (c == '[' and i + 1 < source.len and source[i + 1] == '[') {
             i += 2;
+            const start_line = line;
             const start = i;
-            while (i + 1 < source.len and !(source[i] == ']' and source[i + 1] == ']')) i += 1;
+            while (i + 1 < source.len and !(source[i] == ']' and source[i + 1] == ']')) : (i += 1) {
+                if (source[i] == '\n') line += 1;
+            }
             if (i + 1 >= source.len) return error.UnsupportedFeature;
-            try tokens.append(allocator, .{ .tag = .string, .lexeme = source[start..i] });
+            try tokens.append(allocator, .{ .tag = .string, .lexeme = source[start..i], .line = start_line });
             i += 2;
             continue;
         }
         if (c == '"' or c == '\'') {
             const quote = c;
+            const start_line = line;
             i += 1;
             var bytes: std.ArrayList(u8) = .empty;
             while (i < source.len and source[i] != quote) : (i += 1) {
@@ -1725,64 +1911,65 @@ fn lex(allocator: std.mem.Allocator, source: []const u8) !std.ArrayList(Token) {
                     };
                     try bytes.append(allocator, escaped);
                 } else {
+                    if (source[i] == '\n') line += 1;
                     try bytes.append(allocator, source[i]);
                 }
             }
             if (i >= source.len) return error.UnsupportedFeature;
             i += 1;
-            try tokens.append(allocator, .{ .tag = .string, .lexeme = try bytes.toOwnedSlice(allocator) });
+            try tokens.append(allocator, .{ .tag = .string, .lexeme = try bytes.toOwnedSlice(allocator), .line = start_line });
             continue;
         }
         const three = if (i + 2 < source.len) source[i .. i + 3] else "";
         if (three.len == 3 and std.mem.eql(u8, three, "...")) {
-            try tokens.append(allocator, .{ .tag = .ellipsis, .lexeme = three });
+            try tokens.append(allocator, .{ .tag = .ellipsis, .lexeme = three, .line = line });
             i += 3;
             continue;
         }
         const two = if (i + 1 < source.len) source[i .. i + 2] else "";
         if (two.len == 2) {
             if (std.mem.eql(u8, two, "::")) {
-                try tokens.append(allocator, .{ .tag = .coloncolon, .lexeme = two });
+                try tokens.append(allocator, .{ .tag = .coloncolon, .lexeme = two, .line = line });
                 i += 2;
                 continue;
             }
             if (std.mem.eql(u8, two, "//")) {
-                try tokens.append(allocator, .{ .tag = .floor_div, .lexeme = two });
+                try tokens.append(allocator, .{ .tag = .floor_div, .lexeme = two, .line = line });
                 i += 2;
                 continue;
             }
             if (std.mem.eql(u8, two, "..")) {
-                try tokens.append(allocator, .{ .tag = .concat, .lexeme = two });
+                try tokens.append(allocator, .{ .tag = .concat, .lexeme = two, .line = line });
                 i += 2;
                 continue;
             }
             if (std.mem.eql(u8, two, "==")) {
-                try tokens.append(allocator, .{ .tag = .eq, .lexeme = two });
+                try tokens.append(allocator, .{ .tag = .eq, .lexeme = two, .line = line });
                 i += 2;
                 continue;
             }
             if (std.mem.eql(u8, two, "~=")) {
-                try tokens.append(allocator, .{ .tag = .ne, .lexeme = two });
+                try tokens.append(allocator, .{ .tag = .ne, .lexeme = two, .line = line });
                 i += 2;
                 continue;
             }
             if (std.mem.eql(u8, two, "<=")) {
-                try tokens.append(allocator, .{ .tag = .le, .lexeme = two });
+                try tokens.append(allocator, .{ .tag = .le, .lexeme = two, .line = line });
                 i += 2;
                 continue;
             }
             if (std.mem.eql(u8, two, ">=")) {
-                try tokens.append(allocator, .{ .tag = .ge, .lexeme = two });
+                try tokens.append(allocator, .{ .tag = .ge, .lexeme = two, .line = line });
                 i += 2;
                 continue;
             }
             if (std.mem.eql(u8, two, "<<")) {
-                try tokens.append(allocator, .{ .tag = .shl, .lexeme = two });
+                try tokens.append(allocator, .{ .tag = .shl, .lexeme = two, .line = line });
                 i += 2;
                 continue;
             }
             if (std.mem.eql(u8, two, ">>")) {
-                try tokens.append(allocator, .{ .tag = .shr, .lexeme = two });
+                try tokens.append(allocator, .{ .tag = .shr, .lexeme = two, .line = line });
                 i += 2;
                 continue;
             }
@@ -1811,7 +1998,7 @@ fn lex(allocator: std.mem.Allocator, source: []const u8) !std.ArrayList(Token) {
             '~' => .tilde,
             else => return error.UnsupportedFeature,
         };
-        try tokens.append(allocator, .{ .tag = tag, .lexeme = source[i .. i + 1] });
+        try tokens.append(allocator, .{ .tag = tag, .lexeme = source[i .. i + 1], .line = line });
         i += 1;
     }
     return tokens;
@@ -2044,6 +2231,26 @@ test "vm level0 literals locals arithmetic strings tables control flow and bitwi
         try std.testing.expectEqual(VmState.pass, result.state);
         try std.testing.expectEqual(@as(u8, 0), result.exit_code);
         try std.testing.expectEqualSlices(u8, snippet.stdout, result.stdout);
+        _ = arena.reset(.retain_capacity);
+    }
+}
+
+test "vm level0 goto label legality diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const snippets = [_]struct { source: []const u8, diagnostic: []const u8 }{
+        .{ .source = "goto missing\n", .diagnostic = "syntax-error:1:no visible label 'missing' for <goto> at line 1" },
+        .{ .source = "::a::\n::a::\n", .diagnostic = "syntax-error:2:label 'a' already defined on line 2" },
+        .{ .source = "::1::\n", .diagnostic = "syntax-error:1:<name> expected near '1'" },
+        .{ .source = "goto end\n", .diagnostic = "syntax-error:1:<name> expected near 'end'" },
+        .{ .source = "goto L\nlocal x\n::L::\nprint(1)\n", .diagnostic = "syntax-error:4:<goto L> at line 1 jumps into the scope of 'x'" },
+    };
+    for (snippets) |snippet| {
+        const result = try runLevel0(arena.allocator(), snippet.source);
+        try std.testing.expectEqual(VmState.runtime_error, result.state);
+        try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+        try std.testing.expectEqualSlices(u8, "", result.stdout);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, snippet.diagnostic) != null);
         _ = arena.reset(.retain_capacity);
     }
 }

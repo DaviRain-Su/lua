@@ -1,5 +1,6 @@
 import json
 import importlib.util
+import os
 import shlex
 import subprocess
 import sys
@@ -13,10 +14,14 @@ VM_COMMAND = "./zig-out/bin/ziglua-vm"
 BASELINE_ORACLE = REPO / "tools" / "validation" / "baseline_oracle.py"
 
 
-def run(*command: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
+def run(*command: str, stdin: str | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    process_env = os.environ.copy()
+    if env is not None:
+        process_env.update(env)
     return subprocess.run(
         list(command),
         cwd=REPO,
+        env=process_env,
         input=stdin,
         text=True,
         stdout=subprocess.PIPE,
@@ -120,6 +125,30 @@ class VmLevel0Tests(unittest.TestCase):
         self.assertEqual(candidate.stdout, "")
         self.assertIn("ziglua-vm:", candidate.stderr)
         self.assertIn("arithmetic", candidate.stderr)
+
+    def test_no_host_lua_goto_label_legality_matches_stock_lua(self):
+        cases = {
+            "undefined-label": "goto missing\n",
+            "duplicate-label": "::a::\n::a::\n",
+            "malformed-label": "::1::\n",
+            "malformed-goto-label": "goto end\n",
+            "jump-into-local-scope": "goto L\nlocal x\n::L::\nprint(1)\n",
+        }
+        for name, source in cases.items():
+            with self.subTest(case=name):
+                stock = run("./lua", "-", stdin=source)
+                candidate = run(
+                    "./zig-out/bin/lua-zig",
+                    "run",
+                    "-",
+                    stdin=source,
+                    env={"LUA_ZIG_RUN_NO_HOST_LUA": "1"},
+                )
+
+                self.assertNotEqual(stock.returncode, 0, name)
+                self.assertEqual(candidate.returncode, stock.returncode, candidate.stderr)
+                self.assertEqual(candidate.stdout, stock.stdout)
+                self.assertEqual(candidate.stderr, stock.stderr)
 
     def test_baseline_oracle_vm_level0_corpus_command_reports_pass(self):
         completed = run(

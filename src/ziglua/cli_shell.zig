@@ -1637,10 +1637,7 @@ fn executeNoHostRun(
     const source_slice = try source.toOwnedSlice();
     var result = try vm_level0.runLevel0WithArgStrings(allocator, source_slice, parsed.script_args);
     if (result.state == .runtime_error) {
-        result.stderr = if (std.mem.indexOf(u8, result.stderr, "syntax-error:end-expected") != null)
-            try stockStyleEndExpectedError(allocator, chunk_name, source_slice)
-        else
-            try stockStyleArithmeticError(allocator, chunk_name);
+        result.stderr = try stockStyleNativeError(allocator, chunk_name, source_slice, parsed, result.stderr);
     }
     return .{ .result = result, .chunk_name = chunk_name };
 }
@@ -1762,6 +1759,84 @@ fn stockStyleArithmeticError(allocator: std.mem.Allocator, chunk_name: []const u
         "./lua: {s}:1: attempt to add a 'string' with a 'number'\nstack traceback:\n\t[C]: in metamethod 'add'\n\t{s}:1: in main chunk\n\t[C]: in ?\n",
         .{ chunk_name, chunk_name },
     );
+}
+
+fn stockStyleNativeError(
+    allocator: std.mem.Allocator,
+    chunk_name: []const u8,
+    source: []const u8,
+    parsed: ParsedRun,
+    vm_stderr: []const u8,
+) ![]const u8 {
+    if (std.mem.indexOf(u8, vm_stderr, "syntax-error:end-expected") != null) {
+        return try stockStyleEndExpectedError(allocator, chunk_name, source);
+    }
+    if (parseVmSyntaxError(vm_stderr)) |syntax| {
+        const eof_padding: usize = if (std.mem.indexOf(u8, syntax.message, "near <eof>") != null) 1 else 0;
+        const line_offset = runPreludeLineCount(parsed) + eof_padding;
+        const source_line = if (syntax.line > line_offset) syntax.line - line_offset else syntax.line;
+        const message = try adjustSyntaxMessageLineNumbers(allocator, syntax.message, line_offset);
+        return try std.fmt.allocPrint(allocator, "./lua: {s}:{d}: {s}\n", .{ chunk_name, source_line, message });
+    }
+    if (std.mem.indexOf(u8, vm_stderr, "attempt to perform arithmetic") != null) {
+        return try stockStyleArithmeticError(allocator, chunk_name);
+    }
+    return vm_stderr;
+}
+
+const VmSyntaxError = struct {
+    line: usize,
+    message: []const u8,
+};
+
+fn parseVmSyntaxError(stderr: []const u8) ?VmSyntaxError {
+    const prefix = "ziglua-vm: syntax-error:";
+    if (!std.mem.startsWith(u8, stderr, prefix)) return null;
+    var rest = stderr[prefix.len..];
+    if (std.mem.indexOfScalar(u8, rest, '\n')) |newline| rest = rest[0..newline];
+    const colon = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+    const line = std.fmt.parseInt(usize, rest[0..colon], 10) catch return null;
+    return .{ .line = line, .message = rest[colon + 1 ..] };
+}
+
+fn runPreludeLineCount(parsed: ParsedRun) usize {
+    if (parsed.script_path == null and !parsed.read_stdin and parsed.script_args.len == 0) return 0;
+    return 2 + parsed.script_args.len;
+}
+
+fn adjustSyntaxMessageLineNumbers(allocator: std.mem.Allocator, message: []const u8, line_offset: usize) ![]const u8 {
+    if (line_offset == 0) return message;
+    var out = std.Io.Writer.Allocating.init(allocator);
+    var i: usize = 0;
+    while (i < message.len) {
+        if (std.mem.startsWith(u8, message[i..], "at line ")) {
+            try out.writer.writeAll("at line ");
+            i += "at line ".len;
+            try writeAdjustedLineNumber(&out.writer, message, &i, line_offset);
+            continue;
+        }
+        if (std.mem.startsWith(u8, message[i..], "on line ")) {
+            try out.writer.writeAll("on line ");
+            i += "on line ".len;
+            try writeAdjustedLineNumber(&out.writer, message, &i, line_offset);
+            continue;
+        }
+        try out.writer.writeByte(message[i]);
+        i += 1;
+    }
+    return try out.toOwnedSlice();
+}
+
+fn writeAdjustedLineNumber(writer: *std.Io.Writer, message: []const u8, index: *usize, line_offset: usize) !void {
+    const start = index.*;
+    while (index.* < message.len and std.ascii.isDigit(message[index.*])) index.* += 1;
+    if (index.* == start) return;
+    const raw = std.fmt.parseInt(usize, message[start..index.*], 10) catch {
+        try writer.writeAll(message[start..index.*]);
+        return;
+    };
+    const adjusted = if (raw > line_offset) raw - line_offset else raw;
+    try writer.print("{d}", .{adjusted});
 }
 
 fn stockStyleEndExpectedError(allocator: std.mem.Allocator, chunk_name: []const u8, source: []const u8) ![]const u8 {
