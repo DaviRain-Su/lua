@@ -1638,6 +1638,8 @@ class BaselineOracleTests(unittest.TestCase):
         self.assertGreaterEqual(coverage["VAL-NATIVE-008"]["case_count"], 5)
         self.assertIn("coercion:overflow-error", coverage["VAL-NATIVE-008"]["tags"])
         self.assertIn("diagnostic:bitwise-coercion", coverage["VAL-NATIVE-010"]["tags"])
+        self.assertIn("closure:loop-variable-numeric-for", coverage["VAL-NATIVE-012"]["tags"])
+        self.assertIn("closure:loop-variable-generic-for", coverage["VAL-NATIVE-012"]["tags"])
 
     def test_native_core_coverage_rejects_fallback_or_missing_evidence(self):
         entries = [
@@ -1665,6 +1667,74 @@ class BaselineOracleTests(unittest.TestCase):
         self.assertTrue(any("without native/no_host_lua evidence" in error for error in errors), errors)
         self.assertTrue(any("missing evidence fields" in error for error in errors), errors)
         self.assertTrue(any("VAL-NATIVE-004 requires at least" in error for error in errors), errors)
+
+    def test_native_core_coverage_requires_numeric_and_generic_loop_closure_tags(self):
+        entries = []
+        for case in baseline_oracle.NATIVE_CORE_LANGUAGE_CASES:
+            tags = [
+                tag
+                for tag in case["coverage_tags"]
+                if tag not in {"closure:loop-variable-numeric-for", "closure:loop-variable-generic-for"}
+            ]
+            entries.append(
+                {
+                    "name": case["name"],
+                    "puc_file": case["puc_file"],
+                    "validates": case["validates"],
+                    "coverage_tags": tags,
+                    "state": "pass",
+                    "implementation_mode": "native",
+                    "no_host_lua": True,
+                    "fallback_observed": False,
+                    "unsupported_observed": False,
+                }
+            )
+
+        coverage, errors = baseline_oracle.validate_native_core_coverage(entries)
+
+        self.assertIn("closure:loop-variable", coverage["VAL-NATIVE-012"]["tags"])
+        self.assertTrue(
+            any(
+                "VAL-NATIVE-012 missing required native coverage tags" in error
+                and "closure:loop-variable-numeric-for" in error
+                and "closure:loop-variable-generic-for" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_native_core_coverage_rejects_non_native_loop_closure_evidence(self):
+        entries = []
+        for case in baseline_oracle.NATIVE_CORE_LANGUAGE_CASES:
+            is_loop_closure = "closure:loop-variable" in case["coverage_tags"]
+            entries.append(
+                {
+                    "name": case["name"],
+                    "puc_file": case["puc_file"],
+                    "validates": case["validates"],
+                    "coverage_tags": case["coverage_tags"],
+                    "state": "pass",
+                    "implementation_mode": "stock-lua-fallback" if is_loop_closure else "native",
+                    "no_host_lua": False if is_loop_closure else True,
+                    "fallback_observed": True if is_loop_closure else False,
+                    "unsupported_observed": False,
+                }
+            )
+
+        coverage, errors = baseline_oracle.validate_native_core_coverage(entries)
+
+        self.assertNotIn("closure:loop-variable-numeric-for", coverage["VAL-NATIVE-012"]["tags"])
+        self.assertNotIn("closure:loop-variable-generic-for", coverage["VAL-NATIVE-012"]["tags"])
+        self.assertTrue(any("without native/no_host_lua evidence" in error for error in errors), errors)
+        self.assertTrue(
+            any(
+                "VAL-NATIVE-012 missing required native coverage tags" in error
+                and "closure:loop-variable-numeric-for" in error
+                and "closure:loop-variable-generic-for" in error
+                for error in errors
+            ),
+            errors,
+        )
 
     def test_packaged_advanced_smokes_run_protected_and_metatable_native_fixtures(self):
         with tempfile.TemporaryDirectory() as tmp:

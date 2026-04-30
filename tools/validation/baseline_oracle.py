@@ -135,13 +135,16 @@ NATIVE_CORE_COVERAGE_REQUIREMENTS = {
         ],
     },
     "VAL-NATIVE-012": {
-        "min_cases": 4,
+        "min_cases": 6,
         "required_puc_files": ["closure.lua"],
         "required_tags": [
             "closure:lexical-capture",
             "closure:closed-upvalue",
             "closure:mutation-visibility",
             "closure:aliasing",
+            "closure:loop-variable",
+            "closure:loop-variable-numeric-for",
+            "closure:loop-variable-generic-for",
         ],
     },
     "VAL-NATIVE-013": {
@@ -413,7 +416,12 @@ print(get())
         "name": "closure-numeric-for-control-variable-core",
         "puc_file": "closure.lua",
         "validates": ["VAL-NATIVE-012"],
-        "coverage_tags": ["closure:lexical-capture", "closure:closed-upvalue", "closure:loop-variable"],
+        "coverage_tags": [
+            "closure:lexical-capture",
+            "closure:closed-upvalue",
+            "closure:loop-variable",
+            "closure:loop-variable-numeric-for",
+        ],
         "description": "numeric for-loop control variables captured by escaping closures use per-iteration cells",
         "source": """local a = {}
 for i = 1, 3 do
@@ -426,7 +434,12 @@ print(a[1](), a[2](), a[3]())
         "name": "closure-numeric-for-body-local-core",
         "puc_file": "closure.lua",
         "validates": ["VAL-NATIVE-012"],
-        "coverage_tags": ["closure:lexical-capture", "closure:closed-upvalue", "closure:loop-variable"],
+        "coverage_tags": [
+            "closure:lexical-capture",
+            "closure:closed-upvalue",
+            "closure:loop-variable",
+            "closure:loop-variable-numeric-for",
+        ],
         "description": "numeric for-loop body locals captured with the control variable are fresh per iteration",
         "source": """local a = {}
 for i = 1, 3 do
@@ -440,7 +453,12 @@ print(a[1](), a[2](), a[3]())
         "name": "closure-generic-for-key-value-core",
         "puc_file": "closure.lua",
         "validates": ["VAL-NATIVE-012"],
-        "coverage_tags": ["closure:lexical-capture", "closure:closed-upvalue", "closure:loop-variable"],
+        "coverage_tags": [
+            "closure:lexical-capture",
+            "closure:closed-upvalue",
+            "closure:loop-variable",
+            "closure:loop-variable-generic-for",
+        ],
         "description": "generic for-loop key/value variables captured by escaping closures use per-iteration cells",
         "source": """local a = {}
 for k, v in ipairs({"a", "b", "c"}) do
