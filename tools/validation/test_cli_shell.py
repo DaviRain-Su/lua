@@ -55,19 +55,107 @@ class LuaZigCliShellTests(unittest.TestCase):
         self.assertEqual(version_result.stderr, "")
         self.assertRegex(version_result.stdout, r"^lua-zig 0\.1\.0 zig=0\.16\.0 profile=native-full\n$")
 
-    def test_registered_build_and_check_commands_return_deterministic_json_route_metadata(self):
-        for command in ("build", "check"):
-            with self.subTest(command=command):
-                completed = run(str(CLI), command)
+    def test_registered_build_command_returns_deterministic_json_route_metadata(self):
+        completed = run(str(CLI), "build")
 
-                self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
-                self.assertEqual(completed.stderr, "")
-                summary = json.loads(completed.stdout)
-                self.assertEqual(summary["state"], "pending")
-                self.assertEqual(summary["command"], command)
-                self.assertEqual(summary["cli"], "lua-zig")
-                self.assertEqual(summary["profile"], "native-full")
-                self.assertIn("registered", summary["message"])
+        self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+        self.assertEqual(completed.stderr, "")
+        summary = json.loads(completed.stdout)
+        self.assertEqual(summary["state"], "pending")
+        self.assertEqual(summary["command"], "build")
+        self.assertEqual(summary["cli"], "lua-zig")
+        self.assertEqual(summary["profile"], "native-full")
+        self.assertIn("registered", summary["message"])
+
+    def test_check_validates_source_syntax_without_executing_or_emitting_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            script = temp_path / "valid.lua"
+            script.write_text('print("SHOULD_NOT_EXECUTE")\nlocal x = 21 + 21\n')
+            evidence_dir = temp_path / "evidence"
+            artifact_dir = temp_path / "artifacts"
+            artifact_dir.mkdir()
+
+            completed = run(
+                str(CLI),
+                "check",
+                "--profile",
+                "native-full",
+                str(script),
+                env={"LUA_ZIG_EVIDENCE_DIR": str(evidence_dir)},
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            self.assertEqual(completed.stderr, "")
+            summary = json.loads(completed.stdout)
+            self.assertEqual(summary["state"], "pass")
+            self.assertEqual(summary["command"], "check")
+            self.assertEqual(summary["target_profile"], "native-full")
+            self.assertEqual(summary["accounting"]["native_pass_count"], 0)
+            self.assertEqual(summary["accounting"]["fail_count"], 0)
+            self.assertEqual(summary["accounting"]["unsupported_count"], 0)
+            self.assertNotIn("SHOULD_NOT_EXECUTE", completed.stdout)
+            ledger = summary["ledger"][0]
+            self.assertEqual(ledger["implementation_mode"], "loader-parser-check")
+            self.assertEqual(ledger["chunk"]["kind"], "source")
+            self.assertEqual(ledger["chunk"]["path"], str(script.resolve()))
+            self.assertFalse(ledger["artifacts_emitted"])
+            self.assertIn("VAL-CLI-013", ledger["validates"])
+            self.assertEqual(list(artifact_dir.iterdir()), [])
+            evidence = json.loads(next(evidence_dir.glob("check-*.json")).read_text())
+            self.assertFalse(evidence["artifacts_emitted"])
+
+    def test_check_reports_syntax_errors_and_profile_limitations(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            invalid = temp_path / "invalid.lua"
+            invalid.write_text("function nope(\n")
+            unsupported = temp_path / "unsupported.lua"
+            unsupported.write_text('debug.getinfo(1)\n')
+            wasm_denied = temp_path / "wasm-denied.lua"
+            wasm_denied.write_text('io.open("file.txt", "w")\n')
+            env = {"LUA_ZIG_EVIDENCE_DIR": str(temp_path / "evidence")}
+
+            syntax = run(str(CLI), "check", str(invalid), env=env)
+            self.assertNotEqual(syntax.returncode, 0, syntax.stderr + syntax.stdout)
+            self.assertEqual(syntax.stderr, "")
+            syntax_summary = json.loads(syntax.stdout)
+            self.assertEqual(syntax_summary["state"], "fail")
+            self.assertEqual(syntax_summary["accounting"]["fail_count"], 1)
+            self.assertEqual(syntax_summary["ledger"][0]["chunk"]["path"], str(invalid.resolve()))
+            self.assertIn(invalid.name, syntax_summary["ledger"][0]["diagnostic"])
+
+            native_limit = run(str(CLI), "check", str(unsupported), env=env)
+            self.assertNotEqual(native_limit.returncode, 0, native_limit.stderr + native_limit.stdout)
+            native_summary = json.loads(native_limit.stdout)
+            self.assertEqual(native_summary["state"], "unsupported")
+            self.assertEqual(native_summary["accounting"]["unsupported_count"], 1)
+            self.assertEqual(native_summary["ledger"][0]["profile_limitation"], "debug-api-not-yet-native")
+
+            wasm_limit = run(str(CLI), "check", "--profile", "wasm-full", str(wasm_denied), env=env)
+            self.assertNotEqual(wasm_limit.returncode, 0, wasm_limit.stderr + wasm_limit.stdout)
+            wasm_summary = json.loads(wasm_limit.stdout)
+            self.assertEqual(wasm_summary["state"], "capability-denied")
+            self.assertEqual(wasm_summary["accounting"]["capability_denied_count"], 1)
+            self.assertIn("filesystem", wasm_summary["ledger"][0]["capability"])
+
+    def test_check_reports_binary_chunk_loader_limitation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            binary_chunk = temp_path / "chunk.luac"
+            binary_chunk.write_bytes(b"\x1bLua\x00synthetic")
+
+            completed = run(str(CLI), "check", str(binary_chunk))
+
+            self.assertNotEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+            self.assertEqual(completed.stderr, "")
+            summary = json.loads(completed.stdout)
+            self.assertEqual(summary["state"], "unsupported")
+            self.assertEqual(summary["accounting"]["unsupported_count"], 1)
+            ledger = summary["ledger"][0]
+            self.assertEqual(ledger["chunk"]["kind"], "binary")
+            self.assertEqual(ledger["profile_limitation"], "binary-chunk-loader-unimplemented")
+            self.assertFalse(ledger["artifacts_emitted"])
 
     def test_test_command_emits_compatibility_ledger_with_native_accounting(self):
         completed = run(str(CLI), "test", "--suite", "cli-ledger", "--target", "native-full")
@@ -245,7 +333,7 @@ class LuaZigCliShellTests(unittest.TestCase):
             )
             self.assertEqual(report["accounting"]["fail_count"], 1)
             self.assertGreater(report["accounting"]["fallback_pass_count"], 0)
-            self.assertGreaterEqual(report["accounting"]["blocked_count"], 2)
+            self.assertGreaterEqual(report["accounting"]["blocked_count"], 1)
             self.assertEqual(report["evidence"]["source"], str(evidence_dir.resolve()))
             self.assertGreaterEqual(report["evidence"]["record_count"], 6)
             self.assertTrue(any(entry["state"] == "fallback-pass" for entry in report["ledger"]))
@@ -258,6 +346,7 @@ class LuaZigCliShellTests(unittest.TestCase):
                 )
             )
             self.assertTrue(any(entry["command"] == "profile" for entry in report["ledger"]))
+            self.assertTrue(any(entry["command"] == "check" and entry["state"] == "pass" for entry in report["ledger"]))
             self.assertTrue(any(entry["command"] == "test" and entry["fixture"]["path"] == str(fixture.resolve()) for entry in report["ledger"]))
 
     def test_capability_command_lists_profiles_and_rejects_unknown_capabilities(self):

@@ -55,7 +55,8 @@ pub fn main(init: std.process.Init) !void {
 
     switch (command) {
         .run => try runCommand(allocator, io, &args),
-        .build, .check => try registeredRouteCommand(allocator, io, command, &args),
+        .build => try registeredRouteCommand(allocator, io, command, &args),
+        .check => try checkCommand(allocator, io, &args),
         .test_cmd => try testCommand(allocator, io, &args),
         .profile => try profileCommand(allocator, io, &args),
         .report => try reportCommand(allocator, io, &args),
@@ -137,6 +138,12 @@ fn printCommandHelp(io: std.Io, command: Command) !void {
             \\lua-zig report
             \\Usage: lua-zig report [--format json]
             \\Emits compatibility ledger summaries with native/fallback accounting separated.
+            \\
+        ),
+        .check => try stdout_writer.interface.writeAll(
+            \\lua-zig check
+            \\Usage: lua-zig check [--profile native-full|wasm-full|sbf-experimental] [-e chunk] [-l module] [script|-]
+            \\Validates source syntax/profile compatibility without executing chunks or emitting build artifacts.
             \\
         ),
         .capability => try stdout_writer.interface.writeAll(
@@ -977,6 +984,94 @@ fn buildProfileEvidence(
     return try out.toOwnedSlice();
 }
 
+fn buildCheckEvidence(
+    allocator: std.mem.Allocator,
+    command_id: []const u8,
+    state: []const u8,
+    target: []const u8,
+    implementation_mode: []const u8,
+    diagnostic: []const u8,
+    chunk_kind: []const u8,
+    chunk_path: []const u8,
+    source: []const u8,
+    profile_limitation: []const u8,
+    capability: []const u8,
+    timestamp: i128,
+) ![]const u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    try out.writer.writeAll(
+        \\{
+        \\  "artifacts_emitted": false,
+        \\  "capability":
+    );
+    try writeJsonString(&out.writer, capability);
+    try out.writer.writeAll(
+        \\,
+        \\  "chunk": {
+        \\    "kind":
+    );
+    try writeJsonString(&out.writer, chunk_kind);
+    try out.writer.writeAll(
+        \\,
+        \\    "path":
+    );
+    try writeJsonString(&out.writer, chunk_path);
+    try out.writer.print(
+        \\,
+        \\    "source_bytes": {d},
+        \\    "source_sha256":
+    ,
+        .{source.len},
+    );
+    const digest = try sourceDigestHex(allocator, source);
+    try writeJsonString(&out.writer, digest);
+    try out.writer.writeAll(
+        \\
+        \\  },
+        \\  "cli": "lua-zig",
+        \\  "command": "check",
+        \\  "command_id":
+    );
+    try writeJsonString(&out.writer, command_id);
+    try out.writer.writeAll(
+        \\,
+        \\  "diagnostic":
+    );
+    try writeJsonString(&out.writer, diagnostic);
+    try out.writer.writeAll(
+        \\,
+        \\  "id": "loader-parser-check",
+        \\  "implementation_mode":
+    );
+    try writeJsonString(&out.writer, implementation_mode);
+    try out.writer.writeAll(
+        \\,
+        \\  "loader_boundary": "run-compatible-source-loader",
+        \\  "profile":
+    );
+    try writeJsonString(&out.writer, target);
+    try out.writer.writeAll(
+        \\,
+        \\  "profile_limitation":
+    );
+    try writeJsonString(&out.writer, profile_limitation);
+    try out.writer.writeAll(
+        \\,
+        \\  "provenance": "lua-zig check loaded the chunk through the run-compatible loader and parsed it without executing user code or emitting build artifacts",
+        \\  "state":
+    );
+    try writeJsonString(&out.writer, state);
+    try out.writer.print(
+        \\,
+        \\  "timestamp_unix_ms": {d},
+        \\  "validates": ["VAL-CLI-013"]
+        \\}}
+    ,
+        .{timestamp},
+    );
+    return try out.toOwnedSlice();
+}
+
 fn buildRunEvidence(
     allocator: std.mem.Allocator,
     command_id: []const u8,
@@ -1148,6 +1243,23 @@ const ParsedRun = struct {
 const NativeRun = struct {
     result: vm_level0.VmResult,
     chunk_name: []const u8,
+};
+
+const CheckInput = struct {
+    source: []const u8,
+    chunk_name: []const u8,
+    display_path: []const u8,
+    chunk_kind: []const u8,
+    loader_error: ?[]const u8,
+};
+
+const CheckClassification = struct {
+    state: []const u8,
+    implementation_mode: []const u8,
+    diagnostic: []const u8,
+    profile_limitation: []const u8,
+    capability: []const u8,
+    exit_code: u8,
 };
 
 fn timestampMillis(io: std.Io) i128 {
@@ -1567,6 +1679,278 @@ fn stockStyleArithmeticError(allocator: std.mem.Allocator, chunk_name: []const u
         "./lua: {s}:1: attempt to add a 'string' with a 'number'\nstack traceback:\n\t[C]: in metamethod 'add'\n\t{s}:1: in main chunk\n\t[C]: in ?\n",
         .{ chunk_name, chunk_name },
     );
+}
+
+fn checkCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    args: *std.process.Args.Iterator,
+) !void {
+    var target: []const u8 = profile_name;
+    var check_args: std.ArrayList([]const u8) = .empty;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try printCommandHelp(io, .check);
+            return;
+        } else if (std.mem.eql(u8, arg, "--profile") or std.mem.eql(u8, arg, "--target")) {
+            target = args.next() orelse return failMissingValue(io, arg);
+            if (!isKnownProfile(target)) return failUnknownValue(io, "profile", target);
+        } else {
+            try check_args.append(allocator, arg);
+        }
+    }
+
+    const timestamp = timestampMillis(io);
+    const input = loadCheckInput(allocator, io, check_args.items) catch |err| switch (err) {
+        error.MissingRunOptionValue => return failMissingValue(io, "Lua option"),
+        else => return err,
+    };
+    const classification = try classifyCheckInput(allocator, io, input, target);
+    const command_id = try std.fmt.allocPrint(allocator, "check-{d}", .{timestamp});
+    const entry = try buildCheckEvidence(
+        allocator,
+        command_id,
+        classification.state,
+        target,
+        classification.implementation_mode,
+        classification.diagnostic,
+        input.chunk_kind,
+        input.display_path,
+        input.source,
+        classification.profile_limitation,
+        classification.capability,
+        timestamp,
+    );
+    try writeEvidenceRecord(allocator, io, entry, "check", timestamp);
+
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
+    try printLedgerSummary(
+        &stdout_writer.interface,
+        "check",
+        "loader-parser",
+        target,
+        classification.state,
+        entry,
+    );
+    try stdout_writer.interface.flush();
+    if (classification.exit_code != 0) std.process.exit(classification.exit_code);
+}
+
+fn loadCheckInput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    check_args: []const []const u8,
+) !CheckInput {
+    const parsed = try parseRunArgs(allocator, check_args);
+    var source = std.Io.Writer.Allocating.init(allocator);
+    const display_path = if (parsed.script_path) |path|
+        try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator)
+    else if (parsed.read_stdin or parsed.options.len == 0)
+        "stdin"
+    else
+        "(command line)";
+    const chunk_name = if (parsed.script_path) |path|
+        try std.fmt.allocPrint(allocator, "@{s}", .{path})
+    else if (parsed.read_stdin or parsed.options.len == 0)
+        "=stdin"
+    else
+        "=(command line)";
+
+    if (parsed.script_path) |path| {
+        if (parsed.options.len == 0 and !parsed.read_stdin and parsed.script_args.len == 0) {
+            const file_source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
+            return .{
+                .source = file_source,
+                .chunk_name = chunk_name,
+                .display_path = display_path,
+                .chunk_kind = if (isLuaBinaryChunk(file_source)) "binary" else "source",
+                .loader_error = null,
+            };
+        }
+    }
+
+    try appendLuaArgPrelude(&source.writer, parsed.script_path, parsed.read_stdin, parsed.script_args);
+    for (parsed.options) |option| {
+        switch (option.kind) {
+            .chunk => {
+                try source.writer.writeAll(option.value);
+                try source.writer.writeByte('\n');
+            },
+            .module => {
+                const module_source = readLuaModule(allocator, io, option.value) catch |err| switch (err) {
+                    error.FileNotFound => {
+                        return .{
+                            .source = "",
+                            .chunk_name = chunk_name,
+                            .display_path = display_path,
+                            .chunk_kind = "source",
+                            .loader_error = try std.fmt.allocPrint(allocator, "module '{s}' not found in LUA_PATH", .{option.value}),
+                        };
+                    },
+                    else => return err,
+                };
+                try source.writer.writeAll(try stripTopLevelModuleReturn(allocator, module_source));
+                try source.writer.writeByte('\n');
+            },
+        }
+    }
+    if (parsed.script_path) |path| {
+        const file_source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
+        try source.writer.writeAll(file_source);
+        try source.writer.writeByte('\n');
+    } else if (parsed.read_stdin or parsed.options.len == 0) {
+        var stdin_reader = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
+        const stdin_source = try stdin_reader.interface.allocRemaining(allocator, .limited(1024 * 1024));
+        try source.writer.writeAll(stdin_source);
+        try source.writer.writeByte('\n');
+    }
+
+    const loaded_source = try source.toOwnedSlice();
+    return .{
+        .source = loaded_source,
+        .chunk_name = chunk_name,
+        .display_path = display_path,
+        .chunk_kind = if (isLuaBinaryChunk(loaded_source)) "binary" else "source",
+        .loader_error = null,
+    };
+}
+
+fn classifyCheckInput(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    input: CheckInput,
+    target: []const u8,
+) !CheckClassification {
+    if (input.loader_error) |loader_error| {
+        return .{
+            .state = "fail",
+            .implementation_mode = "loader-parser-check",
+            .diagnostic = loader_error,
+            .profile_limitation = "",
+            .capability = "loader",
+            .exit_code = 1,
+        };
+    }
+    if (std.mem.eql(u8, input.chunk_kind, "binary")) {
+        return .{
+            .state = "unsupported",
+            .implementation_mode = "loader-parser-check",
+            .diagnostic = "binary Lua chunks are detected but native binary chunk loading is not implemented in this profile",
+            .profile_limitation = "binary-chunk-loader-unimplemented",
+            .capability = "binary-chunk-loader",
+            .exit_code = 1,
+        };
+    }
+
+    const syntax = try runLuaSyntaxCheck(allocator, io, input.source, input.chunk_name);
+    if (syntax.exit_code != 0) {
+        return .{
+            .state = "fail",
+            .implementation_mode = "loader-parser-check",
+            .diagnostic = syntax.stderr,
+            .profile_limitation = "",
+            .capability = "",
+            .exit_code = syntax.exit_code,
+        };
+    }
+
+    if (checkProfileLimitation(input.source, target)) |limitation| {
+        return .{
+            .state = limitation.state,
+            .implementation_mode = "profile-compatibility-check",
+            .diagnostic = limitation.diagnostic,
+            .profile_limitation = limitation.reason,
+            .capability = limitation.capability,
+            .exit_code = 1,
+        };
+    }
+
+    return .{
+        .state = "pass",
+        .implementation_mode = "loader-parser-check",
+        .diagnostic = "syntax and current profile compatibility checks passed without executing the chunk",
+        .profile_limitation = "",
+        .capability = "",
+        .exit_code = 0,
+    };
+}
+
+const SyntaxCheckResult = struct {
+    stderr: []const u8,
+    exit_code: u8,
+};
+
+fn runLuaSyntaxCheck(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: []const u8,
+    chunk_name: []const u8,
+) !SyntaxCheckResult {
+    var checker = std.Io.Writer.Allocating.init(allocator);
+    try checker.writer.writeAll("local fn, err = load(");
+    try writeLuaString(&checker.writer, source);
+    try checker.writer.writeAll(", ");
+    try writeLuaString(&checker.writer, chunk_name);
+    try checker.writer.writeAll(")\nif not fn then io.stderr:write(err, \"\\n\"); os.exit(1) end\n");
+    const checker_source = try checker.toOwnedSlice();
+    const result = try std.process.run(allocator, io, .{
+        .argv = &.{ "./lua", "-e", checker_source },
+        .stdout_limit = .unlimited,
+        .stderr_limit = .unlimited,
+    });
+    return .{
+        .stderr = result.stderr,
+        .exit_code = termExitCode(result.term),
+    };
+}
+
+const ProfileLimitation = struct {
+    state: []const u8,
+    reason: []const u8,
+    capability: []const u8,
+    diagnostic: []const u8,
+};
+
+fn checkProfileLimitation(source: []const u8, target: []const u8) ?ProfileLimitation {
+    if (std.mem.indexOf(u8, source, "debug.") != null) {
+        return .{
+            .state = "unsupported",
+            .reason = "debug-api-not-yet-native",
+            .capability = "debug",
+            .diagnostic = "debug library compatibility is tracked explicitly and is not accepted by this check boundary yet",
+        };
+    }
+    if (std.mem.indexOf(u8, source, "load(") != null or std.mem.indexOf(u8, source, "loadfile(") != null) {
+        return .{
+            .state = "unsupported",
+            .reason = "dynamic-load-not-yet-native",
+            .capability = "dynamic-loading",
+            .diagnostic = "dynamic source/binary loading is reported separately from parser-only check success",
+        };
+    }
+    if (std.mem.eql(u8, target, "wasm-full")) {
+        if (std.mem.indexOf(u8, source, "io.") != null or std.mem.indexOf(u8, source, "os.") != null) {
+            return .{
+                .state = "capability-denied",
+                .reason = "wasm-host-filesystem-process-capability",
+                .capability = "filesystem/process",
+                .diagnostic = "wasm-full host filesystem/process access requires an explicit host shim and cannot be counted as parser compatibility",
+            };
+        }
+    }
+    if (std.mem.eql(u8, target, "sbf-experimental")) {
+        return .{
+            .state = "expected-skip",
+            .reason = "sbf-experimental-parser-check-only",
+            .capability = "sbf-experimental",
+            .diagnostic = "sbf remains experimental; parser check records source syntax without full compatibility claims",
+        };
+    }
+    return null;
+}
+
+fn isLuaBinaryChunk(source: []const u8) bool {
+    return source.len >= 4 and source[0] == 0x1b and source[1] == 'L' and source[2] == 'u' and source[3] == 'a';
 }
 
 fn runCommand(
