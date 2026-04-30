@@ -2320,7 +2320,10 @@ const Parser = struct {
             .pending_expression,
             .pending_binary,
             => next.pos = new_pos,
-            .resume_body, .pending_protected_call => {},
+            .resume_body => {
+                if (next.local_name == null) next.pos = new_pos;
+            },
+            .pending_protected_call => {},
         }
     }
 
@@ -4317,6 +4320,10 @@ test "protected errors and coroutine smoke execute natively" {
         .{
             .source = "local co = coroutine.create(function()\n  coroutine.yield(\"pause\")\n  return \"done\"\nend)\nprint(coroutine.resume(co))\nprint(coroutine.resume(co))\n",
             .stdout = "true\tpause\ntrue\tdone\n",
+        },
+        .{
+            .source = "local got_a, got_b, got_c\nlocal function sink(a, b, c)\n  got_a, got_b, got_c = a, b, c\nend\nlocal co = coroutine.create(function()\n  sink(\"a\", coroutine.yield(\"pause\"), \"c\")\n  return got_a, got_b, got_c, \"done\"\nend)\nprint(coroutine.resume(co))\nprint(coroutine.resume(co, \"b\", \"extra\"))\nprint(coroutine.status(co))\n",
+            .stdout = "true\tpause\ntrue\ta\tb\tc\tdone\ndead\n",
         },
     };
     for (snippets) |snippet| {
