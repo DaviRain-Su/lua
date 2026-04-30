@@ -138,6 +138,9 @@ const CoroutineContinuationKind = enum {
     pending_assignment,
     pending_return,
     pending_protected_call,
+    pending_expression,
+    pending_binary,
+    pending_call,
 };
 
 const CoroutineContinuation = struct {
@@ -148,6 +151,12 @@ const CoroutineContinuation = struct {
     prefix_values: []const Value,
     pos: usize,
     body_end: usize,
+    expression_min_prec: u8 = 0,
+    binary_left: Value = .{ .nil = {} },
+    binary_op: Token = .{ .tag = .eof, .lexeme = "", .line = 1 },
+    call_callee: Value = .{ .nil = {} },
+    call_open_line: usize = 1,
+    call_prepend_callee: bool = false,
 };
 
 const Thread = struct {
@@ -1222,7 +1231,32 @@ const Parser = struct {
     }
 
     fn expression(self: *Parser, min_prec: u8) anyerror!Value {
-        var left = try self.prefix();
+        const left = self.prefix() catch |err| switch (err) {
+            error.Yield => {
+                const op = self.peek();
+                const prec = binaryPrecedence(op);
+                if (prec != 0 and prec >= min_prec) {
+                    self.discardAutoResumeContinuationAtCurrentPos();
+                    try self.appendThreadContinuation(.{
+                        .kind = .pending_expression,
+                        .local_name = null,
+                        .local_names = &.{},
+                        .assign_targets = &.{},
+                        .prefix_values = &.{},
+                        .pos = self.pos,
+                        .body_end = self.limit,
+                        .expression_min_prec = min_prec,
+                    });
+                }
+                return err;
+            },
+            else => return err,
+        };
+        return self.continueExpression(left, min_prec);
+    }
+
+    fn continueExpression(self: *Parser, initial_left: Value, min_prec: u8) anyerror!Value {
+        var left = initial_left;
         while (true) {
             const op = self.peek();
             const prec = binaryPrecedence(op);
@@ -1236,7 +1270,25 @@ const Parser = struct {
                     self.evaluate = previous_evaluate;
                     left = left;
                 } else {
-                    left = try self.expression(prec + 1);
+                    left = self.expression(prec + 1) catch |err| switch (err) {
+                        error.Yield => {
+                            self.discardAutoResumeContinuationAtCurrentPos();
+                            try self.appendThreadContinuation(.{
+                                .kind = .pending_binary,
+                                .local_name = null,
+                                .local_names = &.{},
+                                .assign_targets = &.{},
+                                .prefix_values = &.{},
+                                .pos = self.pos,
+                                .body_end = self.limit,
+                                .expression_min_prec = min_prec,
+                                .binary_left = left,
+                                .binary_op = op,
+                            });
+                            return err;
+                        },
+                        else => return err,
+                    };
                 }
                 continue;
             }
@@ -1248,12 +1300,48 @@ const Parser = struct {
                     self.evaluate = previous_evaluate;
                     left = left;
                 } else {
-                    left = try self.expression(prec + 1);
+                    left = self.expression(prec + 1) catch |err| switch (err) {
+                        error.Yield => {
+                            self.discardAutoResumeContinuationAtCurrentPos();
+                            try self.appendThreadContinuation(.{
+                                .kind = .pending_binary,
+                                .local_name = null,
+                                .local_names = &.{},
+                                .assign_targets = &.{},
+                                .prefix_values = &.{},
+                                .pos = self.pos,
+                                .body_end = self.limit,
+                                .expression_min_prec = min_prec,
+                                .binary_left = left,
+                                .binary_op = op,
+                            });
+                            return err;
+                        },
+                        else => return err,
+                    };
                 }
                 continue;
             }
             const right_min = if (op.tag == .concat) prec else prec + 1;
-            const right = try self.expression(right_min);
+            const right = self.expression(right_min) catch |err| switch (err) {
+                error.Yield => {
+                    self.discardAutoResumeContinuationAtCurrentPos();
+                    try self.appendThreadContinuation(.{
+                        .kind = .pending_binary,
+                        .local_name = null,
+                        .local_names = &.{},
+                        .assign_targets = &.{},
+                        .prefix_values = &.{},
+                        .pos = self.pos,
+                        .body_end = self.limit,
+                        .expression_min_prec = min_prec,
+                        .binary_left = left,
+                        .binary_op = op,
+                    });
+                    return err;
+                },
+                else => return err,
+            };
             if (!self.evaluate) {
                 left = .{ .nil = {} };
                 self.last_call_values = null;
@@ -1263,6 +1351,12 @@ const Parser = struct {
             self.last_call_values = null;
         }
         return left;
+    }
+
+    fn applyResumedBinaryValue(self: *Parser, op: Token, left: Value, right: Value) anyerror!Value {
+        if (op.tag == .keyword and std.mem.eql(u8, op.lexeme, "and")) return right;
+        if (op.tag == .keyword and std.mem.eql(u8, op.lexeme, "or")) return right;
+        return self.applyBinaryValue(op, left, right);
     }
 
     fn prefix(self: *Parser) anyerror!Value {
@@ -1584,26 +1678,28 @@ const Parser = struct {
         try self.consume(.lparen);
         var args: std.ArrayList(Value) = .empty;
         if (!self.match(.rparen)) {
-            try self.parseExpressionList(&args);
+            self.parseExpressionList(&args) catch |err| switch (err) {
+                error.Yield => {
+                    self.discardAutoResumeContinuationAtCurrentPos();
+                    try self.appendThreadContinuation(.{
+                        .kind = .pending_call,
+                        .local_name = null,
+                        .local_names = &.{},
+                        .assign_targets = &.{},
+                        .prefix_values = try args.toOwnedSlice(self.vm.allocator),
+                        .pos = self.pos,
+                        .body_end = self.limit,
+                        .call_callee = callee,
+                        .call_open_line = open.line,
+                        .call_prepend_callee = true,
+                    });
+                    return err;
+                },
+                else => return err,
+            };
             try self.consumeCloseParen(open.line);
         }
-        if (callee == .table) {
-            const metamethod = callee.table.rawMetafield("__call");
-            if (metamethod == .function or metamethod == .builtin) {
-                var call_args: std.ArrayList(Value) = .empty;
-                try call_args.append(self.vm.allocator, callee);
-                try call_args.appendSlice(self.vm.allocator, args.items);
-                return self.invokeCallable(metamethod, call_args.items);
-            }
-        }
-        if (callee != .function and callee != .builtin and callee != .wrapped_thread) {
-            self.vm.setRuntimeErrorAt(open.line, try std.fmt.allocPrint(self.vm.allocator, "attempt to call a {s} value", .{valueTypeName(callee)}));
-            return error.RuntimeError;
-        }
-        const previous_call_line = self.active_call_line;
-        self.active_call_line = open.line;
-        defer self.active_call_line = previous_call_line;
-        return self.invokeCallable(callee, args.items);
+        return self.invokePreparedCall(callee, args.items, open.line, true);
     }
 
     fn callFunctionValueWithPrefix(self: *Parser, callee: Value, receiver: Value) anyerror![]const Value {
@@ -1612,26 +1708,51 @@ const Parser = struct {
         var args: std.ArrayList(Value) = .empty;
         try args.append(self.vm.allocator, receiver);
         if (!self.match(.rparen)) {
-            try self.parseExpressionList(&args);
+            self.parseExpressionList(&args) catch |err| switch (err) {
+                error.Yield => {
+                    self.discardAutoResumeContinuationAtCurrentPos();
+                    try self.appendThreadContinuation(.{
+                        .kind = .pending_call,
+                        .local_name = null,
+                        .local_names = &.{},
+                        .assign_targets = &.{},
+                        .prefix_values = try args.toOwnedSlice(self.vm.allocator),
+                        .pos = self.pos,
+                        .body_end = self.limit,
+                        .call_callee = callee,
+                        .call_open_line = open.line,
+                        .call_prepend_callee = false,
+                    });
+                    return err;
+                },
+                else => return err,
+            };
             try self.consumeCloseParen(open.line);
         }
+        return self.invokePreparedCall(callee, args.items, open.line, false);
+    }
+
+    fn invokePreparedCall(self: *Parser, callee: Value, args: []const Value, open_line: usize, prepend_callee_for_call_metamethod: bool) anyerror![]const Value {
         if (callee == .table) {
             const metamethod = callee.table.rawMetafield("__call");
             if (metamethod == .function or metamethod == .builtin) {
+                var call_args: std.ArrayList(Value) = .empty;
+                if (prepend_callee_for_call_metamethod) try call_args.append(self.vm.allocator, callee);
+                try call_args.appendSlice(self.vm.allocator, args);
                 const previous_call_line = self.active_call_line;
-                self.active_call_line = open.line;
+                self.active_call_line = open_line;
                 defer self.active_call_line = previous_call_line;
-                return self.invokeCallable(metamethod, args.items);
+                return self.invokeCallable(metamethod, call_args.items);
             }
         }
         if (callee != .function and callee != .builtin and callee != .wrapped_thread) {
-            self.vm.setRuntimeErrorAt(open.line, try std.fmt.allocPrint(self.vm.allocator, "attempt to call a {s} value", .{valueTypeName(callee)}));
+            self.vm.setRuntimeErrorAt(open_line, try std.fmt.allocPrint(self.vm.allocator, "attempt to call a {s} value", .{valueTypeName(callee)}));
             return error.RuntimeError;
         }
         const previous_call_line = self.active_call_line;
-        self.active_call_line = open.line;
+        self.active_call_line = open_line;
         defer self.active_call_line = previous_call_line;
-        return self.invokeCallable(callee, args.items);
+        return self.invokeCallable(callee, args);
     }
 
     fn invokeCallable(self: *Parser, callee: Value, args: []const Value) anyerror![]const Value {
@@ -2104,17 +2225,18 @@ const Parser = struct {
                 return self.finishSuspendedFunction(thread, signal);
             },
             .pending_local_assignment => {
-                const values = try self.combineContinuationValues(cont.prefix_values, payload);
+                var continuation_parser = Parser{ .vm = &thread.vm, .pos = cont.pos, .limit = cont.body_end, .evaluate = true };
+                const values = try continuation_parser.finishResumedExpressionList(cont.prefix_values, payload);
                 for (cont.local_names, 0..) |name, i| {
                     try thread.vm.declare(name, if (i < values.len) values[i] else Value{ .nil = {} });
                 }
-                var body = Parser{ .vm = &thread.vm, .pos = cont.pos, .limit = cont.body_end, .evaluate = true };
+                var body = Parser{ .vm = &thread.vm, .pos = continuation_parser.pos, .limit = cont.body_end, .evaluate = true };
                 const signal = try body.parseBlock();
                 return self.finishSuspendedFunction(thread, signal);
             },
             .pending_assignment => {
-                const values = try self.combineContinuationValues(cont.prefix_values, payload);
                 var continuation_parser = Parser{ .vm = &thread.vm, .pos = cont.pos, .limit = cont.body_end, .evaluate = true };
+                const values = try continuation_parser.finishResumedExpressionList(cont.prefix_values, payload);
                 for (cont.assign_targets, 0..) |target, i| {
                     const value = if (i < values.len) values[i] else Value{ .nil = {} };
                     switch (target.kind) {
@@ -2127,12 +2249,35 @@ const Parser = struct {
                 return self.finishSuspendedFunction(thread, signal);
             },
             .pending_return => {
-                const values = try self.combineContinuationValues(cont.prefix_values, payload);
+                var continuation_parser = Parser{ .vm = &thread.vm, .pos = cont.pos, .limit = cont.body_end, .evaluate = true };
+                const values = try continuation_parser.finishResumedExpressionList(cont.prefix_values, payload);
                 self.popSuspendedFunction(thread);
                 return values;
             },
             .pending_protected_call => {
                 return self.coroutineResult(true, payload);
+            },
+            .pending_expression => {
+                var continuation_parser = Parser{ .vm = &thread.vm, .pos = cont.pos, .limit = cont.body_end, .evaluate = true };
+                const left = if (payload.len > 0) payload[0] else Value{ .nil = {} };
+                const value = try continuation_parser.continueExpression(left, cont.expression_min_prec);
+                self.advanceNextContinuationPos(thread, cont.pos, continuation_parser.pos);
+                return self.singleValuePayload(thread, value);
+            },
+            .pending_binary => {
+                var continuation_parser = Parser{ .vm = &thread.vm, .pos = cont.pos, .limit = cont.body_end, .evaluate = true };
+                const right = if (payload.len > 0) payload[0] else Value{ .nil = {} };
+                const combined = try continuation_parser.applyResumedBinaryValue(cont.binary_op, cont.binary_left, right);
+                const value = try continuation_parser.continueExpression(combined, cont.expression_min_prec);
+                self.advanceNextContinuationPos(thread, cont.pos, continuation_parser.pos);
+                return self.singleValuePayload(thread, value);
+            },
+            .pending_call => {
+                var continuation_parser = Parser{ .vm = &thread.vm, .pos = cont.pos, .limit = cont.body_end, .evaluate = true };
+                const args = try continuation_parser.finishResumedExpressionList(cont.prefix_values, payload);
+                try continuation_parser.consumeCloseParen(cont.call_open_line);
+                self.advanceNextContinuationPos(thread, cont.pos, continuation_parser.pos);
+                return continuation_parser.invokePreparedCall(cont.call_callee, args, cont.call_open_line, cont.call_prepend_callee);
             },
         }
     }
@@ -2143,6 +2288,40 @@ const Parser = struct {
         @memcpy(values[0..leading.len], leading);
         @memcpy(values[leading.len..], payload);
         return values;
+    }
+
+    fn finishResumedExpressionList(self: *Parser, leading: []const Value, payload: []const Value) ![]const Value {
+        var values: std.ArrayList(Value) = .empty;
+        try values.appendSlice(self.vm.allocator, leading);
+        if (self.match(.comma)) {
+            try values.append(self.vm.allocator, if (payload.len > 0) payload[0] else Value{ .nil = {} });
+            try self.parseExpressionList(&values);
+        } else {
+            try values.appendSlice(self.vm.allocator, payload);
+        }
+        return values.toOwnedSlice(self.vm.allocator);
+    }
+
+    fn singleValuePayload(_: *Parser, thread: *Thread, value: Value) ![]const Value {
+        const values = try thread.vm.allocator.alloc(Value, 1);
+        values[0] = value;
+        return values;
+    }
+
+    fn advanceNextContinuationPos(_: *Parser, thread: *Thread, old_pos: usize, new_pos: usize) void {
+        if (new_pos == old_pos or thread.continuations.items.len == 0) return;
+        const next = &thread.continuations.items[0];
+        if (next.pos != old_pos) return;
+        switch (next.kind) {
+            .pending_local_assignment,
+            .pending_assignment,
+            .pending_return,
+            .pending_call,
+            .pending_expression,
+            .pending_binary,
+            => next.pos = new_pos,
+            .resume_body, .pending_protected_call => {},
+        }
     }
 
     fn finishSuspendedFunction(_: *Parser, thread: *Thread, signal: ExecSignal) anyerror![]const Value {
