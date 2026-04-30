@@ -334,6 +334,32 @@ print(1, t.values())
 """,
     },
     {
+        "name": "calls-primary-statement-chains-core",
+        "puc_file": "calls.lua",
+        "validates": ["VAL-NATIVE-011"],
+        "coverage_tags": ["call:method-sugar", "call:table-field", "call:return-adjustment"],
+        "description": "standalone primary-expression call statements cover table-field, method-sugar, indexed, and chained call forms",
+        "source": """local seen = {}
+local a = { b = { c = {
+  marker = "self",
+  f2 = function(self, k, n)
+    seen[1], seen[2], seen[3] = self.marker, k, n
+  end
+} } }
+a.b.c:f2("k", 12)
+print(seen[1], seen[2], seen[3])
+local t = {}
+t.fn = function(a, b) t[1], t[2] = a, b end
+t.fn("x", "y")
+print(t[1], t[2])
+t[1] = function(a, b) t[2], t[3] = a, b end
+t[1](4, 5)
+print(t[2], t[3])
+local function factory() return { run = function(a, b) print(a, b) end } end
+factory().run("chain", 99)
+""",
+    },
+    {
         "name": "closure-counter-upvalue-core",
         "puc_file": "closure.lua",
         "validates": ["VAL-NATIVE-012"],

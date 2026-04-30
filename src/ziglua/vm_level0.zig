@@ -457,13 +457,67 @@ const Parser = struct {
         if (self.matchKeyword("for")) return self.forStatement();
         if (self.matchKeyword("goto")) return self.gotoStatement();
         if (self.matchKeyword("break")) return .break_loop;
-        if (self.peek().tag == .ident and self.peekOffset(1).tag == .lparen) {
+        if (self.isCallStatementStart()) {
             _ = try self.expressionValues();
             return .normal;
         }
         if (self.peek().tag == .ident) return self.assignmentStatement();
         if (self.peek().tag == .eof) return .normal;
         return error.UnsupportedFeature;
+    }
+
+    fn isCallStatementStart(self: *Parser) bool {
+        var p = self.scanPrimaryPrefix(self.pos) orelse return false;
+        var saw_call = false;
+        while (p < self.limit) {
+            switch (self.tokens()[p].tag) {
+                .dot => {
+                    if (p + 1 >= self.limit or self.tokens()[p + 1].tag != .ident) return false;
+                    p += 2;
+                },
+                .lbracket => {
+                    p = self.skipBalancedWithinLimit(p, .lbracket, .rbracket) orelse return false;
+                },
+                .colon => {
+                    if (p + 2 >= self.limit or self.tokens()[p + 1].tag != .ident or self.tokens()[p + 2].tag != .lparen) return false;
+                    p = self.skipBalancedWithinLimit(p + 2, .lparen, .rparen) orelse return true;
+                    saw_call = true;
+                },
+                .lparen => {
+                    p = self.skipBalancedWithinLimit(p, .lparen, .rparen) orelse return true;
+                    saw_call = true;
+                },
+                else => break,
+            }
+        }
+        return saw_call and self.isCallStatementBoundary(p);
+    }
+
+    fn scanPrimaryPrefix(self: *Parser, start: usize) ?usize {
+        if (start >= self.limit) return null;
+        return switch (self.tokens()[start].tag) {
+            .ident => start + 1,
+            .lparen => self.skipBalancedWithinLimit(start, .lparen, .rparen),
+            else => null,
+        };
+    }
+
+    fn skipBalancedWithinLimit(self: *Parser, start: usize, open: TokenTag, close: TokenTag) ?usize {
+        if (start >= self.limit or self.tokens()[start].tag != open) return null;
+        const next = skipBalanced(self.tokens(), start, open, close);
+        if (next > self.limit or next == 0) return null;
+        if (self.tokens()[next - 1].tag != close) return null;
+        return next;
+    }
+
+    fn isCallStatementBoundary(self: *Parser, pos: usize) bool {
+        if (pos >= self.limit) return true;
+        const token = self.tokens()[pos];
+        return switch (token.tag) {
+            .eof, .semi, .coloncolon, .ident, .lparen => true,
+            .keyword => isStatementBoundaryKeyword(token) or std.mem.eql(u8, token.lexeme, "goto"),
+            else => false,
+        };
     }
 
     fn localStatement(self: *Parser) !ExecSignal {
@@ -3069,6 +3123,10 @@ test "vm level1 closures upvalues aliases and method calls execute natively" {
         .{ .source = "local a = {}\nfor k, v in ipairs({\"a\", \"b\", \"c\"}) do\n  a[k] = function() return k, v end\nend\nprint(a[1](), a[2](), a[3]())\n", .stdout = "1\t2\t3\tc\n" },
         .{ .source = "local box = { value = 7 }\nbox.get = function(self, extra) return self.value, extra end\nprint(box:get(3))\n", .stdout = "7\t3\n" },
         .{ .source = "local t = {}\nt.fn = function() return 1, 2 end\nprint(t.fn())\n", .stdout = "1\t2\n" },
+        .{ .source = "local seen = {}\nlocal a = { b = { c = { marker = \"self\", f2 = function(self, k, n) seen[1], seen[2], seen[3] = self.marker, k, n end } } }\na.b.c:f2(\"k\", 12)\nprint(seen[1], seen[2], seen[3])\n", .stdout = "self\tk\t12\n" },
+        .{ .source = "local t = {}\nt.fn = function(a, b) t[1], t[2] = a, b end\nt.fn(\"x\", \"y\")\nprint(t[1], t[2])\n", .stdout = "x\ty\n" },
+        .{ .source = "local t = {}\nt[1] = function(a, b) t[2], t[3] = a, b end\nt[1](4, 5)\nprint(t[2], t[3])\n", .stdout = "4\t5\n" },
+        .{ .source = "local function factory()\n  return { run = function(a, b) print(a, b) end }\nend\nfactory().run(\"chain\", 99)\n", .stdout = "chain\t99\n" },
     };
     for (snippets) |snippet| {
         const result = try runLevel0(arena.allocator(), snippet.source);

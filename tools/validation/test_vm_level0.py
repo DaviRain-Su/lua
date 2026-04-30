@@ -250,6 +250,50 @@ print(a[1](), a[2](), a[3]())
                 self.assertEqual(candidate.stdout, stock.stdout)
                 self.assertEqual(candidate.stderr, stock.stderr)
 
+    def test_no_host_lua_primary_call_statements_match_stock_lua(self):
+        cases = {
+            "table-field-call-statement": """local t = {}
+t.fn = function(a, b) t[1], t[2] = a, b end
+t.fn("left", "right")
+print(t[1], t[2])
+""",
+            "method-chain-call-statement": """local seen = {}
+local a = { b = { c = {
+  marker = "self",
+  f2 = function(self, k, n)
+    seen[1], seen[2], seen[3] = self.marker, k, n
+  end
+} } }
+a.b.c:f2("k", 12)
+print(seen[1], seen[2], seen[3])
+""",
+            "indexed-call-statement": """local t = {}
+t[1] = function(a, b) t[2], t[3] = a, b end
+t[1](4, 5)
+print(t[2], t[3])
+""",
+            "call-chain-statement": """local function factory()
+  return { run = function(a, b) print(a, b) end }
+end
+factory().run("chain", 99)
+""",
+        }
+        for name, source in cases.items():
+            with self.subTest(case=name):
+                stock = run("./lua", "-", stdin=source)
+                candidate = run(
+                    "./zig-out/bin/lua-zig",
+                    "run",
+                    "-",
+                    stdin=source,
+                    env={"LUA_ZIG_RUN_NO_HOST_LUA": "1"},
+                )
+
+                self.assertEqual(stock.returncode, 0, name)
+                self.assertEqual(candidate.returncode, stock.returncode, candidate.stderr)
+                self.assertEqual(candidate.stdout, stock.stdout)
+                self.assertEqual(candidate.stderr, stock.stderr)
+
     def test_baseline_oracle_vm_level0_corpus_command_reports_pass(self):
         completed = run(
             "python3",
