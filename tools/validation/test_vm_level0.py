@@ -320,6 +320,31 @@ print(a == b, a ~= b, calls)
         self.assertEqual(candidate.stdout, stock.stdout)
         self.assertEqual(candidate.stderr, stock.stderr)
 
+    def test_no_host_lua_protected_metatable_setmetatable_errors_match_stock_lua(self):
+        cases = {
+            "replace": """local t = setmetatable({}, { __metatable = "locked" })
+setmetatable(t, {})
+""",
+            "remove_false_protection": """local t = setmetatable({}, { __metatable = false })
+setmetatable(t, nil)
+""",
+        }
+        for name, source in cases.items():
+            with self.subTest(case=name):
+                stock = run("./lua", "-", stdin=source)
+                candidate = run(
+                    "./zig-out/bin/lua-zig",
+                    "run",
+                    "-",
+                    stdin=source,
+                    env={"LUA_ZIG_RUN_NO_HOST_LUA": "1"},
+                )
+
+                self.assertNotEqual(stock.returncode, 0, name)
+                self.assertEqual(candidate.returncode, stock.returncode, candidate.stderr)
+                self.assertEqual(candidate.stdout, stock.stdout)
+                self.assertEqual(candidate.stderr, stock.stderr)
+
     def test_baseline_oracle_vm_level0_corpus_command_reports_pass(self):
         completed = run(
             "python3",

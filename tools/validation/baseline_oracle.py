@@ -198,6 +198,7 @@ NATIVE_CORE_COVERAGE_REQUIREMENTS = {
             "metatable:arithmetic",
             "metatable:comparison",
             "metatable:len-concat-call",
+            "metatable:protection",
         ],
     },
 }
@@ -884,6 +885,14 @@ print(outer(1)(4))
         "coverage_tags": ["metatable:__index", "table:indexing-read-write"],
         "description": "__index table events dispatch through another table",
         "source": 'local proto = { answer = 42 }\nlocal t = setmetatable({}, { __index = proto })\nprint(t.answer, rawget(t, "answer"))\n',
+    },
+    {
+        "name": "metatable-protection-core",
+        "puc_file": "events.lua",
+        "validates": ["VAL-NATIVE-017"],
+        "coverage_tags": ["metatable:protection"],
+        "description": "__metatable protection changes getmetatable results while ordinary unprotected metatables remain gettable and settable",
+        "source": 'local t = setmetatable({}, { __metatable = "locked" })\nprint(getmetatable(t))\nlocal f = setmetatable({}, { __metatable = false })\nprint(getmetatable(f))\nlocal u = {}\nlocal mt = {}\nprint(setmetatable(u, mt) == u, getmetatable(u) == mt)\nprint(setmetatable(u, nil) == u, getmetatable(u))\n',
     },
 ]
 VM_DYNAMIC_FALLBACK_FIXTURES = [

@@ -517,6 +517,7 @@ const Parser = struct {
     last_primary_name: ?[]const u8 = null,
     last_primary_scope: ValueScope = .unknown,
     last_call_values: ?[]const Value = null,
+    active_call_line: ?usize = null,
 
     fn parseBlock(self: *Parser) !ExecSignal {
         while (self.pos < self.limit and self.peek().tag != .eof) {
@@ -1334,6 +1335,9 @@ const Parser = struct {
             self.vm.setRuntimeErrorAt(open.line, try std.fmt.allocPrint(self.vm.allocator, "attempt to call a {s} value", .{valueTypeName(callee)}));
             return error.RuntimeError;
         }
+        const previous_call_line = self.active_call_line;
+        self.active_call_line = open.line;
+        defer self.active_call_line = previous_call_line;
         return self.invokeCallable(callee, args.items);
     }
 
@@ -1349,6 +1353,9 @@ const Parser = struct {
         if (callee == .table) {
             const metamethod = callee.table.rawMetafield("__call");
             if (metamethod == .function or metamethod == .builtin) {
+                const previous_call_line = self.active_call_line;
+                self.active_call_line = open.line;
+                defer self.active_call_line = previous_call_line;
                 return self.invokeCallable(metamethod, args.items);
             }
         }
@@ -1356,6 +1363,9 @@ const Parser = struct {
             self.vm.setRuntimeErrorAt(open.line, try std.fmt.allocPrint(self.vm.allocator, "attempt to call a {s} value", .{valueTypeName(callee)}));
             return error.RuntimeError;
         }
+        const previous_call_line = self.active_call_line;
+        self.active_call_line = open.line;
+        defer self.active_call_line = previous_call_line;
         return self.invokeCallable(callee, args.items);
     }
 
@@ -1456,6 +1466,10 @@ const Parser = struct {
             },
             .setmetatable => {
                 if (args.len < 2 or args[0] != .table) return error.RuntimeError;
+                if (!args[0].table.rawMetafield("__metatable").isNil()) {
+                    self.vm.setRuntimeErrorAt(self.active_call_line orelse self.peek().line, "cannot change a protected metatable");
+                    return error.RuntimeError;
+                }
                 args[0].table.metatable = switch (args[1]) {
                     .nil => null,
                     .table => |t| t,
@@ -1469,7 +1483,11 @@ const Parser = struct {
                 if (args.len < 1) return error.RuntimeError;
                 const values = try self.vm.allocator.alloc(Value, 1);
                 values[0] = switch (args[0]) {
-                    .table => |t| if (t.metatable) |mt| .{ .table = mt } else .{ .nil = {} },
+                    .table => |t| blk: {
+                        const protected = t.rawMetafield("__metatable");
+                        if (!protected.isNil()) break :blk protected;
+                        break :blk if (t.metatable) |mt| .{ .table = mt } else .{ .nil = {} };
+                    },
                     else => .{ .nil = {} },
                 };
                 return values;
@@ -3442,12 +3460,33 @@ test "raw operations and metatable indexing execute natively" {
             .source = "local t = setmetatable({}, { __index = function(_, k) return \"miss:\" .. k end })\nprint(t.answer)\n",
             .stdout = "miss:answer\n",
         },
+        .{
+            .source = "local t = setmetatable({}, { __metatable = \"locked\" })\nprint(getmetatable(t))\nlocal f = setmetatable({}, { __metatable = false })\nprint(getmetatable(f))\nlocal u = {}\nlocal mt = {}\nprint(setmetatable(u, mt) == u, getmetatable(u) == mt)\nprint(setmetatable(u, nil) == u, getmetatable(u))\n",
+            .stdout = "locked\nfalse\ntrue\ttrue\ntrue\tnil\n",
+        },
     };
     for (snippets) |snippet| {
         const result = try runLevel0(arena.allocator(), snippet.source);
         try std.testing.expectEqual(VmState.pass, result.state);
         try std.testing.expectEqualSlices(u8, snippet.stdout, result.stdout);
         try std.testing.expectEqualSlices(u8, "", result.stderr);
+        _ = arena.reset(.retain_capacity);
+    }
+}
+
+test "protected metatables reject replacement natively" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const snippets = [_][]const u8{
+        "local t = setmetatable({}, { __metatable = \"locked\" })\nsetmetatable(t, {})\n",
+        "local t = setmetatable({}, { __metatable = false })\nsetmetatable(t, nil)\n",
+    };
+    for (snippets) |source| {
+        const result = try runLevel0(arena.allocator(), source);
+        try std.testing.expectEqual(VmState.runtime_error, result.state);
+        try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+        try std.testing.expectEqualSlices(u8, "", result.stdout);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "cannot change a protected metatable") != null);
         _ = arena.reset(.retain_capacity);
     }
 }
