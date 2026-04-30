@@ -100,8 +100,10 @@ NATIVE_CORE_COVERAGE_REQUIREMENTS = {
         "required_tags": [
             "goto:valid-forward",
             "goto:valid-nested",
+            "goto:valid-end-of-block",
             "goto:undefined",
             "goto:duplicate",
+            "goto:duplicate-visible-nested",
             "goto:malformed",
             "goto:jump-into-local",
         ],
@@ -324,6 +326,14 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "source": 'local x = 0\ndo\n  goto inner\n  x = 10\n  ::inner::\n  x = x + 2\nend\nprint(x)\n',
     },
     {
+        "name": "goto-valid-end-of-block-after-local-core",
+        "puc_file": "goto.lua",
+        "validates": ["VAL-NATIVE-009"],
+        "coverage_tags": ["goto:valid-end-of-block"],
+        "description": "forward goto over a local declaration to a label at the end of the same block remains valid like stock Lua",
+        "source": 'do\n  goto done\n  local hidden\n  ::done::\nend\nprint("ok")\n',
+    },
+    {
         "name": "goto-undefined-label-core",
         "puc_file": "goto.lua",
         "validates": ["VAL-NATIVE-009", "VAL-NATIVE-010"],
@@ -338,6 +348,14 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "coverage_tags": ["goto:duplicate", "diagnostic:goto"],
         "description": "duplicate labels in the same block produce Lua-compatible syntax diagnostics and nonzero exit",
         "source": "::a::\n::a::\n",
+    },
+    {
+        "name": "goto-visible-nested-duplicate-label-core",
+        "puc_file": "goto.lua",
+        "validates": ["VAL-NATIVE-009", "VAL-NATIVE-010"],
+        "coverage_tags": ["goto:duplicate-visible-nested", "diagnostic:goto"],
+        "description": "duplicate labels are rejected when an outer label remains visible inside a nested block",
+        "source": "::l1::\ndo\n  ::l1::\nend\n",
     },
     {
         "name": "goto-malformed-label-core",

@@ -164,6 +164,7 @@ class VmLevel0Tests(unittest.TestCase):
             "malformed-label": "::1::\n",
             "malformed-goto-label": "goto end\n",
             "jump-into-local-scope": "goto L\nlocal x\n::L::\nprint(1)\n",
+            "nested-duplicate-visible-label": "::l1::\ndo\n  ::l1::\nend\n",
         }
         for name, source in cases.items():
             with self.subTest(case=name):
@@ -177,6 +178,28 @@ class VmLevel0Tests(unittest.TestCase):
                 )
 
                 self.assertNotEqual(stock.returncode, 0, name)
+                self.assertEqual(candidate.returncode, stock.returncode, candidate.stderr)
+                self.assertEqual(candidate.stdout, stock.stdout)
+                self.assertEqual(candidate.stderr, stock.stderr)
+
+    def test_no_host_lua_goto_end_of_block_scope_visibility_matches_stock_lua(self):
+        cases = {
+            "top-level-end-label-after-local": "goto L\nlocal x\n::L::\n",
+            "nested-end-label-after-local": 'do\ngoto L\nlocal x\n::L::\nend\nprint("ok")\n',
+            "end-label-after-local-and-empty-statements": "goto L\nlocal x\n; ; ::L:: ; ;\n",
+        }
+        for name, source in cases.items():
+            with self.subTest(case=name):
+                stock = run("./lua", "-", stdin=source)
+                candidate = run(
+                    "./zig-out/bin/lua-zig",
+                    "run",
+                    "-",
+                    stdin=source,
+                    env={"LUA_ZIG_RUN_NO_HOST_LUA": "1"},
+                )
+
+                self.assertEqual(stock.returncode, 0, name)
                 self.assertEqual(candidate.returncode, stock.returncode, candidate.stderr)
                 self.assertEqual(candidate.stdout, stock.stdout)
                 self.assertEqual(candidate.stderr, stock.stderr)

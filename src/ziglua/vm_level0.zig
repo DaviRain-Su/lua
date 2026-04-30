@@ -1342,6 +1342,7 @@ const LabelInfo = struct {
     line: usize,
     index: usize,
     block_id: usize,
+    ends_block: bool,
 };
 
 const GotoInfo = struct {
@@ -1363,6 +1364,7 @@ fn validateGotoAndLabels(allocator: std.mem.Allocator, tokens: []const Token) !?
     var gotos: std.ArrayList(GotoInfo) = .empty;
     var locals: std.ArrayList(LocalInfo) = .empty;
     var block_stack: std.ArrayList(usize) = .empty;
+    var function_barriers: std.ArrayList(usize) = .empty;
     try block_stack.append(allocator, 0);
     var next_block_id: usize = 1;
 
@@ -1380,12 +1382,16 @@ fn validateGotoAndLabels(allocator: std.mem.Allocator, tokens: []const Token) !?
             }
             const label = tokens[i + 1];
             const block_id = block_stack.items[block_stack.items.len - 1];
+            const visible_path = visibleBlockPath(block_stack.items, function_barriers.items);
             for (labels.items) |existing| {
                 if (existing.block_id == block_id and std.mem.eql(u8, existing.name, label.lexeme)) {
                     return .{ .line = label.line, .message = try std.fmt.allocPrint(allocator, "label '{s}' already defined on line {d}", .{ label.lexeme, label.line }) };
                 }
+                if (std.mem.eql(u8, existing.name, label.lexeme) and blockDepthInPath(visible_path, existing.block_id) != null) {
+                    return .{ .line = label.line, .message = try std.fmt.allocPrint(allocator, "label '{s}' already defined on line {d}", .{ label.lexeme, existing.line }) };
+                }
             }
-            try labels.append(allocator, .{ .name = label.lexeme, .line = label.line, .index = i, .block_id = block_id });
+            try labels.append(allocator, .{ .name = label.lexeme, .line = label.line, .index = i, .block_id = block_id, .ends_block = labelTerminatesBlock(tokens, i) });
             i += 2;
             continue;
         }
@@ -1399,7 +1405,7 @@ fn validateGotoAndLabels(allocator: std.mem.Allocator, tokens: []const Token) !?
                 .line = token.line,
                 .index = i,
                 .block_id = block_stack.items[block_stack.items.len - 1],
-                .block_path = try allocator.dupe(usize, block_stack.items),
+                .block_path = try allocator.dupe(usize, visibleBlockPath(block_stack.items, function_barriers.items)),
             });
             i += 1;
             continue;
@@ -1411,17 +1417,20 @@ fn validateGotoAndLabels(allocator: std.mem.Allocator, tokens: []const Token) !?
 
         if (token.tag == .keyword) {
             if (std.mem.eql(u8, token.lexeme, "end") or std.mem.eql(u8, token.lexeme, "until")) {
-                if (block_stack.items.len > 1) _ = block_stack.pop();
+                popBlock(&block_stack, &function_barriers);
             } else if (std.mem.eql(u8, token.lexeme, "else")) {
-                if (block_stack.items.len > 1) _ = block_stack.pop();
+                popBlock(&block_stack, &function_barriers);
                 try block_stack.append(allocator, next_block_id);
                 next_block_id += 1;
             } else if (std.mem.eql(u8, token.lexeme, "then") or
                 std.mem.eql(u8, token.lexeme, "do") or
-                std.mem.eql(u8, token.lexeme, "repeat") or
-                std.mem.eql(u8, token.lexeme, "function"))
+                std.mem.eql(u8, token.lexeme, "repeat"))
             {
                 try block_stack.append(allocator, next_block_id);
+                next_block_id += 1;
+            } else if (std.mem.eql(u8, token.lexeme, "function")) {
+                try block_stack.append(allocator, next_block_id);
+                try function_barriers.append(allocator, next_block_id);
                 next_block_id += 1;
             }
         }
@@ -1431,7 +1440,7 @@ fn validateGotoAndLabels(allocator: std.mem.Allocator, tokens: []const Token) !?
         const label = findVisibleLabel(labels.items, goto_ref) orelse {
             return .{ .line = goto_ref.line, .message = try std.fmt.allocPrint(allocator, "no visible label '{s}' for <goto> at line {d}", .{ goto_ref.name, goto_ref.line }) };
         };
-        if (label.block_id == goto_ref.block_id and goto_ref.index < label.index) {
+        if (label.block_id == goto_ref.block_id and goto_ref.index < label.index and !label.ends_block) {
             for (locals.items) |local_info| {
                 if (local_info.block_id == goto_ref.block_id and goto_ref.index < local_info.index and local_info.index < label.index) {
                     return .{ .line = label.line + 1, .message = try std.fmt.allocPrint(allocator, "<goto {s}> at line {d} jumps into the scope of '{s}'", .{ goto_ref.name, goto_ref.line, local_info.name }) };
@@ -1465,6 +1474,48 @@ fn collectLocalNames(
         if (p >= tokens.len or tokens[p].tag != .comma) break;
         p += 1;
     }
+}
+
+fn popBlock(block_stack: *std.ArrayList(usize), function_barriers: *std.ArrayList(usize)) void {
+    if (block_stack.items.len <= 1) return;
+    const popped = block_stack.pop().?;
+    if (function_barriers.items.len > 0 and function_barriers.items[function_barriers.items.len - 1] == popped) {
+        _ = function_barriers.pop();
+    }
+}
+
+fn visibleBlockPath(block_stack: []const usize, function_barriers: []const usize) []const usize {
+    if (function_barriers.len == 0) return block_stack;
+    const function_block_id = function_barriers[function_barriers.len - 1];
+    for (block_stack, 0..) |block_id, depth| {
+        if (block_id == function_block_id) return block_stack[depth..];
+    }
+    return block_stack;
+}
+
+fn labelTerminatesBlock(tokens: []const Token, label_index: usize) bool {
+    var p = label_index + 3;
+    while (p < tokens.len) {
+        const token = tokens[p];
+        if (token.tag == .semi) {
+            p += 1;
+            continue;
+        }
+        if (token.tag == .coloncolon and p + 2 < tokens.len and tokens[p + 1].tag == .ident and tokens[p + 2].tag == .coloncolon) {
+            p += 3;
+            continue;
+        }
+        if (token.tag == .eof) return true;
+        if (token.tag == .keyword and (std.mem.eql(u8, token.lexeme, "end") or
+            std.mem.eql(u8, token.lexeme, "until") or
+            std.mem.eql(u8, token.lexeme, "else") or
+            std.mem.eql(u8, token.lexeme, "elseif")))
+        {
+            return true;
+        }
+        return false;
+    }
+    return true;
 }
 
 fn findVisibleLabel(labels: []const LabelInfo, goto_ref: GotoInfo) ?LabelInfo {
@@ -2610,6 +2661,7 @@ test "vm level0 literals locals arithmetic strings tables control flow and bitwi
         .{ .source = "local a = false and (missing + 1)\nlocal b = true or (missing + 1)\nprint(a, b)\n", .stdout = "false\ttrue\n" },
         .{ .source = "print(1 == 1.0, 1 ~= 1.0)\n", .stdout = "true\tfalse\n" },
         .{ .source = "local x = 0\ngoto skip\nx = 99\n::skip::\nx = x + 1\nprint(x)\n", .stdout = "1\n" },
+        .{ .source = "goto done\nlocal hidden\n::done::\n", .stdout = "" },
         .{ .source = "local preload_value = \"debug words are data\"\nlocal loader_count = 9\nprint(preload_value, loader_count)\n", .stdout = "debug words are data\t9\n" },
         .{ .source = "print((-9223372036854775808.0) & 1)\n", .stdout = "0\n" },
     };
@@ -2631,6 +2683,7 @@ test "vm level0 goto label legality diagnostics" {
         .{ .source = "::1::\n", .diagnostic = "syntax-error:1:<name> expected near '1'" },
         .{ .source = "goto end\n", .diagnostic = "syntax-error:1:<name> expected near 'end'" },
         .{ .source = "goto L\nlocal x\n::L::\nprint(1)\n", .diagnostic = "syntax-error:4:<goto L> at line 1 jumps into the scope of 'x'" },
+        .{ .source = "::l1::\ndo\n  ::l1::\nend\n", .diagnostic = "syntax-error:3:label 'l1' already defined on line 1" },
     };
     for (snippets) |snippet| {
         const result = try runLevel0(arena.allocator(), snippet.source);
