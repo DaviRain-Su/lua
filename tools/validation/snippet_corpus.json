@@ -45,6 +45,15 @@
     "source": "local t = {1, 2, 3, name = \"lua\"}\nt[2] = 22\nt.extra = \"three\"\nprint(t[1], t[2], t.extra, #t)\n"
   },
   {
+    "name": "level0-float-table-keys",
+    "level": 0,
+    "areas": ["tables"],
+    "expected_state": "pass",
+    "expected_stdout": "half\ttwo\tquarter\traw\tnil\ntrue\t31\n",
+    "description": "non-integral float table keys work through constructors, indexing, raw operations, and pairs traversal",
+    "source": "local t = {[1.5] = \"half\", [2.0] = \"two\"}\nt[3.25] = \"quarter\"\nrawset(t, 4.5, \"raw\")\nprint(t[1.5], t[2], rawget(t, 3.25), rawget(t, 4.5), rawget(t, 4))\nlocal u = {[1.5] = 10, [2.0] = 20, a = 1}\nlocal saw_float = false\nlocal sum = 0\nfor k, v in pairs(u) do\n  if k == 1.5 then saw_float = true end\n  sum = sum + v\nend\nprint(saw_float, sum)\n"
+  },
+  {
     "name": "level0-control-flow",
     "level": 0,
     "areas": ["control-flow"],

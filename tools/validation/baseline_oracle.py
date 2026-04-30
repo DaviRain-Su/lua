@@ -777,6 +777,19 @@ print(outer(1)(4))
         "source": 'local t = {1, 2, 3, a = 4}\nt[2] = nil\nt.a = nil\nprint(t[1], t[2], t[3], t.a, #t)\n',
     },
     {
+        "name": "tables-float-keys-core",
+        "puc_file": "nextvar.lua",
+        "validates": ["VAL-NATIVE-014", "VAL-NATIVE-015"],
+        "coverage_tags": [
+            "table:constructor-array-hash",
+            "table:indexing-read-write",
+            "next:complete-traversal",
+            "next:pairs-ipairs",
+        ],
+        "description": "non-integral float keys and integral-float normalization work through constructors, indexing, raw operations, and pairs traversal",
+        "source": 'local t = {[1.5] = "half", [2.0] = "two"}\nt[3.25] = "quarter"\nrawset(t, 4.5, "raw")\nprint(t[1.5], t[2], rawget(t, 3.25), rawget(t, 4.5), rawget(t, 4))\nlocal u = {[1.5] = 10, [2.0] = 20, a = 1}\nlocal saw_float = false\nlocal sum = 0\nfor k, v in pairs(u) do\n  if k == 1.5 then saw_float = true end\n  sum = sum + v\nend\nprint(saw_float, sum)\n',
+    },
+    {
         "name": "next-pairs-ipairs-complete-core",
         "puc_file": "nextvar.lua",
         "validates": ["VAL-NATIVE-015"],

@@ -120,6 +120,7 @@ const Cell = struct {
 const Table = struct {
     array: std.ArrayList(Value),
     integers: std.AutoHashMap(i64, Value),
+    floats: std.AutoHashMap(u64, Value),
     strings: std.StringHashMap(Value),
     table_keys: std.AutoHashMap(*Table, Value),
     function_keys: std.AutoHashMap(*Function, Value),
@@ -133,6 +134,7 @@ const Table = struct {
         table.* = .{
             .array = .empty,
             .integers = std.AutoHashMap(i64, Value).init(allocator),
+            .floats = std.AutoHashMap(u64, Value).init(allocator),
             .strings = std.StringHashMap(Value).init(allocator),
             .table_keys = std.AutoHashMap(*Table, Value).init(allocator),
             .function_keys = std.AutoHashMap(*Function, Value).init(allocator),
@@ -160,7 +162,14 @@ const Table = struct {
         switch (key) {
             .nil => return error.RuntimeError,
             .integer => |i| try self.setIndex(allocator, i, value),
-            .float => |f| try self.setIndex(allocator, try valueToInteger(.{ .float = f }), value),
+            .float => |f| {
+                if (floatToInteger(f, .eq)) |i| {
+                    try self.setIndex(allocator, i, value);
+                } else {
+                    if (f != f) return error.RuntimeError;
+                    try self.floats.put(floatTableKey(f), value);
+                }
+            },
             .string => |s| try self.setString(s, value),
             .table => |t| try self.table_keys.put(t, value),
             .function => |f| try self.function_keys.put(f, value),
@@ -177,9 +186,14 @@ const Table = struct {
 
     fn rawGetKey(self: *Table, key: Value) !Value {
         return switch (key) {
-            .nil => error.RuntimeError,
+            .nil => .{ .nil = {} },
             .integer => |i| self.getIndex(i),
-            .float => |f| self.getIndex(try valueToInteger(.{ .float = f })),
+            .float => |f| if (floatToInteger(f, .eq)) |i|
+                self.getIndex(i)
+            else if (f != f)
+                .{ .nil = {} }
+            else
+                self.floats.get(floatTableKey(f)) orelse .{ .nil = {} },
             .string => |s| self.getString(s),
             .table => |t| self.table_keys.get(t) orelse .{ .nil = {} },
             .function => |f| self.function_keys.get(f) orelse .{ .nil = {} },
@@ -1152,12 +1166,7 @@ const Parser = struct {
     }
 
     fn getTableValue(self: *Parser, table: *Table, key: Value, line: usize) anyerror!Value {
-        const raw = table.rawGetKey(key) catch |err| switch (err) {
-            error.RuntimeError => {
-                self.vm.setRuntimeErrorAt(line, "table index is nil");
-                return error.RuntimeError;
-            },
-        };
+        const raw = try table.rawGetKey(key);
         if (!raw.isNil()) return raw;
         const metamethod = table.rawMetafield("__index");
         if (metamethod.isNil()) return raw;
@@ -1172,19 +1181,14 @@ const Parser = struct {
     }
 
     fn setTableValue(self: *Parser, table: *Table, key: Value, value: Value, line: usize) anyerror!void {
-        const current = table.rawGetKey(key) catch |err| switch (err) {
-            error.RuntimeError => {
-                self.vm.setRuntimeErrorAt(line, "table index is nil");
-                return error.RuntimeError;
-            },
-        };
+        const current = try table.rawGetKey(key);
         if (!current.isNil()) {
-            try table.rawSetKey(self.vm.allocator, key, value);
+            try self.rawSetTableValue(table, key, value, line);
             return;
         }
         const metamethod = table.rawMetafield("__newindex");
         if (metamethod.isNil()) {
-            try table.rawSetKey(self.vm.allocator, key, value);
+            try self.rawSetTableValue(table, key, value, line);
             return;
         }
         switch (metamethod) {
@@ -1192,8 +1196,18 @@ const Parser = struct {
             .function, .builtin => {
                 _ = try self.invokeCallable(metamethod, &.{ .{ .table = table }, key, value });
             },
-            else => try table.rawSetKey(self.vm.allocator, key, value),
+            else => try self.rawSetTableValue(table, key, value, line),
         }
+    }
+
+    fn rawSetTableValue(self: *Parser, table: *Table, key: Value, value: Value, line: usize) anyerror!void {
+        table.rawSetKey(self.vm.allocator, key, value) catch |err| switch (err) {
+            error.RuntimeError => {
+                self.vm.setRuntimeErrorAt(line, tableIndexErrorMessage(key));
+                return error.RuntimeError;
+            },
+            else => return err,
+        };
     }
 
     fn valueMetafield(_: *Parser, value: Value, name: []const u8) Value {
@@ -1413,7 +1427,7 @@ const Parser = struct {
             },
             .rawset => {
                 if (args.len < 3 or args[0] != .table) return error.RuntimeError;
-                try args[0].table.rawSetKey(self.vm.allocator, args[1], args[2]);
+                try self.rawSetTableValue(args[0].table, args[1], args[2], self.peek().line);
                 const values = try self.vm.allocator.alloc(Value, 1);
                 values[0] = args[0];
                 return values;
@@ -1501,6 +1515,13 @@ const Parser = struct {
         var int_iter = table.integers.iterator();
         while (int_iter.next()) |entry| {
             if (!entry.value_ptr.*.isNil()) try entries.append(self.vm.allocator, .{ .key = .{ .integer = entry.key_ptr.* }, .value = entry.value_ptr.* });
+        }
+        var float_iter = table.floats.iterator();
+        while (float_iter.next()) |entry| {
+            if (!entry.value_ptr.*.isNil()) {
+                const float_key: f64 = @bitCast(entry.key_ptr.*);
+                try entries.append(self.vm.allocator, .{ .key = .{ .float = float_key }, .value = entry.value_ptr.* });
+            }
         }
         var string_iter = table.strings.iterator();
         while (string_iter.next()) |entry| {
@@ -1615,7 +1636,7 @@ const Parser = struct {
                 const key = try self.expression(0);
                 try self.consumeCloseBracket(bracket_line);
                 try self.consume(.assign);
-                try table.rawSetKey(self.vm.allocator, key, try self.expression(0));
+                try self.rawSetTableValue(table, key, try self.expression(0), bracket_line);
             } else if (self.peek().tag == .ident and self.peekOffset(1).tag == .assign) {
                 const key = try self.consumeIdent();
                 try self.consume(.assign);
@@ -2893,6 +2914,17 @@ fn valueToInteger(value: Value) !i64 {
     };
 }
 
+fn floatTableKey(value: f64) u64 {
+    return @bitCast(value);
+}
+
+fn tableIndexErrorMessage(key: Value) []const u8 {
+    return switch (key) {
+        .float => |f| if (f != f) "table index is NaN" else "table index is nil",
+        else => "table index is nil",
+    };
+}
+
 fn unaryMinus(vm: *Vm, line: usize, value: Value) !Value {
     return switch (value) {
         .integer => |i| .{ .integer = -i },
@@ -3410,6 +3442,50 @@ test "raw operations and metatable indexing execute natively" {
         try std.testing.expectEqual(VmState.pass, result.state);
         try std.testing.expectEqualSlices(u8, snippet.stdout, result.stdout);
         try std.testing.expectEqualSlices(u8, "", result.stderr);
+        _ = arena.reset(.retain_capacity);
+    }
+}
+
+test "non-integral float table keys execute natively" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const snippets = [_]struct { source: []const u8, stdout: []const u8 }{
+        .{
+            .source = "local t = {[1.5] = \"half\", [2.0] = \"two\"}\nt[3.25] = \"quarter\"\nrawset(t, 4.5, \"raw\")\nprint(t[1.5], t[2], rawget(t, 3.25), rawget(t, 4.5), rawget(t, 4))\nt[1.5] = nil\nprint(rawget(t, 1.5))\n",
+            .stdout = "half\ttwo\tquarter\traw\tnil\nnil\n",
+        },
+        .{
+            .source = "local t = {[1.5] = 10, [2.0] = 20, a = 1}\nlocal saw_float = false\nlocal sum = 0\nfor k, v in pairs(t) do\n  if k == 1.5 then saw_float = true end\n  sum = sum + v\nend\nprint(saw_float, sum)\n",
+            .stdout = "true\t31\n",
+        },
+        .{
+            .source = "local t = setmetatable({}, { __newindex = function(_, k, v) print(k, v) end })\nt[0/0] = \"nan-mm\"\nt[nil] = \"nil-mm\"\nprint(rawget({}, 0/0))\n",
+            .stdout = "nan\tnan-mm\nnil\tnil-mm\nnil\n",
+        },
+    };
+    for (snippets) |snippet| {
+        const result = try runLevel0(arena.allocator(), snippet.source);
+        try std.testing.expectEqual(VmState.pass, result.state);
+        try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+        try std.testing.expectEqualSlices(u8, snippet.stdout, result.stdout);
+        try std.testing.expectEqualSlices(u8, "", result.stderr);
+        _ = arena.reset(.retain_capacity);
+    }
+}
+
+test "nan table writes retain lua-compatible diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const snippets = [_]struct { source: []const u8, diagnostic: []const u8 }{
+        .{ .source = "local t = {}\nt[0/0] = 1\n", .diagnostic = "table index is NaN" },
+        .{ .source = "rawset({}, 0/0, 1)\n", .diagnostic = "table index is NaN" },
+        .{ .source = "local t = {[0/0] = 1}\n", .diagnostic = "table index is NaN" },
+    };
+    for (snippets) |snippet| {
+        const result = try runLevel0(arena.allocator(), snippet.source);
+        try std.testing.expectEqual(VmState.runtime_error, result.state);
+        try std.testing.expectEqual(@as(u8, 1), result.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, snippet.diagnostic) != null);
         _ = arena.reset(.retain_capacity);
     }
 }
