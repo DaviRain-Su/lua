@@ -2382,12 +2382,7 @@ fn valueToNumber(value: Value) !f64 {
 fn valueToInteger(value: Value) !i64 {
     return switch (value) {
         .integer => |i| i,
-        .float => |f| {
-            if (f != f) return error.RuntimeError;
-            if (@floor(f) != f) return error.RuntimeError;
-            if (f < -9223372036854775808.0 or f >= 9223372036854775808.0) return error.RuntimeError;
-            return @intFromFloat(f);
-        },
+        .float => |f| floatToInteger(f, .eq) orelse error.RuntimeError,
         else => error.RuntimeError,
     };
 }
@@ -2493,10 +2488,11 @@ fn compare(vm: *Vm, op: Token, left: Value, right: Value) !Value {
 }
 
 fn valuesEqual(left: Value, right: Value) bool {
-    if ((left == .integer or left == .float) and (right == .integer or right == .float)) {
-        const a = valueToNumber(left) catch return false;
-        const b = valueToNumber(right) catch return false;
-        return a == b;
+    if (left == .integer and right == .float) {
+        return if (floatToInteger(right.float, .eq)) |i| left.integer == i else false;
+    }
+    if (left == .float and right == .integer) {
+        return if (floatToInteger(left.float, .eq)) |i| i == right.integer else false;
     }
     if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
     return switch (left) {
@@ -2512,14 +2508,39 @@ fn valuesEqual(left: Value, right: Value) bool {
 }
 
 fn orderedCompare(vm: *Vm, op: Token, left: Value, right: Value) !bool {
-    if ((left == .integer or left == .float) and (right == .integer or right == .float)) {
-        const a = try valueToNumber(left);
-        const b = try valueToNumber(right);
+    if (left == .integer and right == .integer) {
         return switch (op.tag) {
-            .lt => a < b,
-            .le => a <= b,
-            .gt => a > b,
-            .ge => a >= b,
+            .lt => left.integer < right.integer,
+            .le => left.integer <= right.integer,
+            .gt => left.integer > right.integer,
+            .ge => left.integer >= right.integer,
+            else => unreachable,
+        };
+    }
+    if (left == .float and right == .float) {
+        return switch (op.tag) {
+            .lt => left.float < right.float,
+            .le => left.float <= right.float,
+            .gt => left.float > right.float,
+            .ge => left.float >= right.float,
+            else => unreachable,
+        };
+    }
+    if (left == .integer and right == .float) {
+        return switch (op.tag) {
+            .lt => ltIntFloat(left.integer, right.float),
+            .le => leIntFloat(left.integer, right.float),
+            .gt => ltFloatInt(right.float, left.integer),
+            .ge => leFloatInt(right.float, left.integer),
+            else => unreachable,
+        };
+    }
+    if (left == .float and right == .integer) {
+        return switch (op.tag) {
+            .lt => ltFloatInt(left.float, right.integer),
+            .le => leFloatInt(left.float, right.integer),
+            .gt => ltIntFloat(right.integer, left.float),
+            .ge => leIntFloat(right.integer, left.float),
             else => unreachable,
         };
     }
@@ -2535,6 +2556,51 @@ fn orderedCompare(vm: *Vm, op: Token, left: Value, right: Value) !bool {
     }
     vm.setRuntimeErrorAt(op.line, try orderedComparisonErrorMessage(vm.allocator, left, right));
     return error.RuntimeError;
+}
+
+const FloatToIntegerMode = enum { eq, floor, ceil };
+
+fn floatToInteger(value: f64, mode: FloatToIntegerMode) ?i64 {
+    if (value != value) return null;
+    var rounded = @floor(value);
+    if (value != rounded) {
+        switch (mode) {
+            .eq => return null,
+            .floor => {},
+            .ceil => rounded += 1.0,
+        }
+    }
+    if (rounded < -9223372036854775808.0 or rounded >= 9223372036854775808.0) return null;
+    return @intFromFloat(rounded);
+}
+
+fn intFitsFloat(value: i64) bool {
+    const max_exact_int_in_float: i64 = 9007199254740992;
+    return value >= -max_exact_int_in_float and value <= max_exact_int_in_float;
+}
+
+fn ltIntFloat(integer: i64, float: f64) bool {
+    if (intFitsFloat(integer)) return @as(f64, @floatFromInt(integer)) < float;
+    if (floatToInteger(float, .ceil)) |ceil_float| return integer < ceil_float;
+    return float > 0;
+}
+
+fn leIntFloat(integer: i64, float: f64) bool {
+    if (intFitsFloat(integer)) return @as(f64, @floatFromInt(integer)) <= float;
+    if (floatToInteger(float, .floor)) |floor_float| return integer <= floor_float;
+    return float > 0;
+}
+
+fn ltFloatInt(float: f64, integer: i64) bool {
+    if (intFitsFloat(integer)) return float < @as(f64, @floatFromInt(integer));
+    if (floatToInteger(float, .floor)) |floor_float| return floor_float < integer;
+    return float < 0;
+}
+
+fn leFloatInt(float: f64, integer: i64) bool {
+    if (intFitsFloat(integer)) return float <= @as(f64, @floatFromInt(integer));
+    if (floatToInteger(float, .ceil)) |ceil_float| return ceil_float <= integer;
+    return float < 0;
 }
 
 fn orderedComparisonErrorMessage(allocator: std.mem.Allocator, left: Value, right: Value) ![]const u8 {
@@ -2812,6 +2878,33 @@ test "ordered comparisons follow lua number string and invalid operand semantics
     const invalid = try runLevel0(arena.allocator(), "print(\"2\" < 10)\n");
     try std.testing.expectEqual(VmState.runtime_error, invalid.state);
     try std.testing.expect(std.mem.indexOf(u8, invalid.stderr, "attempt to compare string with number") != null);
+}
+
+test "mixed integer float ordered comparisons preserve precision boundaries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try runLevel0(arena.allocator(),
+        \\local a = 9007199254740993
+        \\local b = 9007199254740992.0
+        \\print(a < b, a <= b, a > b, a >= b)
+        \\print(b < a, b <= a, b > a, b >= a)
+        \\local c = 9223372036854775807
+        \\local d = 9223372036854775807.0
+        \\print(c < d, c <= d, c > d, c >= d)
+        \\print(d < c, d <= c, d > c, d >= c)
+        \\print(a == b, a ~= b, d == c, d ~= c)
+        \\
+    );
+    try std.testing.expectEqual(VmState.pass, result.state);
+    try std.testing.expectEqualSlices(u8,
+        "false\tfalse\ttrue\ttrue\n" ++
+            "true\ttrue\tfalse\tfalse\n" ++
+            "true\ttrue\tfalse\tfalse\n" ++
+            "false\tfalse\ttrue\ttrue\n" ++
+            "false\ttrue\tfalse\ttrue\n",
+        result.stdout,
+    );
+    try std.testing.expectEqualSlices(u8, "", result.stderr);
 }
 
 test "bitwise float coercion rejects nan and overflow without panicking" {

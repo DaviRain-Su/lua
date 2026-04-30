@@ -209,6 +209,7 @@ class VmLevel0Tests(unittest.TestCase):
             "ipairs-generic-for": 'for i,v in ipairs({"a","b"}) do print(i,v) end\n',
             "pairs-array-generic-for": "local total = 0\nfor k,v in pairs({3,4,5}) do total = total + k + v end\nprint(total)\n",
             "ordered-number-and-string": 'print(1 < 2, 2.0 <= 2, 3 > 2.5, 3 >= 3)\nprint("2" < "10", "abc" <= "abc", "b" > "aa", "b" >= "b")\n',
+            "ordered-int-float-precision-boundaries": "local a = 9007199254740993\nlocal b = 9007199254740992.0\nprint(a < b, a <= b, a > b, a >= b)\nprint(b < a, b <= a, b > a, b >= a)\nlocal c = 9223372036854775807\nlocal d = 9223372036854775807.0\nprint(c < d, c <= d, c > d, c >= d)\nprint(d < c, d <= c, d > c, d >= c)\n",
             "mixed-string-number-rejected": 'print("2" < 10)\n',
             "mixed-number-string-rejected": 'print(2 < "10")\n',
             "unsupported-table-comparison-rejected": "print({} < {})\n",

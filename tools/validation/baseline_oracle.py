@@ -182,6 +182,14 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "source": 'print(1 < 2, 2.0 <= 2, 3 > 2.5, 3 >= 3)\nprint("2" < "10", "abc" <= "abc", "b" > "aa", "b" >= "b")\n',
     },
     {
+        "name": "ordered-comparison-int-float-precision-boundaries-core",
+        "puc_file": "constructs.lua",
+        "validates": ["VAL-NATIVE-005"],
+        "coverage_tags": ["construct:ordered-comparison", "comparison:int-float-boundary", "comparison:no-f64-overcoercion"],
+        "description": "mixed integer/float comparisons preserve Lua LTintfloat/LEintfloat semantics around 2^53 and i64 boundaries",
+        "source": 'local a = 9007199254740993\nlocal b = 9007199254740992.0\nprint(a < b, a <= b, a > b, a >= b)\nprint(b < a, b <= a, b > a, b >= a)\nlocal c = 9223372036854775807\nlocal d = 9223372036854775807.0\nprint(c < d, c <= d, c > d, c >= d)\nprint(d < c, d <= c, d > c, d >= c)\n',
+    },
+    {
         "name": "ordered-comparison-mixed-string-number-core",
         "puc_file": "constructs.lua",
         "validates": ["VAL-NATIVE-005", "VAL-NATIVE-010"],
