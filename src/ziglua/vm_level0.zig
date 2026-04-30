@@ -68,7 +68,22 @@ const Function = struct {
     captures: std.StringHashMap(*Cell),
 };
 
-const Builtin = enum { print, select, pairs, ipairs, next, ipairs_iter };
+const Builtin = enum {
+    print,
+    select,
+    pairs,
+    ipairs,
+    next,
+    ipairs_iter,
+    rawget,
+    rawset,
+    rawequal,
+    rawlen,
+    setmetatable,
+    getmetatable,
+    tostring,
+    type,
+};
 
 const ValueTag = enum { nil, boolean, integer, float, string, table, function, builtin };
 
@@ -106,6 +121,12 @@ const Table = struct {
     array: std.ArrayList(Value),
     integers: std.AutoHashMap(i64, Value),
     strings: std.StringHashMap(Value),
+    table_keys: std.AutoHashMap(*Table, Value),
+    function_keys: std.AutoHashMap(*Function, Value),
+    builtin_keys: std.AutoHashMap(Builtin, Value),
+    bool_true: Value,
+    bool_false: Value,
+    metatable: ?*Table,
 
     fn create(allocator: std.mem.Allocator) !*Table {
         const table = try allocator.create(Table);
@@ -113,6 +134,12 @@ const Table = struct {
             .array = .empty,
             .integers = std.AutoHashMap(i64, Value).init(allocator),
             .strings = std.StringHashMap(Value).init(allocator),
+            .table_keys = std.AutoHashMap(*Table, Value).init(allocator),
+            .function_keys = std.AutoHashMap(*Function, Value).init(allocator),
+            .builtin_keys = std.AutoHashMap(Builtin, Value).init(allocator),
+            .bool_true = .{ .nil = {} },
+            .bool_false = .{ .nil = {} },
+            .metatable = null,
         };
         return table;
     }
@@ -127,6 +154,38 @@ const Table = struct {
 
     fn getString(self: *Table, key: []const u8) Value {
         return self.strings.get(key) orelse .{ .nil = {} };
+    }
+
+    fn rawSetKey(self: *Table, allocator: std.mem.Allocator, key: Value, value: Value) !void {
+        switch (key) {
+            .nil => return error.RuntimeError,
+            .integer => |i| try self.setIndex(allocator, i, value),
+            .float => |f| try self.setIndex(allocator, try valueToInteger(.{ .float = f }), value),
+            .string => |s| try self.setString(s, value),
+            .table => |t| try self.table_keys.put(t, value),
+            .function => |f| try self.function_keys.put(f, value),
+            .builtin => |b| try self.builtin_keys.put(b, value),
+            .boolean => |b| {
+                if (b) {
+                    self.bool_true = value;
+                } else {
+                    self.bool_false = value;
+                }
+            },
+        }
+    }
+
+    fn rawGetKey(self: *Table, key: Value) !Value {
+        return switch (key) {
+            .nil => error.RuntimeError,
+            .integer => |i| self.getIndex(i),
+            .float => |f| self.getIndex(try valueToInteger(.{ .float = f })),
+            .string => |s| self.getString(s),
+            .table => |t| self.table_keys.get(t) orelse .{ .nil = {} },
+            .function => |f| self.function_keys.get(f) orelse .{ .nil = {} },
+            .builtin => |b| self.builtin_keys.get(b) orelse .{ .nil = {} },
+            .boolean => |b| if (b) self.bool_true else self.bool_false,
+        };
     }
 
     fn setIndex(self: *Table, allocator: std.mem.Allocator, index: i64, value: Value) !void {
@@ -152,6 +211,11 @@ const Table = struct {
         var n: usize = 0;
         while (n < self.array.items.len and !self.array.items[n].isNil()) : (n += 1) {}
         return @intCast(n);
+    }
+
+    fn rawMetafield(self: *Table, name: []const u8) Value {
+        if (self.metatable) |mt| return mt.getString(name);
+        return .{ .nil = {} };
     }
 };
 
@@ -181,6 +245,7 @@ const AssignTarget = struct {
     name: []const u8,
     table: ?*Table = null,
     key_string: []const u8 = "",
+    key_value: Value = .{ .nil = {} },
     key_index: i64 = 0,
 };
 
@@ -220,6 +285,15 @@ const Vm = struct {
         try default_env.setString("pairs", .{ .builtin = .pairs });
         try default_env.setString("ipairs", .{ .builtin = .ipairs });
         try default_env.setString("next", .{ .builtin = .next });
+        try default_env.setString("rawget", .{ .builtin = .rawget });
+        try default_env.setString("rawset", .{ .builtin = .rawset });
+        try default_env.setString("rawequal", .{ .builtin = .rawequal });
+        try default_env.setString("rawlen", .{ .builtin = .rawlen });
+        try default_env.setString("setmetatable", .{ .builtin = .setmetatable });
+        try default_env.setString("getmetatable", .{ .builtin = .getmetatable });
+        try default_env.setString("tostring", .{ .builtin = .tostring });
+        try default_env.setString("type", .{ .builtin = .type });
+        try default_env.setString("_G", .{ .table = default_env });
         try vm.declare("_ENV", .{ .table = default_env });
         return vm;
     }
@@ -826,8 +900,8 @@ const Parser = struct {
             const value = if (i < values.items.len) values.items[i] else Value{ .nil = {} };
             switch (target.kind) {
                 .name => try self.vm.assignName(target.name, value),
-                .string_field => try target.table.?.setString(target.key_string, value),
-                .index => try target.table.?.setIndex(self.vm.allocator, target.key_index, value),
+                .string_field => try self.setTableValue(target.table.?, .{ .string = target.key_string }, value, self.peek().line),
+                .index => try self.setTableValue(target.table.?, target.key_value, value, self.peek().line),
             }
         }
         return .normal;
@@ -849,7 +923,7 @@ const Parser = struct {
                     return error.RuntimeError;
                 },
             };
-            return .{ .kind = .string_field, .name = name, .table = table, .key_string = key };
+            return .{ .kind = .string_field, .name = name, .table = table, .key_string = key, .key_value = .{ .string = key } };
         }
         if (self.match(.lbracket)) {
             const key = try self.expression(0);
@@ -864,7 +938,7 @@ const Parser = struct {
                     return error.RuntimeError;
                 },
             };
-            return .{ .kind = .index, .name = name, .table = table, .key_index = try valueToInteger(key) };
+            return .{ .kind = .index, .name = name, .table = table, .key_value = key };
         }
         return .{ .kind = .name, .name = name };
     }
@@ -934,7 +1008,7 @@ const Parser = struct {
                 self.last_call_values = null;
                 continue;
             }
-            left = try applyBinary(self.vm, op, left, right);
+            left = try self.applyBinaryValue(op, left, right);
             self.last_call_values = null;
         }
         return left;
@@ -953,13 +1027,14 @@ const Parser = struct {
             const value = try self.expression(11);
             if (!self.evaluate) return .{ .nil = {} };
             self.last_call_values = null;
-            return lengthValue(self.vm, op.line, value);
+            return self.lengthValue(op.line, value);
         }
         if (self.match(.tilde)) {
+            const op = self.tokens()[self.pos - 1];
             const value = try self.expression(11);
             if (!self.evaluate) return .{ .nil = {} };
             self.last_call_values = null;
-            return bitNot(value);
+            return self.bitNotValue(op.line, value);
         }
         if (self.matchKeyword("not")) {
             const value = try self.expression(11);
@@ -980,7 +1055,7 @@ const Parser = struct {
                 const key_token = self.peek();
                 const key = try self.consumeIdent();
                 value = switch (value) {
-                    .table => |t| t.getString(key),
+                    .table => |t| try self.getTableValue(t, .{ .string = key }, key_token.line),
                     else => {
                         self.vm.setRuntimeErrorAt(
                             key_token.line,
@@ -997,7 +1072,7 @@ const Parser = struct {
                 const key = try self.consumeIdent();
                 const receiver = value;
                 value = switch (value) {
-                    .table => |t| t.getString(key),
+                    .table => |t| try self.getTableValue(t, .{ .string = key }, key_token.line),
                     else => {
                         self.vm.setRuntimeErrorAt(
                             key_token.line,
@@ -1031,7 +1106,7 @@ const Parser = struct {
                 const key = try self.expression(0);
                 try self.consumeCloseBracket(bracket_line);
                 value = switch (value) {
-                    .table => |t| t.getIndex(try valueToInteger(key)),
+                    .table => |t| try self.getTableValue(t, key, bracket_line),
                     else => {
                         self.vm.setRuntimeErrorAt(
                             bracket_line,
@@ -1076,6 +1151,148 @@ const Parser = struct {
         return value;
     }
 
+    fn getTableValue(self: *Parser, table: *Table, key: Value, line: usize) anyerror!Value {
+        const raw = table.rawGetKey(key) catch |err| switch (err) {
+            error.RuntimeError => {
+                self.vm.setRuntimeErrorAt(line, "table index is nil");
+                return error.RuntimeError;
+            },
+        };
+        if (!raw.isNil()) return raw;
+        const metamethod = table.rawMetafield("__index");
+        if (metamethod.isNil()) return raw;
+        switch (metamethod) {
+            .table => |mt| return self.getTableValue(mt, key, line),
+            .function, .builtin => {
+                const returns = try self.invokeCallable(metamethod, &.{ .{ .table = table }, key });
+                return if (returns.len == 0) Value{ .nil = {} } else returns[0];
+            },
+            else => return raw,
+        }
+    }
+
+    fn setTableValue(self: *Parser, table: *Table, key: Value, value: Value, line: usize) anyerror!void {
+        const current = table.rawGetKey(key) catch |err| switch (err) {
+            error.RuntimeError => {
+                self.vm.setRuntimeErrorAt(line, "table index is nil");
+                return error.RuntimeError;
+            },
+        };
+        if (!current.isNil()) {
+            try table.rawSetKey(self.vm.allocator, key, value);
+            return;
+        }
+        const metamethod = table.rawMetafield("__newindex");
+        if (metamethod.isNil()) {
+            try table.rawSetKey(self.vm.allocator, key, value);
+            return;
+        }
+        switch (metamethod) {
+            .table => |mt| try self.setTableValue(mt, key, value, line),
+            .function, .builtin => {
+                _ = try self.invokeCallable(metamethod, &.{ .{ .table = table }, key, value });
+            },
+            else => try table.rawSetKey(self.vm.allocator, key, value),
+        }
+    }
+
+    fn valueMetafield(_: *Parser, value: Value, name: []const u8) Value {
+        return switch (value) {
+            .table => |t| t.rawMetafield(name),
+            else => .{ .nil = {} },
+        };
+    }
+
+    fn invokeMetamethod(self: *Parser, metamethod: Value, args: []const Value) anyerror!Value {
+        switch (metamethod) {
+            .function, .builtin => {
+                const returns = try self.invokeCallable(metamethod, args);
+                return if (returns.len == 0) Value{ .nil = {} } else returns[0];
+            },
+            else => return error.RuntimeError,
+        }
+    }
+
+    fn writePrintValue(self: *Parser, value: Value) anyerror!void {
+        if (value == .table) {
+            const mm = value.table.rawMetafield("__tostring");
+            if (!mm.isNil()) {
+                const text_value = try self.invokeMetamethod(mm, &.{value});
+                return self.vm.writeValue(text_value);
+            }
+        }
+        try self.vm.writeValue(value);
+    }
+
+    fn binaryMetamethod(self: *Parser, left: Value, right: Value, name: []const u8) Value {
+        const left_mm = self.valueMetafield(left, name);
+        if (!left_mm.isNil()) return left_mm;
+        return self.valueMetafield(right, name);
+    }
+
+    fn applyBinaryValue(self: *Parser, op: Token, left: Value, right: Value) anyerror!Value {
+        const meta_name = binaryMetamethodName(op.tag);
+        if (meta_name) |name| {
+            if (!binaryOperandsAreRawSupported(op.tag, left, right)) {
+                const mm = self.binaryMetamethod(left, right, name);
+                if (!mm.isNil()) return self.invokeMetamethod(mm, &.{ left, right });
+            }
+        }
+        if ((op.tag == .eq or op.tag == .ne) and std.meta.activeTag(left) == std.meta.activeTag(right)) {
+            const mm = self.binaryMetamethod(left, right, "__eq");
+            if (!mm.isNil()) {
+                const result = try self.invokeMetamethod(mm, &.{ left, right });
+                return .{ .boolean = if (op.tag == .eq) result.isTruthy() else !result.isTruthy() };
+            }
+        }
+        if ((op.tag == .lt or op.tag == .gt) and !binaryOperandsAreRawSupported(op.tag, left, right)) {
+            const mm = self.binaryMetamethod(left, right, "__lt");
+            if (!mm.isNil()) {
+                const result = if (op.tag == .lt)
+                    try self.invokeMetamethod(mm, &.{ left, right })
+                else
+                    try self.invokeMetamethod(mm, &.{ right, left });
+                return .{ .boolean = result.isTruthy() };
+            }
+        }
+        if ((op.tag == .le or op.tag == .ge) and !binaryOperandsAreRawSupported(op.tag, left, right)) {
+            const mm = self.binaryMetamethod(left, right, "__le");
+            if (!mm.isNil()) {
+                const result = if (op.tag == .le)
+                    try self.invokeMetamethod(mm, &.{ left, right })
+                else
+                    try self.invokeMetamethod(mm, &.{ right, left });
+                return .{ .boolean = result.isTruthy() };
+            }
+            const lt = self.binaryMetamethod(left, right, "__lt");
+            if (!lt.isNil()) {
+                const result = if (op.tag == .le)
+                    try self.invokeMetamethod(lt, &.{ right, left })
+                else
+                    try self.invokeMetamethod(lt, &.{ left, right });
+                return .{ .boolean = !result.isTruthy() };
+            }
+        }
+        return applyBinary(self.vm, op, left, right);
+    }
+
+    fn lengthValue(self: *Parser, line: usize, value: Value) anyerror!Value {
+        if (value == .table) {
+            const mm = value.table.rawMetafield("__len");
+            if (!mm.isNil()) return self.invokeMetamethod(mm, &.{value});
+        }
+        return lengthValueRaw(self.vm, line, value);
+    }
+
+    fn bitNotValue(self: *Parser, line: usize, value: Value) anyerror!Value {
+        if (valueToInteger(value)) |i| return .{ .integer = ~i } else |_| {
+            const mm = self.valueMetafield(value, "__bnot");
+            if (!mm.isNil()) return self.invokeMetamethod(mm, &.{value});
+            self.vm.setRuntimeErrorAt(line, try bitwiseErrorMessage(self.vm.allocator, value));
+            return error.RuntimeError;
+        }
+    }
+
     fn callFunctionValue(self: *Parser, callee: Value) anyerror![]const Value {
         const open = self.peek();
         try self.consume(.lparen);
@@ -1083,6 +1300,15 @@ const Parser = struct {
         if (!self.match(.rparen)) {
             try self.parseExpressionList(&args);
             try self.consumeCloseParen(open.line);
+        }
+        if (callee == .table) {
+            const metamethod = callee.table.rawMetafield("__call");
+            if (metamethod == .function or metamethod == .builtin) {
+                var call_args: std.ArrayList(Value) = .empty;
+                try call_args.append(self.vm.allocator, callee);
+                try call_args.appendSlice(self.vm.allocator, args.items);
+                return self.invokeCallable(metamethod, call_args.items);
+            }
         }
         if (callee != .function and callee != .builtin) {
             self.vm.setRuntimeErrorAt(open.line, try std.fmt.allocPrint(self.vm.allocator, "attempt to call a {s} value", .{valueTypeName(callee)}));
@@ -1099,6 +1325,12 @@ const Parser = struct {
         if (!self.match(.rparen)) {
             try self.parseExpressionList(&args);
             try self.consumeCloseParen(open.line);
+        }
+        if (callee == .table) {
+            const metamethod = callee.table.rawMetafield("__call");
+            if (metamethod == .function or metamethod == .builtin) {
+                return self.invokeCallable(metamethod, args.items);
+            }
         }
         if (callee != .function and callee != .builtin) {
             self.vm.setRuntimeErrorAt(open.line, try std.fmt.allocPrint(self.vm.allocator, "attempt to call a {s} value", .{valueTypeName(callee)}));
@@ -1129,7 +1361,7 @@ const Parser = struct {
             .print => {
                 for (args, 0..) |value, i| {
                     if (i != 0) try self.vm.stdout.writer.writeAll("\t");
-                    try self.vm.writeValue(value);
+                    try self.writePrintValue(value);
                 }
                 try self.vm.stdout.writer.writeAll("\n");
                 return &.{};
@@ -1173,6 +1405,71 @@ const Parser = struct {
             },
             .next => return self.nextTable(args),
             .ipairs_iter => return self.ipairsIter(args),
+            .rawget => {
+                if (args.len < 2 or args[0] != .table) return error.RuntimeError;
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = try args[0].table.rawGetKey(args[1]);
+                return values;
+            },
+            .rawset => {
+                if (args.len < 3 or args[0] != .table) return error.RuntimeError;
+                try args[0].table.rawSetKey(self.vm.allocator, args[1], args[2]);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = args[0];
+                return values;
+            },
+            .rawequal => {
+                if (args.len < 2) return error.RuntimeError;
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .boolean = valuesEqual(args[0], args[1]) };
+                return values;
+            },
+            .rawlen => {
+                if (args.len < 1) return error.RuntimeError;
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = switch (args[0]) {
+                    .table => |t| .{ .integer = t.length() },
+                    .string => |s| .{ .integer = @intCast(s.len) },
+                    else => return error.RuntimeError,
+                };
+                return values;
+            },
+            .setmetatable => {
+                if (args.len < 2 or args[0] != .table) return error.RuntimeError;
+                args[0].table.metatable = switch (args[1]) {
+                    .nil => null,
+                    .table => |t| t,
+                    else => return error.RuntimeError,
+                };
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = args[0];
+                return values;
+            },
+            .getmetatable => {
+                if (args.len < 1) return error.RuntimeError;
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = switch (args[0]) {
+                    .table => |t| if (t.metatable) |mt| .{ .table = mt } else .{ .nil = {} },
+                    else => .{ .nil = {} },
+                };
+                return values;
+            },
+            .tostring => {
+                if (args.len < 1) return error.RuntimeError;
+                const values = try self.vm.allocator.alloc(Value, 1);
+                if (args[0] == .table and !args[0].table.rawMetafield("__tostring").isNil()) {
+                    values[0] = try self.invokeMetamethod(args[0].table.rawMetafield("__tostring"), &.{args[0]});
+                } else {
+                    values[0] = .{ .string = try valueToStringForTostring(self.vm.allocator, args[0]) };
+                }
+                return values;
+            },
+            .type => {
+                if (args.len < 1) return error.RuntimeError;
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .string = valueTypeName(args[0]) };
+                return values;
+            },
         }
     }
 
@@ -1195,23 +1492,55 @@ const Parser = struct {
         if (args.len == 0 or args[0] != .table) return error.RuntimeError;
         const table = args[0].table;
         const key = if (args.len > 1) args[1] else Value{ .nil = {} };
-        const start_index: i64 = switch (key) {
-            .nil => 1,
-            .integer => |i| i + 1,
-            .float => |f| (try valueToInteger(.{ .float = f })) + 1,
-            else => return error.RuntimeError,
-        };
-        if (start_index >= 1) {
-            var idx = start_index;
-            while (idx <= table.length()) : (idx += 1) {
-                const value = table.getIndex(idx);
-                if (!value.isNil()) {
-                    const values = try self.vm.allocator.alloc(Value, 2);
-                    values[0] = .{ .integer = idx };
-                    values[1] = value;
-                    return values;
+        var entries: std.ArrayList(struct { key: Value, value: Value }) = .empty;
+        var idx: usize = 0;
+        while (idx < table.array.items.len) : (idx += 1) {
+            const value = table.array.items[idx];
+            if (!value.isNil()) try entries.append(self.vm.allocator, .{ .key = .{ .integer = @intCast(idx + 1) }, .value = value });
+        }
+        var int_iter = table.integers.iterator();
+        while (int_iter.next()) |entry| {
+            if (!entry.value_ptr.*.isNil()) try entries.append(self.vm.allocator, .{ .key = .{ .integer = entry.key_ptr.* }, .value = entry.value_ptr.* });
+        }
+        var string_iter = table.strings.iterator();
+        while (string_iter.next()) |entry| {
+            if (!entry.value_ptr.*.isNil()) try entries.append(self.vm.allocator, .{ .key = .{ .string = entry.key_ptr.* }, .value = entry.value_ptr.* });
+        }
+        var table_iter = table.table_keys.iterator();
+        while (table_iter.next()) |entry| {
+            if (!entry.value_ptr.*.isNil()) try entries.append(self.vm.allocator, .{ .key = .{ .table = entry.key_ptr.* }, .value = entry.value_ptr.* });
+        }
+        var function_iter = table.function_keys.iterator();
+        while (function_iter.next()) |entry| {
+            if (!entry.value_ptr.*.isNil()) try entries.append(self.vm.allocator, .{ .key = .{ .function = entry.key_ptr.* }, .value = entry.value_ptr.* });
+        }
+        var builtin_iter = table.builtin_keys.iterator();
+        while (builtin_iter.next()) |entry| {
+            if (!entry.value_ptr.*.isNil()) try entries.append(self.vm.allocator, .{ .key = .{ .builtin = entry.key_ptr.* }, .value = entry.value_ptr.* });
+        }
+        if (!table.bool_false.isNil()) try entries.append(self.vm.allocator, .{ .key = .{ .boolean = false }, .value = table.bool_false });
+        if (!table.bool_true.isNil()) try entries.append(self.vm.allocator, .{ .key = .{ .boolean = true }, .value = table.bool_true });
+
+        var return_index: usize = 0;
+        if (!key.isNil()) {
+            var found = false;
+            for (entries.items, 0..) |entry, i| {
+                if (valuesEqual(entry.key, key)) {
+                    return_index = i + 1;
+                    found = true;
+                    break;
                 }
             }
+            if (!found) {
+                self.vm.setRuntimeErrorAt(self.peek().line, "invalid key to 'next'");
+                return error.RuntimeError;
+            }
+        }
+        if (return_index < entries.items.len) {
+            const values = try self.vm.allocator.alloc(Value, 2);
+            values[0] = entries.items[return_index].key;
+            values[1] = entries.items[return_index].value;
+            return values;
         }
         const values = try self.vm.allocator.alloc(Value, 1);
         values[0] = .{ .nil = {} };
@@ -1281,7 +1610,13 @@ const Parser = struct {
         const table = try Table.create(self.vm.allocator);
         if (self.match(.rbrace)) return .{ .table = table };
         while (true) {
-            if (self.peek().tag == .ident and self.peekOffset(1).tag == .assign) {
+            if (self.match(.lbracket)) {
+                const bracket_line = self.tokens()[self.pos - 1].line;
+                const key = try self.expression(0);
+                try self.consumeCloseBracket(bracket_line);
+                try self.consume(.assign);
+                try table.rawSetKey(self.vm.allocator, key, try self.expression(0));
+            } else if (self.peek().tag == .ident and self.peekOffset(1).tag == .assign) {
                 const key = try self.consumeIdent();
                 try self.consume(.assign);
                 try table.setString(key, try self.expression(0));
@@ -1768,16 +2103,8 @@ const AdvancedScanState = struct {
         if (isFieldName(tokens, i) or isTableConstructorKey(tokens, i)) return null;
         if (hasActiveBinding(bindings, token.lexeme)) return null;
 
-        if (std.mem.eql(u8, token.lexeme, "rawget") or
-            std.mem.eql(u8, token.lexeme, "rawset") or
-            std.mem.eql(u8, token.lexeme, "rawequal") or
-            std.mem.eql(u8, token.lexeme, "rawlen"))
-        {
-            return .raw_ops;
-        }
         if (std.mem.eql(u8, token.lexeme, "collectgarbage")) return .gc_weak_finalization;
         if (std.mem.eql(u8, token.lexeme, "coroutine")) return .coroutine_model;
-        if (std.mem.eql(u8, token.lexeme, "next")) return .table_iteration;
         if (std.mem.eql(u8, token.lexeme, "close")) {
             const attr_left = i > 0 and tokens[i - 1].tag == .lt;
             const attr_right = i + 1 < tokens.len and tokens[i + 1].tag == .gt;
@@ -1804,7 +2131,6 @@ const AdvancedScanState = struct {
         if (self.saw_metatable and self.saw_protected) return .cross_boundary_advanced;
         if (self.saw_binary_dump) return .binary_dynamic_gates;
         if (self.saw_protected) return .protected_error;
-        if (self.saw_metatable) return .metatable_dispatch;
         return null;
     }
 };
@@ -2578,7 +2904,7 @@ fn unaryMinus(vm: *Vm, line: usize, value: Value) !Value {
     };
 }
 
-fn lengthValue(vm: *Vm, line: usize, value: Value) !Value {
+fn lengthValueRaw(vm: *Vm, line: usize, value: Value) !Value {
     return switch (value) {
         .string => |s| .{ .integer = @intCast(s.len) },
         .table => |t| .{ .integer = t.length() },
@@ -2591,6 +2917,44 @@ fn lengthValue(vm: *Vm, line: usize, value: Value) !Value {
 
 fn bitNot(value: Value) !Value {
     return .{ .integer = ~(try valueToInteger(value)) };
+}
+
+fn binaryMetamethodName(tag: TokenTag) ?[]const u8 {
+    return switch (tag) {
+        .plus => "__add",
+        .minus => "__sub",
+        .star => "__mul",
+        .slash => "__div",
+        .floor_div => "__idiv",
+        .percent => "__mod",
+        .concat => "__concat",
+        .amp => "__band",
+        .pipe => "__bor",
+        .tilde => "__bxor",
+        .shl => "__shl",
+        .shr => "__shr",
+        else => null,
+    };
+}
+
+fn binaryOperandsAreRawSupported(tag: TokenTag, left: Value, right: Value) bool {
+    return switch (tag) {
+        .plus, .minus, .star, .slash, .floor_div, .percent => (left == .integer or left == .float) and (right == .integer or right == .float),
+        .concat => canConcatRaw(left) and canConcatRaw(right),
+        .amp, .pipe, .tilde, .shl, .shr => canValueToInteger(left) and canValueToInteger(right),
+        .lt, .le, .gt, .ge => ((left == .integer or left == .float) and (right == .integer or right == .float)) or (left == .string and right == .string),
+        .eq, .ne => true,
+        else => true,
+    };
+}
+
+fn canConcatRaw(value: Value) bool {
+    return value == .string or value == .integer or value == .float;
+}
+
+fn canValueToInteger(value: Value) bool {
+    _ = valueToInteger(value) catch return false;
+    return true;
 }
 
 fn applyBinary(vm: *Vm, op: Token, left: Value, right: Value) !Value {
@@ -2654,6 +3018,18 @@ fn valueToStringForConcat(allocator: std.mem.Allocator, value: Value) ![]const u
         .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
         .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
         else => error.RuntimeError,
+    };
+}
+
+fn valueToStringForTostring(allocator: std.mem.Allocator, value: Value) ![]const u8 {
+    return switch (value) {
+        .nil => "nil",
+        .boolean => |b| if (b) "true" else "false",
+        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
+        .string => |s| s,
+        .table => "table",
+        .function, .builtin => "function",
     };
 }
 
@@ -3001,14 +3377,10 @@ test "advanced api names are local bindings before fallback classification" {
     }
 }
 
-test "real advanced api globals still classify with stable fallback reasons" {
+test "remaining advanced api globals still classify with stable fallback reasons" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const snippets = [_]struct { source: []const u8, reason: []const u8 }{
-        .{ .source = "local t = {}\nprint(rawget(t, \"x\"))\n", .reason = "raw-ops" },
-        .{ .source = "local t = {}\nif false then\n  local rawget = 1\nelse\n  print(rawget(t, \"x\"))\nend\n", .reason = "raw-ops" },
-        .{ .source = "local t = {}\nif false then\n  local rawget = 1\nelseif true then\n  print(rawget(t, \"x\"))\nend\n", .reason = "raw-ops" },
-        .{ .source = "local t = {}\nsetmetatable(t, {})\n", .reason = "metatable-dispatch" },
         .{ .source = "print(pcall(function() error(\"boom\") end))\n", .reason = "protected-error" },
     };
     for (snippets) |snippet| {
@@ -3016,6 +3388,28 @@ test "real advanced api globals still classify with stable fallback reasons" {
         try std.testing.expectEqual(VmState.unsupported, result.state);
         try std.testing.expectEqual(@as(u8, 1), result.exit_code);
         try std.testing.expectEqualStrings(snippet.reason, result.unsupported_reason.?);
+        _ = arena.reset(.retain_capacity);
+    }
+}
+
+test "raw operations and metatable indexing execute natively" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const snippets = [_]struct { source: []const u8, stdout: []const u8 }{
+        .{
+            .source = "local t = {}\nprint(rawget(t, \"x\"))\nrawset(t, \"x\", 4)\nprint(rawget(t, \"x\"), rawequal(rawget(t, \"x\"), 4), rawlen({1, 2, x = 3}))\n",
+            .stdout = "nil\n4\ttrue\t2\n",
+        },
+        .{
+            .source = "local t = setmetatable({}, { __index = function(_, k) return \"miss:\" .. k end })\nprint(t.answer)\n",
+            .stdout = "miss:answer\n",
+        },
+    };
+    for (snippets) |snippet| {
+        const result = try runLevel0(arena.allocator(), snippet.source);
+        try std.testing.expectEqual(VmState.pass, result.state);
+        try std.testing.expectEqualSlices(u8, snippet.stdout, result.stdout);
+        try std.testing.expectEqualSlices(u8, "", result.stderr);
         _ = arena.reset(.retain_capacity);
     }
 }

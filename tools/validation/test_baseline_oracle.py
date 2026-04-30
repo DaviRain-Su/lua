@@ -510,7 +510,7 @@ class BaselineOracleTests(unittest.TestCase):
             self.assertEqual(summary["fail_count"], 0)
             self.assertEqual(
                 {entry["fixture"] for entry in summary["fixtures"]},
-                {"dynamic-load", "dynamic-debug", "dynamic-metatable-dispatch", "dynamic-env-mutation"},
+                {"dynamic-load", "dynamic-debug", "dynamic-env-mutation"},
             )
             self.assertTrue(all(entry["state"] == "unsupported" for entry in summary["fixtures"]))
 

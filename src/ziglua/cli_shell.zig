@@ -1761,6 +1761,10 @@ fn stockStyleRuntimeError(
     message: []const u8,
 ) ![]const u8 {
     var out = std.Io.Writer.Allocating.init(allocator);
+    if (metamethod == null and std.mem.eql(u8, message, "invalid key to 'next'")) {
+        try out.writer.print("./lua: {s}\nstack traceback:\n\t[C]: in global 'next'\n\t{s}:{d}: in main chunk\n\t[C]: in ?\n", .{ message, chunk_name, line });
+        return try out.toOwnedSlice();
+    }
     try out.writer.print("./lua: {s}:{d}: {s}\nstack traceback:\n", .{ chunk_name, line, message });
     if (metamethod) |name| {
         try out.writer.print("\t[C]: in metamethod '{s}'\n", .{name});

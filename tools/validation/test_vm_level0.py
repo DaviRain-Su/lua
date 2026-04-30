@@ -76,6 +76,7 @@ class VmLevel0Tests(unittest.TestCase):
         self.assertIn("load", candidate.stderr)
 
     def test_advanced_semantics_fallback_passes_through_stock_lua_with_reason_marker(self):
+        native_reasons = {"metatable-dispatch", "raw-ops", "table-iteration"}
         for fixture in advanced_semantics_fixtures():
             with self.subTest(fixture=fixture["name"]):
                 source = str(fixture["source"])
@@ -85,8 +86,11 @@ class VmLevel0Tests(unittest.TestCase):
                 self.assertEqual(stock.returncode, 0, stock.stderr)
                 self.assertEqual(candidate.returncode, stock.returncode, candidate.stderr)
                 self.assertEqual(candidate.stdout, stock.stdout)
-                self.assertIn("fallback", candidate.stderr)
-                self.assertIn(str(fixture["reason"]), candidate.stderr)
+                if str(fixture["reason"]) in native_reasons:
+                    self.assertEqual(candidate.stderr, stock.stderr)
+                else:
+                    self.assertIn("fallback", candidate.stderr)
+                    self.assertIn(str(fixture["reason"]), candidate.stderr)
 
     def test_level1_supported_corpus_matches_stock_lua(self):
         for snippet in pass_snippets(1):
@@ -339,6 +343,10 @@ factory().run("chain", 99)
                 "VAL-NATIVE-011",
                 "VAL-NATIVE-012",
                 "VAL-NATIVE-013",
+                "VAL-NATIVE-014",
+                "VAL-NATIVE-015",
+                "VAL-NATIVE-016",
+                "VAL-NATIVE-017",
             ],
         )
 
