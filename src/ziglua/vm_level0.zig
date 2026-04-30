@@ -132,8 +132,20 @@ const Cell = struct {
 
 const CoroutineStatus = enum { suspended, running, dead };
 
+const CoroutineContinuationKind = enum {
+    resume_body,
+    pending_local_assignment,
+    pending_assignment,
+    pending_return,
+    pending_protected_call,
+};
+
 const CoroutineContinuation = struct {
+    kind: CoroutineContinuationKind,
     local_name: ?[]const u8,
+    local_names: []const []const u8,
+    assign_targets: []const AssignTarget,
+    prefix_values: []const Value,
     pos: usize,
     body_end: usize,
 };
@@ -142,7 +154,7 @@ const Thread = struct {
     vm: Vm,
     function: *Function,
     status: CoroutineStatus,
-    continuation: ?CoroutineContinuation,
+    continuations: std.ArrayList(CoroutineContinuation),
     yield_values: []const Value,
 };
 
@@ -600,12 +612,52 @@ const Parser = struct {
         if (self.matchKeyword("goto")) return self.gotoStatement();
         if (self.matchKeyword("break")) return .break_loop;
         if (self.isCallStatementStart()) {
-            _ = try self.expressionValues();
+            const statement_start = self.pos;
+            const continuation_depth = self.threadContinuationDepth();
+            _ = self.expressionValues() catch |err| switch (err) {
+                error.Yield => {
+                    if (!self.isCoroutineYieldCallAt(statement_start) and self.threadContinuationDepth() > continuation_depth) {
+                        try self.appendThreadContinuation(.{
+                            .kind = .resume_body,
+                            .local_name = null,
+                            .local_names = &.{},
+                            .assign_targets = &.{},
+                            .prefix_values = &.{},
+                            .pos = self.pos,
+                            .body_end = self.limit,
+                        });
+                    }
+                    return err;
+                },
+                else => return err,
+            };
             return .normal;
         }
         if (self.peek().tag == .ident) return self.assignmentStatement();
         if (self.peek().tag == .eof) return .normal;
         return error.UnsupportedFeature;
+    }
+
+    fn threadContinuationDepth(self: *Parser) usize {
+        if (self.vm.current_thread) |thread| return thread.continuations.items.len;
+        return 0;
+    }
+
+    fn appendThreadContinuation(self: *Parser, continuation: CoroutineContinuation) !void {
+        if (self.vm.current_thread) |thread| {
+            try thread.continuations.append(thread.vm.allocator, continuation);
+        }
+    }
+
+    fn discardAutoResumeContinuationAtCurrentPos(self: *Parser) void {
+        if (self.vm.current_thread) |thread| {
+            if (thread.continuations.items.len == 0) return;
+            const index = thread.continuations.items.len - 1;
+            const continuation = thread.continuations.items[index];
+            if (continuation.kind == .resume_body and continuation.local_name == null and continuation.pos == self.pos) {
+                _ = thread.continuations.orderedRemove(index);
+            }
+        }
     }
 
     fn isCallStatementStart(self: *Parser) bool {
@@ -674,12 +726,33 @@ const Parser = struct {
         if (self.match(.assign)) {
             if (names.items.len == 1 and self.isCoroutineYieldCallAt(self.pos)) {
                 try self.parseCoroutineYieldCall();
-                if (self.vm.current_thread) |thread| {
-                    thread.continuation = .{ .local_name = names.items[0], .pos = self.pos, .body_end = self.limit };
-                }
+                try self.appendThreadContinuation(.{
+                    .kind = .resume_body,
+                    .local_name = names.items[0],
+                    .local_names = &.{},
+                    .assign_targets = &.{},
+                    .prefix_values = &.{},
+                    .pos = self.pos,
+                    .body_end = self.limit,
+                });
                 return error.Yield;
             }
-            try self.parseExpressionList(&values);
+            self.parseExpressionList(&values) catch |err| switch (err) {
+                error.Yield => {
+                    self.discardAutoResumeContinuationAtCurrentPos();
+                    try self.appendThreadContinuation(.{
+                        .kind = .pending_local_assignment,
+                        .local_name = null,
+                        .local_names = try names.toOwnedSlice(self.vm.allocator),
+                        .assign_targets = &.{},
+                        .prefix_values = try values.toOwnedSlice(self.vm.allocator),
+                        .pos = self.pos,
+                        .body_end = self.limit,
+                    });
+                    return err;
+                },
+                else => return err,
+            };
         }
         for (names.items, 0..) |name, i| {
             const value = if (i < values.items.len) values.items[i] else Value{ .nil = {} };
@@ -792,7 +865,22 @@ const Parser = struct {
         if (self.peekKeyword("end") or self.peek().tag == .eof) {
             return .{ .returned = &.{} };
         }
-        try self.parseExpressionList(&values);
+        self.parseExpressionList(&values) catch |err| switch (err) {
+            error.Yield => {
+                self.discardAutoResumeContinuationAtCurrentPos();
+                try self.appendThreadContinuation(.{
+                    .kind = .pending_return,
+                    .local_name = null,
+                    .local_names = &.{},
+                    .assign_targets = &.{},
+                    .prefix_values = try values.toOwnedSlice(self.vm.allocator),
+                    .pos = self.pos,
+                    .body_end = self.limit,
+                });
+                return err;
+            },
+            else => return err,
+        };
         return .{ .returned = try values.toOwnedSlice(self.vm.allocator) };
     }
 
@@ -998,7 +1086,22 @@ const Parser = struct {
         }
         try self.consume(.assign);
         var values: std.ArrayList(Value) = .empty;
-        try self.parseExpressionList(&values);
+        self.parseExpressionList(&values) catch |err| switch (err) {
+            error.Yield => {
+                self.discardAutoResumeContinuationAtCurrentPos();
+                try self.appendThreadContinuation(.{
+                    .kind = .pending_assignment,
+                    .local_name = null,
+                    .local_names = &.{},
+                    .assign_targets = try targets.toOwnedSlice(self.vm.allocator),
+                    .prefix_values = try values.toOwnedSlice(self.vm.allocator),
+                    .pos = self.pos,
+                    .body_end = self.limit,
+                });
+                return err;
+            },
+            else => return err,
+        };
         for (targets.items, 0..) |target, i| {
             const value = if (i < values.items.len) values.items[i] else Value{ .nil = {} };
             switch (target.kind) {
@@ -1198,7 +1301,21 @@ const Parser = struct {
                     self.last_call_values = null;
                     continue;
                 }
-                const returns = try self.callFunctionValueWithPrefix(value, receiver);
+                const continuation_depth = self.threadContinuationDepth();
+                const returns = self.callFunctionValueWithPrefix(value, receiver) catch |err| {
+                    if (err == error.Yield and self.threadContinuationDepth() == continuation_depth) {
+                        try self.appendThreadContinuation(.{
+                            .kind = .resume_body,
+                            .local_name = null,
+                            .local_names = &.{},
+                            .assign_targets = &.{},
+                            .prefix_values = &.{},
+                            .pos = self.pos,
+                            .body_end = self.limit,
+                        });
+                    }
+                    return err;
+                };
                 self.last_call_values = returns;
                 value = if (returns.len == 0) Value{ .nil = {} } else returns[0];
                 context_name = null;
@@ -1236,12 +1353,19 @@ const Parser = struct {
                     continue;
                 }
                 const call_line = self.peek().line;
+                const continuation_depth = self.threadContinuationDepth();
                 const returns = self.callFunctionValue(value) catch |err| {
                     if (err == error.Yield) {
-                        if (self.vm.current_thread) |thread| {
-                            if (thread.continuation == null) {
-                                thread.continuation = .{ .local_name = null, .pos = self.pos, .body_end = self.limit };
-                            }
+                        if (self.threadContinuationDepth() == continuation_depth) {
+                            try self.appendThreadContinuation(.{
+                                .kind = .resume_body,
+                                .local_name = null,
+                                .local_names = &.{},
+                                .assign_targets = &.{},
+                                .prefix_values = &.{},
+                                .pos = self.pos,
+                                .body_end = self.limit,
+                            });
                         }
                         return err;
                     }
@@ -1625,7 +1749,7 @@ const Parser = struct {
                     .vm = try Vm.init(self.vm.allocator, self.vm.tokens),
                     .function = args[0].function,
                     .status = .suspended,
-                    .continuation = null,
+                    .continuations = .empty,
                     .yield_values = &.{},
                 };
                 const values = try self.vm.allocator.alloc(Value, 1);
@@ -1668,7 +1792,7 @@ const Parser = struct {
                     .vm = try Vm.init(self.vm.allocator, self.vm.tokens),
                     .function = args[0].function,
                     .status = .suspended,
-                    .continuation = null,
+                    .continuations = .empty,
                     .yield_values = &.{},
                 };
                 const values = try self.vm.allocator.alloc(Value, 1);
@@ -1701,6 +1825,18 @@ const Parser = struct {
         self.vm.runtime_error_message = null;
         self.vm.runtime_error_metamethod = null;
         const returns = self.invokeProtectedTarget(callee, args) catch |err| switch (err) {
+            error.Yield => {
+                try self.appendThreadContinuation(.{
+                    .kind = .pending_protected_call,
+                    .local_name = null,
+                    .local_names = &.{},
+                    .assign_targets = &.{},
+                    .prefix_values = &.{},
+                    .pos = self.pos,
+                    .body_end = self.limit,
+                });
+                return err;
+            },
             error.RuntimeError => {
                 const message = self.vm.runtime_error_message orelse "runtime error";
                 self.vm.runtime_error_message = saved_message;
@@ -1789,22 +1925,85 @@ const Parser = struct {
         return self.coroutineResult(true, returns);
     }
 
-    fn resumeThreadBody(_: *Parser, thread: *Thread, args: []const Value) anyerror![]const Value {
-        if (thread.continuation) |cont| {
-            thread.continuation = null;
-            if (cont.local_name) |name| {
-                try thread.vm.declare(name, if (args.len > 0) args[0] else Value{ .nil = {} });
+    fn resumeThreadBody(self: *Parser, thread: *Thread, args: []const Value) anyerror![]const Value {
+        if (thread.continuations.items.len > 0) {
+            var payload = args;
+            while (thread.continuations.items.len > 0) {
+                const cont = thread.continuations.orderedRemove(0);
+                payload = try self.resumeContinuation(thread, cont, payload);
             }
-            var body = Parser{ .vm = &thread.vm, .pos = cont.pos, .limit = cont.body_end, .evaluate = true };
-            const signal = try body.parseBlock();
-            return switch (signal) {
-                .normal => &.{},
-                .break_loop => error.UnsupportedFeature,
-                .returned => |values| values,
-            };
+            return payload;
         }
         var entry = Parser{ .vm = &thread.vm, .pos = 0, .limit = thread.vm.tokens.len, .evaluate = true };
         return entry.executeFunction(thread.function, args);
+    }
+
+    fn resumeContinuation(self: *Parser, thread: *Thread, cont: CoroutineContinuation, payload: []const Value) anyerror![]const Value {
+        switch (cont.kind) {
+            .resume_body => {
+                if (cont.local_name) |name| {
+                    try thread.vm.declare(name, if (payload.len > 0) payload[0] else Value{ .nil = {} });
+                }
+                var body = Parser{ .vm = &thread.vm, .pos = cont.pos, .limit = cont.body_end, .evaluate = true };
+                const signal = try body.parseBlock();
+                return self.finishSuspendedFunction(thread, signal);
+            },
+            .pending_local_assignment => {
+                const values = try self.combineContinuationValues(cont.prefix_values, payload);
+                for (cont.local_names, 0..) |name, i| {
+                    try thread.vm.declare(name, if (i < values.len) values[i] else Value{ .nil = {} });
+                }
+                var body = Parser{ .vm = &thread.vm, .pos = cont.pos, .limit = cont.body_end, .evaluate = true };
+                const signal = try body.parseBlock();
+                return self.finishSuspendedFunction(thread, signal);
+            },
+            .pending_assignment => {
+                const values = try self.combineContinuationValues(cont.prefix_values, payload);
+                var continuation_parser = Parser{ .vm = &thread.vm, .pos = cont.pos, .limit = cont.body_end, .evaluate = true };
+                for (cont.assign_targets, 0..) |target, i| {
+                    const value = if (i < values.len) values[i] else Value{ .nil = {} };
+                    switch (target.kind) {
+                        .name => try thread.vm.assignName(target.name, value),
+                        .string_field => try continuation_parser.setTableValue(target.table.?, .{ .string = target.key_string }, value, cont.pos),
+                        .index => try continuation_parser.setTableValue(target.table.?, target.key_value, value, cont.pos),
+                    }
+                }
+                const signal = try continuation_parser.parseBlock();
+                return self.finishSuspendedFunction(thread, signal);
+            },
+            .pending_return => {
+                const values = try self.combineContinuationValues(cont.prefix_values, payload);
+                self.popSuspendedFunction(thread);
+                return values;
+            },
+            .pending_protected_call => {
+                return self.coroutineResult(true, payload);
+            },
+        }
+    }
+
+    fn combineContinuationValues(self: *Parser, leading: []const Value, payload: []const Value) ![]const Value {
+        if (leading.len == 0) return payload;
+        const values = try self.vm.allocator.alloc(Value, leading.len + payload.len);
+        @memcpy(values[0..leading.len], leading);
+        @memcpy(values[leading.len..], payload);
+        return values;
+    }
+
+    fn finishSuspendedFunction(_: *Parser, thread: *Thread, signal: ExecSignal) anyerror![]const Value {
+        const returns = switch (signal) {
+            .normal => &.{},
+            .break_loop => return error.UnsupportedFeature,
+            .returned => |values| values,
+        };
+        if (thread.vm.frames.items.len > 0) _ = thread.vm.frames.pop();
+        if (thread.vm.scopes.items.len > 1) thread.vm.popScope();
+        return returns;
+    }
+
+    fn popSuspendedFunction(_: *Parser, thread: *Thread) void {
+        if (thread.vm.frames.items.len > 0) _ = thread.vm.frames.pop();
+        if (thread.vm.scopes.items.len > 1) thread.vm.popScope();
     }
 
     fn cleanupThreadFrame(_: *Parser, thread: *Thread) void {
