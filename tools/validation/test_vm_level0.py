@@ -150,6 +150,30 @@ class VmLevel0Tests(unittest.TestCase):
                 self.assertEqual(candidate.stdout, stock.stdout)
                 self.assertEqual(candidate.stderr, stock.stderr)
 
+    def test_no_host_lua_generic_for_and_ordered_comparisons_match_stock_lua(self):
+        cases = {
+            "ipairs-generic-for": 'for i,v in ipairs({"a","b"}) do print(i,v) end\n',
+            "pairs-array-generic-for": "local total = 0\nfor k,v in pairs({3,4,5}) do total = total + k + v end\nprint(total)\n",
+            "ordered-number-and-string": 'print(1 < 2, 2.0 <= 2, 3 > 2.5, 3 >= 3)\nprint("2" < "10", "abc" <= "abc", "b" > "aa", "b" >= "b")\n',
+            "mixed-string-number-rejected": 'print("2" < 10)\n',
+            "mixed-number-string-rejected": 'print(2 < "10")\n',
+            "unsupported-table-comparison-rejected": "print({} < {})\n",
+        }
+        for name, source in cases.items():
+            with self.subTest(case=name):
+                stock = run("./lua", "-", stdin=source)
+                candidate = run(
+                    "./zig-out/bin/lua-zig",
+                    "run",
+                    "-",
+                    stdin=source,
+                    env={"LUA_ZIG_RUN_NO_HOST_LUA": "1"},
+                )
+
+                self.assertEqual(candidate.returncode, stock.returncode, candidate.stderr)
+                self.assertEqual(candidate.stdout, stock.stdout)
+                self.assertEqual(candidate.stderr, stock.stderr)
+
     def test_baseline_oracle_vm_level0_corpus_command_reports_pass(self):
         completed = run(
             "python3",

@@ -1761,6 +1761,14 @@ fn stockStyleArithmeticError(allocator: std.mem.Allocator, chunk_name: []const u
     );
 }
 
+fn stockStyleComparisonError(allocator: std.mem.Allocator, chunk_name: []const u8, message: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(
+        allocator,
+        "./lua: {s}:1: {s}\nstack traceback:\n\t{s}:1: in main chunk\n\t[C]: in ?\n",
+        .{ chunk_name, message, chunk_name },
+    );
+}
+
 fn stockStyleNativeError(
     allocator: std.mem.Allocator,
     chunk_name: []const u8,
@@ -1780,6 +1788,11 @@ fn stockStyleNativeError(
     }
     if (std.mem.indexOf(u8, vm_stderr, "attempt to perform arithmetic") != null) {
         return try stockStyleArithmeticError(allocator, chunk_name);
+    }
+    if (std.mem.indexOf(u8, vm_stderr, "attempt to compare")) |idx| {
+        var message = vm_stderr[idx..];
+        if (std.mem.indexOfScalar(u8, message, '\n')) |newline| message = message[0..newline];
+        return try stockStyleComparisonError(allocator, chunk_name, message);
     }
     return vm_stderr;
 }

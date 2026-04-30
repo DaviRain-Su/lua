@@ -66,7 +66,7 @@ const Function = struct {
     lexical_scope_len: usize,
 };
 
-const Builtin = enum { print, select };
+const Builtin = enum { print, select, pairs, ipairs, next, ipairs_iter };
 
 const ValueTag = enum { nil, boolean, integer, float, string, table, function, builtin };
 
@@ -183,6 +183,7 @@ const Vm = struct {
     stdout: std.Io.Writer.Allocating,
     scopes: std.ArrayList(Scope),
     frames: std.ArrayList(CallFrame),
+    runtime_error_message: ?[]const u8,
 
     fn init(allocator: std.mem.Allocator, tokens: []const Token) !Vm {
         return initWithVarargs(allocator, tokens, &.{});
@@ -195,11 +196,15 @@ const Vm = struct {
             .stdout = std.Io.Writer.Allocating.init(allocator),
             .scopes = .empty,
             .frames = .empty,
+            .runtime_error_message = null,
         };
         try vm.pushScope(varargs, varargs.len > 0);
         const default_env = try Table.create(allocator);
         try default_env.setString("print", .{ .builtin = .print });
         try default_env.setString("select", .{ .builtin = .select });
+        try default_env.setString("pairs", .{ .builtin = .pairs });
+        try default_env.setString("ipairs", .{ .builtin = .ipairs });
+        try default_env.setString("next", .{ .builtin = .next });
         try vm.declare("_ENV", .{ .table = default_env });
         return vm;
     }
@@ -335,6 +340,10 @@ const Vm = struct {
             .function => try self.stdout.writer.writeAll("function"),
             .builtin => try self.stdout.writer.writeAll("function"),
         }
+    }
+
+    fn setRuntimeError(self: *Vm, message: []const u8) void {
+        self.runtime_error_message = message;
     }
 };
 
@@ -545,7 +554,7 @@ const Parser = struct {
 
     fn forStatement(self: *Parser) !ExecSignal {
         const name = try self.consumeIdent();
-        try self.consume(.assign);
+        if (!self.match(.assign)) return self.genericForStatement(name);
         const first_comma = try self.findToken(self.pos, self.limit, .comma);
         var start_parser = Parser{ .vm = self.vm, .pos = self.pos, .limit = first_comma, .evaluate = self.evaluate };
         const start = try valueToNumber(try start_parser.expression(0));
@@ -578,6 +587,52 @@ const Parser = struct {
                 .returned => return signal,
             }
         }
+        self.pos = end_idx + 1;
+        return .normal;
+    }
+
+    fn genericForStatement(self: *Parser, first_name: []const u8) !ExecSignal {
+        var names: std.ArrayList([]const u8) = .empty;
+        try names.append(self.vm.allocator, first_name);
+        while (self.match(.comma)) {
+            try names.append(self.vm.allocator, try self.consumeIdent());
+        }
+        if (!self.matchKeyword("in")) return error.UnsupportedFeature;
+        const do_idx = try self.findKeywordAtDepth(self.pos, self.limit, "do");
+        var expr_parser = Parser{ .vm = self.vm, .pos = self.pos, .limit = do_idx, .evaluate = self.evaluate };
+        var iterator_values: std.ArrayList(Value) = .empty;
+        try expr_parser.parseExpressionList(&iterator_values);
+        if (iterator_values.items.len == 0) return error.RuntimeError;
+        const iterator = iterator_values.items[0];
+        const state = if (iterator_values.items.len > 1) iterator_values.items[1] else Value{ .nil = {} };
+        var control = if (iterator_values.items.len > 2) iterator_values.items[2] else Value{ .nil = {} };
+
+        const body_start = do_idx + 1;
+        const end_idx = try self.findEnd(body_start);
+        try self.vm.pushScope(&.{}, false);
+        defer self.vm.popScope();
+        for (names.items) |loop_name| try self.vm.declare(loop_name, .{ .nil = {} });
+
+        var guard: usize = 0;
+        while (true) {
+            guard += 1;
+            if (guard > 100000) return error.UnsupportedFeature;
+            const returns = try self.invokeCallable(iterator, &.{ state, control });
+            if (returns.len == 0 or returns[0].isNil()) break;
+            control = returns[0];
+            for (names.items, 0..) |loop_name, i| {
+                try self.vm.assignName(loop_name, if (i < returns.len) returns[i] else Value{ .nil = {} });
+            }
+
+            var body = Parser{ .vm = self.vm, .pos = body_start, .limit = end_idx, .evaluate = self.evaluate };
+            const signal = try body.parseBlock();
+            switch (signal) {
+                .normal => {},
+                .break_loop => break,
+                .returned => return signal,
+            }
+        }
+
         self.pos = end_idx + 1;
         return .normal;
     }
@@ -704,7 +759,7 @@ const Parser = struct {
                 left = .{ .nil = {} };
                 continue;
             }
-            left = try applyBinary(self.vm.allocator, op, left, right);
+            left = try applyBinary(self.vm, op, left, right);
         }
         return left;
     }
@@ -777,12 +832,16 @@ const Parser = struct {
             try self.parseExpressionList(&args);
             try self.consume(.rparen);
         }
+        return self.invokeCallable(callee, args.items);
+    }
+
+    fn invokeCallable(self: *Parser, callee: Value, args: []const Value) anyerror![]const Value {
         const function = switch (callee) {
             .function => |f| f,
-            .builtin => |b| return self.executeBuiltin(b, args.items),
+            .builtin => |b| return self.executeBuiltin(b, args),
             else => return error.RuntimeError,
         };
-        return self.executeFunction(function, args.items);
+        return self.executeFunction(function, args);
     }
 
     fn executeBuiltin(self: *Parser, builtin: Builtin, args: []const Value) anyerror![]const Value {
@@ -816,7 +875,67 @@ const Parser = struct {
                 };
                 return payload[start..];
             },
+            .pairs => {
+                if (args.len == 0 or args[0] != .table) return error.RuntimeError;
+                const values = try self.vm.allocator.alloc(Value, 3);
+                values[0] = .{ .builtin = .next };
+                values[1] = args[0];
+                values[2] = .{ .nil = {} };
+                return values;
+            },
+            .ipairs => {
+                if (args.len == 0 or args[0] != .table) return error.RuntimeError;
+                const values = try self.vm.allocator.alloc(Value, 3);
+                values[0] = .{ .builtin = .ipairs_iter };
+                values[1] = args[0];
+                values[2] = .{ .integer = 0 };
+                return values;
+            },
+            .next => return self.nextTable(args),
+            .ipairs_iter => return self.ipairsIter(args),
         }
+    }
+
+    fn ipairsIter(self: *Parser, args: []const Value) ![]const Value {
+        if (args.len < 2 or args[0] != .table) return error.RuntimeError;
+        const index = try valueToInteger(args[1]) + 1;
+        const value = args[0].table.getIndex(index);
+        if (value.isNil()) {
+            const values = try self.vm.allocator.alloc(Value, 1);
+            values[0] = .{ .nil = {} };
+            return values;
+        }
+        const values = try self.vm.allocator.alloc(Value, 2);
+        values[0] = .{ .integer = index };
+        values[1] = value;
+        return values;
+    }
+
+    fn nextTable(self: *Parser, args: []const Value) ![]const Value {
+        if (args.len == 0 or args[0] != .table) return error.RuntimeError;
+        const table = args[0].table;
+        const key = if (args.len > 1) args[1] else Value{ .nil = {} };
+        const start_index: i64 = switch (key) {
+            .nil => 1,
+            .integer => |i| i + 1,
+            .float => |f| (try valueToInteger(.{ .float = f })) + 1,
+            else => return error.RuntimeError,
+        };
+        if (start_index >= 1) {
+            var idx = start_index;
+            while (idx <= table.length()) : (idx += 1) {
+                const value = table.getIndex(idx);
+                if (!value.isNil()) {
+                    const values = try self.vm.allocator.alloc(Value, 2);
+                    values[0] = .{ .integer = idx };
+                    values[1] = value;
+                    return values;
+                }
+            }
+        }
+        const values = try self.vm.allocator.alloc(Value, 1);
+        values[0] = .{ .nil = {} };
+        return values;
     }
 
     fn executeFunction(self: *Parser, function: *Function, args: []const Value) anyerror![]const Value {
@@ -1050,7 +1169,7 @@ pub fn runLevel0WithArgStrings(
     var vm = try Vm.initWithVarargs(allocator, token_slice, try varargs.toOwnedSlice(allocator));
     var parser = Parser{ .vm = &vm, .pos = 0, .limit = token_slice.len, .evaluate = true };
     _ = parser.parseBlock() catch |err| switch (err) {
-        error.RuntimeError => return runtimeError(allocator, "attempt to perform arithmetic on an unsupported value"),
+        error.RuntimeError => return runtimeError(allocator, vm.runtime_error_message orelse "attempt to perform arithmetic on an unsupported value"),
         error.SyntaxError => return syntaxError(allocator, "end-expected"),
         error.UnsupportedFeature => return unsupported(allocator, "outside-level0-subset"),
         else => return err,
@@ -1281,12 +1400,7 @@ const AdvancedScanState = struct {
         }
         if (std.mem.eql(u8, token.lexeme, "collectgarbage")) return .gc_weak_finalization;
         if (std.mem.eql(u8, token.lexeme, "coroutine")) return .coroutine_model;
-        if (std.mem.eql(u8, token.lexeme, "pairs") or
-            std.mem.eql(u8, token.lexeme, "ipairs") or
-            std.mem.eql(u8, token.lexeme, "next"))
-        {
-            return .table_iteration;
-        }
+        if (std.mem.eql(u8, token.lexeme, "next")) return .table_iteration;
         if (std.mem.eql(u8, token.lexeme, "close")) {
             const attr_left = i > 0 and tokens[i - 1].tag == .lt;
             const attr_right = i + 1 < tokens.len and tokens[i + 1].tag == .gt;
@@ -2087,11 +2201,11 @@ fn bitNot(value: Value) !Value {
     return .{ .integer = ~(try valueToInteger(value)) };
 }
 
-fn applyBinary(allocator: std.mem.Allocator, op: Token, left: Value, right: Value) !Value {
+fn applyBinary(vm: *Vm, op: Token, left: Value, right: Value) !Value {
     return switch (op.tag) {
         .plus, .minus, .star, .slash, .floor_div, .percent => arithmetic(op.tag, left, right),
-        .concat => concat(allocator, left, right),
-        .eq, .ne, .lt, .le, .gt, .ge => compare(op.tag, left, right),
+        .concat => concat(vm.allocator, left, right),
+        .eq, .ne, .lt, .le, .gt, .ge => compare(vm, op.tag, left, right),
         .amp, .pipe, .tilde, .shl, .shr => bitwise(op.tag, left, right),
         else => error.UnsupportedFeature,
     };
@@ -2138,11 +2252,11 @@ fn valueToStringForConcat(allocator: std.mem.Allocator, value: Value) ![]const u
     };
 }
 
-fn compare(tag: TokenTag, left: Value, right: Value) !Value {
+fn compare(vm: *Vm, tag: TokenTag, left: Value, right: Value) !Value {
     const result = switch (tag) {
         .eq => valuesEqual(left, right),
         .ne => !valuesEqual(left, right),
-        .lt, .le, .gt, .ge => try orderedCompare(tag, left, right),
+        .lt, .le, .gt, .ge => try orderedCompare(vm, tag, left, right),
         else => unreachable,
     };
     return .{ .boolean = result };
@@ -2167,15 +2281,49 @@ fn valuesEqual(left: Value, right: Value) bool {
     };
 }
 
-fn orderedCompare(tag: TokenTag, left: Value, right: Value) !bool {
-    const a = try valueToNumber(left);
-    const b = try valueToNumber(right);
-    return switch (tag) {
-        .lt => a < b,
-        .le => a <= b,
-        .gt => a > b,
-        .ge => a >= b,
-        else => unreachable,
+fn orderedCompare(vm: *Vm, tag: TokenTag, left: Value, right: Value) !bool {
+    if ((left == .integer or left == .float) and (right == .integer or right == .float)) {
+        const a = try valueToNumber(left);
+        const b = try valueToNumber(right);
+        return switch (tag) {
+            .lt => a < b,
+            .le => a <= b,
+            .gt => a > b,
+            .ge => a >= b,
+            else => unreachable,
+        };
+    }
+    if (left == .string and right == .string) {
+        const order = std.mem.order(u8, left.string, right.string);
+        return switch (tag) {
+            .lt => order == .lt,
+            .le => order != .gt,
+            .gt => order == .gt,
+            .ge => order != .lt,
+            else => unreachable,
+        };
+    }
+    vm.setRuntimeError(try orderedComparisonErrorMessage(vm.allocator, left, right));
+    return error.RuntimeError;
+}
+
+fn orderedComparisonErrorMessage(allocator: std.mem.Allocator, left: Value, right: Value) ![]const u8 {
+    const left_name = valueTypeName(left);
+    const right_name = valueTypeName(right);
+    if (std.meta.activeTag(left) == std.meta.activeTag(right)) {
+        return try std.fmt.allocPrint(allocator, "attempt to compare two {s} values", .{left_name});
+    }
+    return try std.fmt.allocPrint(allocator, "attempt to compare {s} with {s}", .{ left_name, right_name });
+}
+
+fn valueTypeName(value: Value) []const u8 {
+    return switch (value) {
+        .nil => "nil",
+        .boolean => "boolean",
+        .integer, .float => "number",
+        .string => "string",
+        .table => "table",
+        .function, .builtin => "function",
     };
 }
 
@@ -2324,7 +2472,6 @@ test "real advanced api globals still classify with stable fallback reasons" {
         .{ .source = "local t = {}\nif false then\n  local rawget = 1\nelseif true then\n  print(rawget(t, \"x\"))\nend\n", .reason = "raw-ops" },
         .{ .source = "local t = {}\nsetmetatable(t, {})\n", .reason = "metatable-dispatch" },
         .{ .source = "print(pcall(function() error(\"boom\") end))\n", .reason = "protected-error" },
-        .{ .source = "local t = {1, 2}\nfor k in pairs(t) do print(k) end\n", .reason = "table-iteration" },
     };
     for (snippets) |snippet| {
         const result = try runLevel0(arena.allocator(), snippet.source);
@@ -2333,6 +2480,46 @@ test "real advanced api globals still classify with stable fallback reasons" {
         try std.testing.expectEqualStrings(snippet.reason, result.unsupported_reason.?);
         _ = arena.reset(.retain_capacity);
     }
+}
+
+test "generic for over pairs and ipairs iterator triples executes natively" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const snippets = [_]struct { source: []const u8, stdout: []const u8 }{
+        .{
+            .source = "for i, v in ipairs({\"a\", \"b\"}) do print(i, v) end\n",
+            .stdout = "1\ta\n2\tb\n",
+        },
+        .{
+            .source = "local total = 0\nfor k, v in pairs({3, 4, 5}) do total = total + k + v end\nprint(total)\n",
+            .stdout = "18\n",
+        },
+    };
+    for (snippets) |snippet| {
+        const result = try runLevel0(arena.allocator(), snippet.source);
+        try std.testing.expectEqual(VmState.pass, result.state);
+        try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+        try std.testing.expectEqualSlices(u8, snippet.stdout, result.stdout);
+        try std.testing.expectEqualSlices(u8, "", result.stderr);
+        _ = arena.reset(.retain_capacity);
+    }
+}
+
+test "ordered comparisons follow lua number string and invalid operand semantics" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const success = try runLevel0(arena.allocator(),
+        \\print(1 < 2, 2.0 <= 2, 3 > 2.5, 3 >= 3)
+        \\print("2" < "10", "abc" <= "abc", "b" > "aa", "b" >= "b")
+        \\
+    );
+    try std.testing.expectEqual(VmState.pass, success.state);
+    try std.testing.expectEqualSlices(u8, "true\ttrue\ttrue\ttrue\nfalse\ttrue\ttrue\ttrue\n", success.stdout);
+    _ = arena.reset(.retain_capacity);
+
+    const invalid = try runLevel0(arena.allocator(), "print(\"2\" < 10)\n");
+    try std.testing.expectEqual(VmState.runtime_error, invalid.state);
+    try std.testing.expect(std.mem.indexOf(u8, invalid.stderr, "attempt to compare string with number") != null);
 }
 
 test "vm level1 closures and dynamic features are explicitly unsupported fallback" {
