@@ -1252,11 +1252,17 @@ const Parser = struct {
                 if (!mm.isNil()) return self.invokeMetamethod(mm, &.{ left, right });
             }
         }
-        if ((op.tag == .eq or op.tag == .ne) and std.meta.activeTag(left) == std.meta.activeTag(right)) {
-            const mm = self.binaryMetamethod(left, right, "__eq");
-            if (!mm.isNil()) {
-                const result = try self.invokeMetamethod(mm, &.{ left, right });
-                return .{ .boolean = if (op.tag == .eq) result.isTruthy() else !result.isTruthy() };
+        if (op.tag == .eq or op.tag == .ne) {
+            const raw_equal = valuesEqual(left, right);
+            if (raw_equal) {
+                return .{ .boolean = op.tag == .eq };
+            }
+            if (std.meta.activeTag(left) == std.meta.activeTag(right)) {
+                const mm = self.binaryMetamethod(left, right, "__eq");
+                if (!mm.isNil()) {
+                    const result = try self.invokeMetamethod(mm, &.{ left, right });
+                    return .{ .boolean = if (op.tag == .eq) result.isTruthy() else !result.isTruthy() };
+                }
             }
         }
         if ((op.tag == .lt or op.tag == .gt) and !binaryOperandsAreRawSupported(op.tag, left, right)) {

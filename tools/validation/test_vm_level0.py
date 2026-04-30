@@ -298,6 +298,28 @@ factory().run("chain", 99)
                 self.assertEqual(candidate.stdout, stock.stdout)
                 self.assertEqual(candidate.stderr, stock.stderr)
 
+    def test_no_host_lua_table_self_equality_and_distinct_eq_metamethod_match_stock_lua(self):
+        source = """local calls = 0
+local mt = { __eq = function() calls = calls + 1; return false end }
+local a = setmetatable({x = 1}, mt)
+local b = setmetatable({x = 1}, mt)
+print(a == a, a ~= a, calls)
+print(a == b, a ~= b, calls)
+"""
+        stock = run("./lua", "-", stdin=source)
+        candidate = run(
+            "./zig-out/bin/lua-zig",
+            "run",
+            "-",
+            stdin=source,
+            env={"LUA_ZIG_RUN_NO_HOST_LUA": "1"},
+        )
+
+        self.assertEqual(stock.returncode, 0, stock.stderr)
+        self.assertEqual(candidate.returncode, stock.returncode, candidate.stderr)
+        self.assertEqual(candidate.stdout, stock.stdout)
+        self.assertEqual(candidate.stderr, stock.stderr)
+
     def test_baseline_oracle_vm_level0_corpus_command_reports_pass(self):
         completed = run(
             "python3",

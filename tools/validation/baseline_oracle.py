@@ -862,6 +862,14 @@ print(outer(1)(4))
         "source": 'local mt = { __add = function(a, b) return a.x + b.x end, __lt = function(a, b) return a.x < b.x end, __eq = function() return true end }\nlocal a = setmetatable({x = 1}, mt)\nlocal b = setmetatable({x = 2}, mt)\nprint(a + b, a < b, a == b)\n',
     },
     {
+        "name": "metatable-table-self-equality-core",
+        "puc_file": "events.lua",
+        "validates": ["VAL-NATIVE-017"],
+        "coverage_tags": ["metatable:comparison", "metatable:raw-bypass"],
+        "description": "raw table identity equality wins before __eq while distinct tables still dispatch __eq",
+        "source": 'local calls = 0\nlocal mt = { __eq = function() calls = calls + 1; return false end }\nlocal a = setmetatable({x = 1}, mt)\nlocal b = setmetatable({x = 1}, mt)\nprint(a == a, a ~= a, calls)\nprint(a == b, a ~= b, calls)\n',
+    },
+    {
         "name": "metatable-len-concat-call-core",
         "puc_file": "events.lua",
         "validates": ["VAL-NATIVE-017"],
