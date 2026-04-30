@@ -24,7 +24,9 @@ const TokenTag = enum {
     lbracket,
     rbracket,
     comma,
+    semi,
     dot,
+    coloncolon,
     assign,
     plus,
     minus,
@@ -63,7 +65,7 @@ const Function = struct {
     lexical_scope_len: usize,
 };
 
-const Builtin = enum { print };
+const Builtin = enum { print, select };
 
 const ValueTag = enum { nil, boolean, integer, float, string, table, function, builtin };
 
@@ -196,6 +198,7 @@ const Vm = struct {
         try vm.pushScope(varargs, varargs.len > 0);
         const default_env = try Table.create(allocator);
         try default_env.setString("print", .{ .builtin = .print });
+        try default_env.setString("select", .{ .builtin = .select });
         try vm.declare("_ENV", .{ .table = default_env });
         return vm;
     }
@@ -343,6 +346,11 @@ const Parser = struct {
     fn parseBlock(self: *Parser) !ExecSignal {
         while (self.pos < self.limit and self.peek().tag != .eof) {
             if (self.peekKeyword("end") or self.peekKeyword("until") or self.peekKeyword("else")) break;
+            if (self.match(.semi)) continue;
+            if (self.peek().tag == .coloncolon) {
+                try self.skipLabel();
+                continue;
+            }
             const signal = try self.statement();
             switch (signal) {
                 .normal => {},
@@ -360,6 +368,7 @@ const Parser = struct {
         if (self.matchKeyword("while")) return self.whileStatement();
         if (self.matchKeyword("repeat")) return self.repeatStatement();
         if (self.matchKeyword("for")) return self.forStatement();
+        if (self.matchKeyword("goto")) return self.gotoStatement();
         if (self.matchKeyword("break")) return .break_loop;
         if (self.peek().tag == .ident and self.peekOffset(1).tag == .lparen) {
             _ = try self.expressionValues();
@@ -387,6 +396,27 @@ const Parser = struct {
             try self.vm.declare(name, value);
         }
         return .normal;
+    }
+
+    fn skipLabel(self: *Parser) !void {
+        try self.consume(.coloncolon);
+        _ = try self.consumeIdent();
+        try self.consume(.coloncolon);
+    }
+
+    fn gotoStatement(self: *Parser) !ExecSignal {
+        const label = try self.consumeIdent();
+        if (self.findLabel(self.pos, self.limit, label)) |idx| {
+            self.pos = idx;
+            try self.skipLabel();
+            return .normal;
+        }
+        if (self.findLabel(0, self.pos, label)) |idx| {
+            self.pos = idx;
+            try self.skipLabel();
+            return .normal;
+        }
+        return error.RuntimeError;
     }
 
     fn localFunctionStatement(self: *Parser) !ExecSignal {
@@ -764,6 +794,27 @@ const Parser = struct {
                 try self.vm.stdout.writer.writeAll("\n");
                 return &.{};
             },
+            .select => {
+                if (args.len == 0) return error.RuntimeError;
+                if (args[0] == .string and std.mem.eql(u8, args[0].string, "#")) {
+                    const values = try self.vm.allocator.alloc(Value, 1);
+                    values[0] = .{ .integer = @intCast(args.len - 1) };
+                    return values;
+                }
+                const raw_index = try valueToInteger(args[0]);
+                if (raw_index == 0) return error.RuntimeError;
+                const payload = args[1..];
+                const start: usize = if (raw_index > 0) blk: {
+                    const index: usize = @intCast(raw_index - 1);
+                    if (index > payload.len) break :blk payload.len;
+                    break :blk index;
+                } else blk: {
+                    const offset: usize = @intCast(-raw_index);
+                    if (offset > payload.len) return error.RuntimeError;
+                    break :blk payload.len - offset;
+                };
+                return payload[start..];
+            },
         }
     }
 
@@ -826,7 +877,7 @@ const Parser = struct {
             } else {
                 const start = self.pos;
                 const first_value = try self.expression(0);
-                if (self.peek().tag == .comma) {
+                if (self.peek().tag == .comma or self.peek().tag == .semi) {
                     try table.appendArray(self.vm.allocator, first_value);
                 } else {
                     self.pos = start;
@@ -834,7 +885,7 @@ const Parser = struct {
                     for (values) |value| try table.appendArray(self.vm.allocator, value);
                 }
             }
-            if (self.match(.comma)) {
+            if (self.match(.comma) or self.match(.semi)) {
                 if (self.match(.rbrace)) break;
                 continue;
             }
@@ -859,7 +910,7 @@ const Parser = struct {
                 depth -= 1;
             }
         }
-        return error.UnsupportedFeature;
+        return error.SyntaxError;
     }
 
     fn findUntil(self: *Parser, start: usize) !usize {
@@ -909,6 +960,21 @@ const Parser = struct {
         }
         return error.UnsupportedFeature;
     }
+
+    fn findLabel(self: *Parser, start: usize, end: usize, label: []const u8) ?usize {
+        var i = start;
+        while (i + 2 < end) : (i += 1) {
+            if (self.tokens()[i].tag == .coloncolon and
+                self.tokens()[i + 1].tag == .ident and
+                std.mem.eql(u8, self.tokens()[i + 1].lexeme, label) and
+                self.tokens()[i + 2].tag == .coloncolon)
+            {
+                return i;
+            }
+        }
+        return null;
+    }
+
 
     fn tokens(self: *Parser) []const Token {
         return self.vm.tokens;
@@ -981,6 +1047,7 @@ pub fn runLevel0WithArgStrings(
     var parser = Parser{ .vm = &vm, .pos = 0, .limit = token_slice.len, .evaluate = true };
     _ = parser.parseBlock() catch |err| switch (err) {
         error.RuntimeError => return runtimeError(allocator, "attempt to perform arithmetic on an unsupported value"),
+        error.SyntaxError => return syntaxError(allocator, "end-expected"),
         error.UnsupportedFeature => return unsupported(allocator, "outside-level0-subset"),
         else => return err,
     };
@@ -1583,6 +1650,10 @@ fn runtimeError(allocator: std.mem.Allocator, message: []const u8) !VmResult {
     return .{ .state = .runtime_error, .stdout = "", .stderr = try std.fmt.allocPrint(allocator, "ziglua-vm: {s}\n", .{message}), .exit_code = 1, .unsupported_reason = null };
 }
 
+fn syntaxError(allocator: std.mem.Allocator, reason: []const u8) !VmResult {
+    return .{ .state = .runtime_error, .stdout = "", .stderr = try std.fmt.allocPrint(allocator, "ziglua-vm: syntax-error:{s}\n", .{reason}), .exit_code = 1, .unsupported_reason = null };
+}
+
 fn lex(allocator: std.mem.Allocator, source: []const u8) !std.ArrayList(Token) {
     var tokens: std.ArrayList(Token) = .empty;
     var i: usize = 0;
@@ -1590,6 +1661,18 @@ fn lex(allocator: std.mem.Allocator, source: []const u8) !std.ArrayList(Token) {
         const c = source[i];
         if (std.ascii.isWhitespace(c)) {
             i += 1;
+            continue;
+        }
+        if (c == '-' and i + 1 < source.len and source[i + 1] == '-') {
+            i += 2;
+            if (i + 1 < source.len and source[i] == '[' and source[i + 1] == '[') {
+                i += 2;
+                while (i + 1 < source.len and !(source[i] == ']' and source[i + 1] == ']')) i += 1;
+                if (i + 1 >= source.len) return error.UnsupportedFeature;
+                i += 2;
+            } else {
+                while (i < source.len and source[i] != '\n') i += 1;
+            }
             continue;
         }
         if (std.ascii.isAlphabetic(c) or c == '_') {
@@ -1602,9 +1685,25 @@ fn lex(allocator: std.mem.Allocator, source: []const u8) !std.ArrayList(Token) {
         }
         if (std.ascii.isDigit(c)) {
             const start = i;
+            if (c == '0' and i + 1 < source.len and (source[i + 1] == 'x' or source[i + 1] == 'X')) {
+                i += 2;
+                while (i < source.len and std.ascii.isHex(source[i])) i += 1;
+                if (i == start + 2) return error.UnsupportedFeature;
+                try tokens.append(allocator, .{ .tag = .number, .lexeme = source[start..i] });
+                continue;
+            }
             i += 1;
             while (i < source.len and (std.ascii.isDigit(source[i]) or source[i] == '.')) i += 1;
             try tokens.append(allocator, .{ .tag = .number, .lexeme = source[start..i] });
+            continue;
+        }
+        if (c == '[' and i + 1 < source.len and source[i + 1] == '[') {
+            i += 2;
+            const start = i;
+            while (i + 1 < source.len and !(source[i] == ']' and source[i + 1] == ']')) i += 1;
+            if (i + 1 >= source.len) return error.UnsupportedFeature;
+            try tokens.append(allocator, .{ .tag = .string, .lexeme = source[start..i] });
+            i += 2;
             continue;
         }
         if (c == '"' or c == '\'') {
@@ -1642,6 +1741,11 @@ fn lex(allocator: std.mem.Allocator, source: []const u8) !std.ArrayList(Token) {
         }
         const two = if (i + 1 < source.len) source[i .. i + 2] else "";
         if (two.len == 2) {
+            if (std.mem.eql(u8, two, "::")) {
+                try tokens.append(allocator, .{ .tag = .coloncolon, .lexeme = two });
+                i += 2;
+                continue;
+            }
             if (std.mem.eql(u8, two, "//")) {
                 try tokens.append(allocator, .{ .tag = .floor_div, .lexeme = two });
                 i += 2;
@@ -1691,6 +1795,7 @@ fn lex(allocator: std.mem.Allocator, source: []const u8) !std.ArrayList(Token) {
             '[' => .lbracket,
             ']' => .rbracket,
             ',' => .comma,
+            ';' => .semi,
             '.' => .dot,
             '=' => .assign,
             '+' => .plus,
@@ -1713,7 +1818,7 @@ fn lex(allocator: std.mem.Allocator, source: []const u8) !std.ArrayList(Token) {
 }
 
 fn isKeyword(word: []const u8) bool {
-    const words = [_][]const u8{ "and", "break", "do", "else", "end", "false", "for", "function", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while" };
+    const words = [_][]const u8{ "and", "break", "do", "else", "end", "false", "for", "function", "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while" };
     for (words) |kw| if (std.mem.eql(u8, word, kw)) return true;
     return false;
 }
@@ -1740,6 +1845,9 @@ fn binaryPrecedence(token: Token) u8 {
 }
 
 fn parseNumber(text: []const u8) !Value {
+    if (std.mem.startsWith(u8, text, "0x") or std.mem.startsWith(u8, text, "0X")) {
+        return .{ .integer = try std.fmt.parseInt(i64, text[2..], 16) };
+    }
     if (std.mem.indexOfScalar(u8, text, '.')) |_| return .{ .float = try std.fmt.parseFloat(f64, text) };
     return .{ .integer = try std.fmt.parseInt(i64, text, 10) };
 }
@@ -1761,7 +1869,13 @@ fn valueToNumber(value: Value) !f64 {
 fn valueToInteger(value: Value) !i64 {
     return switch (value) {
         .integer => |i| i,
-        .float => |f| @intFromFloat(f),
+        .float => |f| {
+            if (f != f) return error.RuntimeError;
+            if (@floor(f) != f) return error.RuntimeError;
+            if (f < @as(f64, @floatFromInt(std.math.minInt(i64))) or
+                f > @as(f64, @floatFromInt(std.math.maxInt(i64)))) return error.RuntimeError;
+            return @intFromFloat(f);
+        },
         else => error.RuntimeError,
     };
 }
@@ -1823,16 +1937,16 @@ fn arithmetic(tag: TokenTag, left: Value, right: Value) !Value {
 }
 
 fn concat(allocator: std.mem.Allocator, left: Value, right: Value) !Value {
-    const l = try valueToStringForConcat(left);
-    const r = try valueToStringForConcat(right);
+    const l = try valueToStringForConcat(allocator, left);
+    const r = try valueToStringForConcat(allocator, right);
     return .{ .string = try std.mem.concat(allocator, u8, &.{ l, r }) };
 }
 
-fn valueToStringForConcat(value: Value) ![]const u8 {
+fn valueToStringForConcat(allocator: std.mem.Allocator, value: Value) ![]const u8 {
     return switch (value) {
         .string => |s| s,
-        .integer => error.UnsupportedFeature,
-        .float => error.UnsupportedFeature,
+        .integer => |i| try std.fmt.allocPrint(allocator, "{d}", .{i}),
+        .float => |f| try std.fmt.allocPrint(allocator, "{d}", .{f}),
         else => error.RuntimeError,
     };
 }
@@ -1885,10 +1999,24 @@ fn bitwise(tag: TokenTag, left: Value, right: Value) !Value {
         .amp => a & b,
         .pipe => a | b,
         .tilde => a ^ b,
-        .shl => a << @intCast(b),
-        .shr => a >> @intCast(b),
+        .shl => shiftBits(a, b),
+        .shr => shiftBits(a, -b),
         else => unreachable,
     } };
+}
+
+fn shiftBits(value: i64, amount: i64) i64 {
+    if (amount == 0) return value;
+    const bits: u64 = @bitCast(value);
+    if (amount > 0) {
+        if (amount >= 64) return 0;
+        const shift: u6 = @intCast(amount);
+        return @bitCast(bits << shift);
+    }
+    const positive = -amount;
+    if (positive >= 64) return 0;
+    const shift: u6 = @intCast(positive);
+    return @bitCast(bits >> shift);
 }
 
 test "vm level0 literals locals arithmetic strings tables control flow and bitwise" {
@@ -1896,16 +2024,19 @@ test "vm level0 literals locals arithmetic strings tables control flow and bitwi
     defer arena.deinit();
     const snippets = [_]struct { source: []const u8, stdout: []const u8 }{
         .{ .source = "print(nil, true, false, 42, 3.5, \"literal\")\n", .stdout = "nil\ttrue\tfalse\t42\t3.5\tliteral\n" },
+        .{ .source = "print([[long literal]], 0x10)\nlocal s = 1; local t = 2; print(s + t)\n", .stdout = "long literal\t16\n3\n" },
         .{ .source = "local x = 1\nlocal y = x + 1\nprint(y, x)\ndo\n  local x = y + 1\n  print(x)\nend\n", .stdout = "2\t1\n3\n" },
         .{ .source = "local a, b = 7, 2\nprint(a + b - 2, a - b, a * b - 2, a / b, a // b, a % b, -a)\n", .stdout = "7\t5\t12\t3.5\t3\t1\t-7\n" },
         .{ .source = "local s = \"lua\" .. \"-\" .. \"55\"\nprint(s, #s, \"a\\n\" == \"a\\n\")\n", .stdout = "lua-55\t6\ttrue\n" },
         .{ .source = "local t = {1, 2, 3, name = \"lua\"}\nt[2] = 22\nt.extra = \"three\"\nprint(t[1], t[2], t.extra, #t)\n", .stdout = "1\t22\tthree\t3\n" },
         .{ .source = "local sum = 0\nfor i = 1, 5 do\n  if i % 2 == 0 then sum = sum + i end\nend\nlocal n = 0\nwhile n < 3 do n = n + 1 end\nrepeat\n  sum = sum + n\n  break\nuntil false\nprint(sum + ((true and 10) or 0))\nprint(n)\n", .stdout = "19\n3\n" },
         .{ .source = "local a, b = 6, 3\nprint(a > b, a >= 6, b < a, b <= 3, a == 6, a ~= b)\nprint((false or \"fallback\") and \"ok\")\nprint(a & b, a | b, a ~ b, a << 1, a >> 1, ~b)\n", .stdout = "true\ttrue\ttrue\ttrue\ttrue\ttrue\nok\n2\t7\t5\t12\t3\t-4\n" },
+        .{ .source = "print(1 << 63, 1 << 64, -1 >> 1, -1 >> 64, 8 << -1, 8 >> -1)\nprint(15.0 & 7, 15.0 | 2, 8.0 << 1)\n", .stdout = "-9223372036854775808\t0\t9223372036854775807\t0\t4\t16\n7\t15\t16\n" },
         .{ .source = "local value = \"initial\"\nif false then\n  value = \"then-branch\"\nelse\n  value = \"else-branch\"\nend\nprint(value)\n", .stdout = "else-branch\n" },
         .{ .source = "local i = \"outer\"\nlocal total = 0\nfor i = 1, 3 do\n  total = total + i\nend\nprint(i, total)\n", .stdout = "outer\t6\n" },
         .{ .source = "local a = false and (missing + 1)\nlocal b = true or (missing + 1)\nprint(a, b)\n", .stdout = "false\ttrue\n" },
         .{ .source = "print(1 == 1.0, 1 ~= 1.0)\n", .stdout = "true\tfalse\n" },
+        .{ .source = "local x = 0\ngoto skip\nx = 99\n::skip::\nx = x + 1\nprint(x)\n", .stdout = "1\n" },
         .{ .source = "local preload_value = \"debug words are data\"\nlocal loader_count = 9\nprint(preload_value, loader_count)\n", .stdout = "debug words are data\t9\n" },
     };
     for (snippets) |snippet| {
@@ -1924,6 +2055,7 @@ test "vm level1 direct calls varargs multi returns env globals and tail calls" {
         .{ .source = "local function add(a, b) return a + b end\nlocal function twice(x) return add(x, x) end\nprint(add(twice(5), 5))\n", .stdout = "15\n" },
         .{ .source = "local x = 0\nlocal function setx() x = 3 end\nsetx()\nprint(x)\n", .stdout = "3\n" },
         .{ .source = "local function count(...)\n  local t = {...}\n  return #t, t[1], t[#t]\nend\nprint(count(1, 2, 3, 4))\n", .stdout = "4\t1\t4\n" },
+        .{ .source = "local function pack(...)\n  local n = select(\"#\", ...)\n  local a, b, c = ...\n  return n, a, c\nend\nprint(pack(nil, \"x\", 3))\n", .stdout = "3\tnil\t3\n" },
         .{ .source = "local function outer(...)\n  local function inner(...) return ... end\n  return inner()\nend\nprint(outer(1, 2))\n", .stdout = "\n" },
         .{ .source = "local function values() return 1, 2, 3 end\nlocal a, b, c = values()\nlocal d = 4\nlocal t = {values()}\nprint(a, b, c, d, #t)\n", .stdout = "1\t2\t3\t4\t3\n" },
         .{ .source = "local function finish(x) return \"done\", x end\nlocal function bounce(x)\n  if x == 0 then return finish(9) end\n  return bounce(x - 1)\nend\nprint(bounce(3))\n", .stdout = "done\t9\n" },

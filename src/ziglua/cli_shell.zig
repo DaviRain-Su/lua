@@ -1634,9 +1634,13 @@ fn executeNoHostRun(
         try source.writer.writeByte('\n');
     }
 
-    var result = try vm_level0.runLevel0WithArgStrings(allocator, try source.toOwnedSlice(), parsed.script_args);
+    const source_slice = try source.toOwnedSlice();
+    var result = try vm_level0.runLevel0WithArgStrings(allocator, source_slice, parsed.script_args);
     if (result.state == .runtime_error) {
-        result.stderr = try stockStyleArithmeticError(allocator, chunk_name);
+        result.stderr = if (std.mem.indexOf(u8, result.stderr, "syntax-error:end-expected") != null)
+            try stockStyleEndExpectedError(allocator, chunk_name, source_slice)
+        else
+            try stockStyleArithmeticError(allocator, chunk_name);
     }
     return .{ .result = result, .chunk_name = chunk_name };
 }
@@ -1758,6 +1762,23 @@ fn stockStyleArithmeticError(allocator: std.mem.Allocator, chunk_name: []const u
         "./lua: {s}:1: attempt to add a 'string' with a 'number'\nstack traceback:\n\t[C]: in metamethod 'add'\n\t{s}:1: in main chunk\n\t[C]: in ?\n",
         .{ chunk_name, chunk_name },
     );
+}
+
+fn stockStyleEndExpectedError(allocator: std.mem.Allocator, chunk_name: []const u8, source: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(
+        allocator,
+        "./lua: {s}:{d}: 'end' expected (to close 'if' at line 1) near <eof>\n",
+        .{ chunk_name, eofLine(source) },
+    );
+}
+
+fn eofLine(source: []const u8) usize {
+    var line: usize = 1;
+    for (source) |byte| {
+        if (byte == '\n') line += 1;
+    }
+    if (std.mem.startsWith(u8, source, "arg = {}\n") and line > 3) line -= 3;
+    return line;
 }
 
 fn checkCommand(

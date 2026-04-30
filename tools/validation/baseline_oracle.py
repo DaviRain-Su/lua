@@ -35,11 +35,70 @@ DARWIN_BUILD_OVERRIDES = {
 }
 DEFAULT_ZIG_VM_CANDIDATE_COMMAND = ["./zig-out/bin/ziglua-vm"]
 DEFAULT_ZIG_AOT_CANDIDATE_COMMAND = ["./zig-out/bin/ziglua-aot"]
+DEFAULT_LUA_ZIG_NATIVE_RUN_COMMAND = ["./zig-out/bin/lua-zig", "run", "-"]
 ZIG_VM_CANDIDATE_REFRESH_COMMAND = ["zig", "build", "--summary", "all"]
 ZIG_AOT_CANDIDATE_REFRESH_COMMAND = ["zig", "build", "--summary", "all"]
 SELECTED_TESTS = ["constructs.lua", "vararg.lua"]
 VM_SELECTED_PUC_TESTS = ["constructs.lua", "code.lua", "calls.lua", "closure.lua", "math.lua", "strings.lua"]
 CROSS_AREA_RUNTIME_SMOKE_SNIPPET = "print(1 + 2)\n"
+NATIVE_CORE_LANGUAGE_CASES = [
+    {
+        "name": "literals-core",
+        "puc_file": "literals.lua",
+        "validates": ["VAL-NATIVE-004"],
+        "description": "nil/boolean/numeric/string/long-string/table-constructor literals",
+        "source": 'print(nil, true, false, 123, 3.25, "a\\n", [[long string]])\nlocal t = {10; 20; name = "lua"}\nprint(t[1], t[2], t.name, #t)\n',
+    },
+    {
+        "name": "constructs-core",
+        "puc_file": "constructs.lua",
+        "validates": ["VAL-NATIVE-005"],
+        "description": "precedence, if/else, numeric for, while, repeat, break, length, concatenation, and comparisons",
+        "source": 'local s = "lua" .. "-" .. 55\nlocal total = 0; for i = 1, 4 do if i % 2 == 0 then total = total + i else total = total + 1 end end\nlocal n = 0; while n < 2 do n = n + 1 end; repeat total = total + n; break until false\nprint(s, #s, total, n, total >= n)\n',
+    },
+    {
+        "name": "vararg-core",
+        "puc_file": "vararg.lua",
+        "validates": ["VAL-NATIVE-006"],
+        "description": "vararg capture, select count, nil preservation, and return adjustment",
+        "source": 'local function pack(...)\n  local n = select("#", ...)\n  local a, b, c = ...\n  return n, a, c\nend\nprint(pack(nil, "x", 3))\n',
+    },
+    {
+        "name": "bitwise-core",
+        "puc_file": "bitwise.lua",
+        "validates": ["VAL-NATIVE-007"],
+        "description": "bitwise operators, precedence, signed edge cases, and integer-width shift behavior",
+        "source": 'local a, b = 0x0f, 0x33\nprint(a & b, a | b, a ~ b, a << 2, b >> 1, ~a)\nprint(1 << 63, 1 << 64, -1 >> 1, -1 >> 64, 8 << -1, 8 >> -1)\n',
+    },
+    {
+        "name": "bwcoercion-core",
+        "puc_file": "bwcoercion.lua",
+        "validates": ["VAL-NATIVE-008"],
+        "description": "integer coercion for integral floats in bitwise operators",
+        "source": "print(15.0 & 7, 15.0 | 2, 8.0 << 1)\n",
+    },
+    {
+        "name": "goto-core",
+        "puc_file": "goto.lua",
+        "validates": ["VAL-NATIVE-009"],
+        "description": "forward goto and label execution without running skipped statements",
+        "source": 'local x = 0\ngoto skip\nx = 99\n::skip::\nx = x + 1\nprint(x)\n',
+    },
+    {
+        "name": "runtime-error-core",
+        "puc_file": "errors.lua",
+        "validates": ["VAL-NATIVE-010"],
+        "description": "runtime error stderr and exit-status parity for a core arithmetic failure",
+        "source": 'local x = "bad" + 1\nprint(x)\n',
+    },
+    {
+        "name": "syntax-error-core",
+        "puc_file": "errors.lua",
+        "validates": ["VAL-NATIVE-010"],
+        "description": "syntax error stderr and exit-status parity for a missing block terminator",
+        "source": 'if true then print("x")\n',
+    },
+]
 VM_DYNAMIC_FALLBACK_FIXTURES = [
     {
         "name": "dynamic-load",
@@ -1161,6 +1220,119 @@ class BaselineOracle:
             "classification": "Selected PUC VM harness accounts pass and unsupported separately; unsupported diagnostics are not counted as semantic pass.",
         }
         self.write_json("vm-selected-puc/summary.json", summary)
+        return summary
+
+    def run_native_core_language(self, candidate_command: list[str]) -> dict[str, object]:
+        refresh = self.runner(ZIG_VM_CANDIDATE_REFRESH_COMMAND, self.repo, {}, None, None)
+        refresh_file = self.write_result("native-core-language-candidate-refresh", refresh)
+        if refresh.exit_code != 0:
+            summary = {
+                "state": "fail",
+                "candidate_command": candidate_command,
+                "candidate_refresh": {
+                    "state": "fail",
+                    "refresh_command": ZIG_VM_CANDIDATE_REFRESH_COMMAND,
+                    "result_file": refresh_file,
+                    "result": refresh.to_dict(),
+                },
+                "cases": [],
+                "case_count": 0,
+                "pass_count": 0,
+                "fail_count": len(NATIVE_CORE_LANGUAGE_CASES),
+                "fallback_count": 0,
+                "unsupported_count": 0,
+                "classification": "Native core language validation was not run because the lua-zig candidate failed to refresh.",
+            }
+            self.write_json("native-core-language/summary.json", summary)
+            return summary
+
+        entries = []
+        state = "pass"
+        pass_count = 0
+        fail_count = 0
+        fallback_count = 0
+        unsupported_count = 0
+        validated_ids: set[str] = set()
+        env = {"LUA_ZIG_RUN_NO_HOST_LUA": "1"}
+        for case in NATIVE_CORE_LANGUAGE_CASES:
+            name = str(case["name"])
+            source = str(case["source"])
+            stock = self.runner(["./lua", "-"], self.repo, {}, source, None)
+            candidate = self.runner(candidate_command, self.repo, env, source, None)
+            stock_file = self.write_result(f"native-core-stock-{name}", stock)
+            candidate_file = self.write_result(f"native-core-candidate-{name}", candidate)
+            diffs = compare_cli_results(stock.to_dict(), candidate.to_dict())
+            fallback_observed = "fallback" in candidate.stderr.lower() or "stock-lua-fallback" in candidate.stdout
+            unsupported_observed = "unsupported" in candidate.stderr.lower() or "native-unsupported" in candidate.stdout
+            case_state = "pass"
+            errors: list[str] = []
+            if diffs:
+                errors.append("stock/native stdout, stderr, or exit_code differed")
+            if fallback_observed:
+                errors.append("fallback marker observed in native core validation")
+            if unsupported_observed:
+                errors.append("unsupported marker observed in native core validation")
+            if candidate.exit_code != stock.exit_code:
+                errors.append("candidate exit status does not match stock Lua")
+            if errors:
+                case_state = "fail"
+                state = "fail"
+                fail_count += 1
+            else:
+                pass_count += 1
+                validated_ids.update(str(assertion) for assertion in case["validates"])
+            if fallback_observed:
+                fallback_count += 1
+            if unsupported_observed:
+                unsupported_count += 1
+            entries.append(
+                {
+                    "name": name,
+                    "puc_file": case["puc_file"],
+                    "description": case["description"],
+                    "validates": case["validates"],
+                    "state": case_state,
+                    "errors": errors,
+                    "stock_result_file": stock_file,
+                    "candidate_result_file": candidate_file,
+                    "stock": stock.to_dict(),
+                    "candidate": candidate.to_dict(),
+                    "diffs": diffs,
+                    "implementation_mode": "native",
+                    "no_host_lua": True,
+                    "fallback_observed": fallback_observed,
+                    "unsupported_observed": unsupported_observed,
+                }
+            )
+
+        required_ids = {f"VAL-NATIVE-{i:03d}" for i in range(4, 11)}
+        missing_ids = sorted(required_ids.difference(validated_ids))
+        if missing_ids:
+            state = "fail"
+        summary = {
+            "state": state,
+            "candidate_command": candidate_command,
+            "candidate_env": env,
+            "candidate_refresh": {
+                "state": "pass",
+                "refresh_command": ZIG_VM_CANDIDATE_REFRESH_COMMAND,
+                "result_file": refresh_file,
+                "result": refresh.to_dict(),
+            },
+            "cases": entries,
+            "case_count": len(entries),
+            "pass_count": pass_count,
+            "fail_count": fail_count,
+            "fallback_count": fallback_count,
+            "unsupported_count": unsupported_count,
+            "validated_assertions": sorted(validated_ids),
+            "missing_assertions": missing_ids,
+            "staged_puc_files": sorted({str(case["puc_file"]) for case in NATIVE_CORE_LANGUAGE_CASES}),
+            "required_puc_files": ["bitwise.lua", "bwcoercion.lua", "constructs.lua", "errors.lua", "goto.lua", "literals.lua", "vararg.lua"],
+            "compared_fields": ["stdout", "stderr", "exit_code"],
+            "classification": "M4 staged PUC-derived core language snippets are executed through lua-zig run with LUA_ZIG_RUN_NO_HOST_LUA=1; fallback and unsupported markers fail native compatibility accounting.",
+        }
+        self.write_json("native-core-language/summary.json", summary)
         return summary
 
     def run_aot_eligibility(self, aot_command: list[str]) -> dict[str, object]:
@@ -3183,6 +3355,14 @@ def validator_registry(repo: Path) -> dict[str, object]:
             "requires_service": False,
             "artifacts_or_channels": ["stdout", "stderr", "exit_code", "build/validation/baseline-oracle/run-parity/summary.json"],
         },
+        {
+            "id": "native-core-language",
+            "description": "Run M4 staged PUC-derived literals, constructs, vararg, bitwise/coercion, goto, and error parity snippets through fallback-disabled lua-zig native execution.",
+            "command": f"python3 {script} --repo {repo} native-core-language",
+            "surface": "cli",
+            "requires_service": False,
+            "artifacts_or_channels": ["stdout", "stderr", "exit_code", "build/validation/baseline-oracle/native-core-language/summary.json"],
+        },
     ]
     return {
         "state": "pass",
@@ -3550,6 +3730,8 @@ def build_parser() -> argparse.ArgumentParser:
     cross_area.add_argument("--vm-command", default=shlex.join(DEFAULT_ZIG_VM_CANDIDATE_COMMAND), help="Zig VM command that reads Lua source from stdin")
     cross_area.add_argument("--aot-command", default=shlex.join(DEFAULT_ZIG_AOT_CANDIDATE_COMMAND), help="Zig AOT command that reads Lua source from stdin")
     subparsers.add_parser("lua-zig-run-cli-parity", help="compare lua-zig run source forms against stock ./lua")
+    native_core = subparsers.add_parser("native-core-language", help="compare M4 staged PUC-derived core language snippets through fallback-disabled lua-zig native execution")
+    native_core.add_argument("--candidate-command", default=shlex.join(DEFAULT_LUA_ZIG_NATIVE_RUN_COMMAND), help="lua-zig native run command that reads Lua source from stdin")
     subparsers.add_parser("list-validators", help="list CLI-only validators and their report/artifact surfaces")
     aot_errors = subparsers.add_parser("aot-runtime-error-parity", help="validate deterministic AOT runtime-error parity under normalized policy")
     aot_errors.add_argument("--vm-command", default=shlex.join(DEFAULT_ZIG_VM_CANDIDATE_COMMAND), help="Zig VM command that reads Lua source from stdin")
@@ -3627,6 +3809,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "lua-zig-run-cli-parity":
         return print_summary(oracle.run_lua_zig_run_cli_parity())
+    if args.command == "native-core-language":
+        return print_summary(oracle.run_native_core_language(shlex.split(args.candidate_command)))
     if args.command == "list-validators":
         return print_summary(validator_registry(args.repo.resolve()))
     if args.command == "aot-runtime-error-parity":
