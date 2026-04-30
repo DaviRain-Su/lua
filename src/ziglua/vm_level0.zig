@@ -184,6 +184,10 @@ const Vm = struct {
     scopes: std.ArrayList(Scope),
     frames: std.ArrayList(CallFrame),
     runtime_error_message: ?[]const u8,
+    runtime_error_line: usize,
+    runtime_error_metamethod: ?[]const u8,
+    syntax_error_message: ?[]const u8,
+    syntax_error_line: usize,
 
     fn init(allocator: std.mem.Allocator, tokens: []const Token) !Vm {
         return initWithVarargs(allocator, tokens, &.{});
@@ -197,6 +201,10 @@ const Vm = struct {
             .scopes = .empty,
             .frames = .empty,
             .runtime_error_message = null,
+            .runtime_error_line = 1,
+            .runtime_error_metamethod = null,
+            .syntax_error_message = null,
+            .syntax_error_line = 1,
         };
         try vm.pushScope(varargs, varargs.len > 0);
         const default_env = try Table.create(allocator);
@@ -248,21 +256,25 @@ const Vm = struct {
     }
 
     fn lookup(self: *Vm, name: []const u8) Value {
+        return self.lookupDetailed(name).value;
+    }
+
+    fn lookupDetailed(self: *Vm, name: []const u8) struct { value: Value, scope: ValueScope } {
         if (self.activeFrame()) |frame| {
-            if (self.lookupNameInScopeRange(name, self.scopes.items.len, frame.scope_start)) |value| return value;
-            if (self.lookupNameInScopeRange(name, @min(frame.lexical_scope_len, self.scopes.items.len), 0)) |value| return value;
+            if (self.lookupNameInScopeRange(name, self.scopes.items.len, frame.scope_start)) |value| return .{ .value = value, .scope = .local };
+            if (self.lookupNameInScopeRange(name, @min(frame.lexical_scope_len, self.scopes.items.len), 0)) |value| return .{ .value = value, .scope = .local };
             if (self.environmentForFrame(frame)) |env| {
                 const value = env.getString(name);
-                if (!value.isNil()) return value;
+                if (!value.isNil()) return .{ .value = value, .scope = .global };
             }
         } else {
-            if (self.lookupNameInScopeRange(name, self.scopes.items.len, 0)) |value| return value;
+            if (self.lookupNameInScopeRange(name, self.scopes.items.len, 0)) |value| return .{ .value = value, .scope = .local };
             if (self.currentEnvironment()) |env| {
                 const value = env.getString(name);
-                if (!value.isNil()) return value;
+                if (!value.isNil()) return .{ .value = value, .scope = .global };
             }
         }
-        return .{ .nil = {} };
+        return .{ .value = .{ .nil = {} }, .scope = .global };
     }
 
     fn lookupNameInScopeRange(self: *Vm, name: []const u8, start_exclusive: usize, lower_inclusive: usize) ?Value {
@@ -345,13 +357,34 @@ const Vm = struct {
     fn setRuntimeError(self: *Vm, message: []const u8) void {
         self.runtime_error_message = message;
     }
+
+    fn setRuntimeErrorAt(self: *Vm, line: usize, message: []const u8) void {
+        self.runtime_error_line = line;
+        self.runtime_error_message = message;
+        self.runtime_error_metamethod = null;
+    }
+
+    fn setRuntimeMetamethodErrorAt(self: *Vm, line: usize, metamethod: []const u8, message: []const u8) void {
+        self.runtime_error_line = line;
+        self.runtime_error_message = message;
+        self.runtime_error_metamethod = metamethod;
+    }
+
+    fn setSyntaxErrorAt(self: *Vm, line: usize, message: []const u8) void {
+        self.syntax_error_line = line;
+        self.syntax_error_message = message;
+    }
 };
+
+const ValueScope = enum { unknown, local, global };
 
 const Parser = struct {
     vm: *Vm,
     pos: usize,
     limit: usize,
     evaluate: bool,
+    last_primary_name: ?[]const u8 = null,
+    last_primary_scope: ValueScope = .unknown,
 
     fn parseBlock(self: *Parser) !ExecSignal {
         while (self.pos < self.limit and self.peek().tag != .eof) {
@@ -430,6 +463,7 @@ const Parser = struct {
     }
 
     fn localFunctionStatement(self: *Parser) !ExecSignal {
+        const opener_line = self.tokens()[self.pos - 1].line;
         const name = try self.consumeIdent();
         try self.consume(.lparen);
         var params: std.ArrayList([]const u8) = .empty;
@@ -448,7 +482,7 @@ const Parser = struct {
             }
         }
         const body_start = self.pos;
-        const body_end = try self.findEnd(body_start);
+        const body_end = try self.findEndFor(body_start, "function", opener_line);
         const function = try self.vm.allocator.create(Function);
         function.* = .{
             .name = name,
@@ -474,7 +508,8 @@ const Parser = struct {
     }
 
     fn doBlock(self: *Parser) !ExecSignal {
-        const end_idx = try self.findEnd(self.pos);
+        const opener = self.tokens()[self.pos - 1];
+        const end_idx = try self.findEndFor(self.pos, "do", opener.line);
         try self.vm.pushScope(&.{}, false);
         var body = Parser{ .vm = self.vm, .pos = self.pos, .limit = end_idx, .evaluate = self.evaluate };
         const signal = try body.parseBlock();
@@ -485,8 +520,9 @@ const Parser = struct {
 
     fn ifStatement(self: *Parser) !ExecSignal {
         const cond_start = self.pos;
+        const opener = self.tokens()[cond_start - 1];
         const then_idx = try self.findKeywordAtDepth(cond_start, self.limit, "then");
-        const end_idx = try self.findEnd(then_idx + 1);
+        const end_idx = try self.findEndFor(then_idx + 1, "if", opener.line);
         const else_idx = self.findElseAtDepth(then_idx + 1, end_idx) catch end_idx;
         var cond_parser = Parser{ .vm = self.vm, .pos = cond_start, .limit = then_idx, .evaluate = self.evaluate };
         const cond = try cond_parser.expression(0);
@@ -508,9 +544,10 @@ const Parser = struct {
 
     fn whileStatement(self: *Parser) !ExecSignal {
         const cond_start = self.pos;
+        const opener = self.tokens()[cond_start - 1];
         const do_idx = try self.findKeywordAtDepth(cond_start, self.limit, "do");
         const body_start = do_idx + 1;
-        const end_idx = try self.findEnd(body_start);
+        const end_idx = try self.findEndFor(body_start, "while", opener.line);
         var guard: usize = 0;
         while (true) {
             guard += 1;
@@ -553,8 +590,9 @@ const Parser = struct {
     }
 
     fn forStatement(self: *Parser) !ExecSignal {
+        const opener = self.tokens()[self.pos - 1];
         const name = try self.consumeIdent();
-        if (!self.match(.assign)) return self.genericForStatement(name);
+        if (!self.match(.assign)) return self.genericForStatement(name, opener.line);
         const first_comma = try self.findToken(self.pos, self.limit, .comma);
         var start_parser = Parser{ .vm = self.vm, .pos = self.pos, .limit = first_comma, .evaluate = self.evaluate };
         const start = try valueToNumber(try start_parser.expression(0));
@@ -569,7 +607,7 @@ const Parser = struct {
             step = try valueToNumber(try step_parser.expression(0));
         }
         const body_start = do_idx + 1;
-        const end_idx = try self.findEnd(body_start);
+        const end_idx = try self.findEndFor(body_start, "for", opener.line);
         try self.vm.pushScope(&.{}, false);
         defer self.vm.popScope();
         try self.vm.declare(name, .{ .nil = {} });
@@ -591,7 +629,7 @@ const Parser = struct {
         return .normal;
     }
 
-    fn genericForStatement(self: *Parser, first_name: []const u8) !ExecSignal {
+    fn genericForStatement(self: *Parser, first_name: []const u8, opener_line: usize) !ExecSignal {
         var names: std.ArrayList([]const u8) = .empty;
         try names.append(self.vm.allocator, first_name);
         while (self.match(.comma)) {
@@ -608,7 +646,7 @@ const Parser = struct {
         var control = if (iterator_values.items.len > 2) iterator_values.items[2] else Value{ .nil = {} };
 
         const body_start = do_idx + 1;
-        const end_idx = try self.findEnd(body_start);
+        const end_idx = try self.findEndFor(body_start, "for", opener_line);
         try self.vm.pushScope(&.{}, false);
         defer self.vm.popScope();
         for (names.items) |loop_name| try self.vm.declare(loop_name, .{ .nil = {} });
@@ -674,21 +712,35 @@ const Parser = struct {
     }
 
     fn parseAssignTarget(self: *Parser) !AssignTarget {
+        const name_token = self.peek();
         const name = try self.consumeIdent();
         if (self.match(.dot)) {
+            const key_token = self.peek();
             const key = try self.consumeIdent();
             const table = switch (self.vm.lookup(name)) {
                 .table => |t| t,
-                else => return error.RuntimeError,
+                else => |value| {
+                    self.vm.setRuntimeErrorAt(
+                        key_token.line,
+                        try valueAccessErrorMessage(self.vm.allocator, "index", value, name, .local),
+                    );
+                    return error.RuntimeError;
+                },
             };
             return .{ .kind = .string_field, .name = name, .table = table, .key_string = key };
         }
         if (self.match(.lbracket)) {
             const key = try self.expression(0);
-            try self.consume(.rbracket);
+            try self.consumeCloseBracket(name_token.line);
             const table = switch (self.vm.lookup(name)) {
                 .table => |t| t,
-                else => return error.RuntimeError,
+                else => |value| {
+                    self.vm.setRuntimeErrorAt(
+                        name_token.line,
+                        try valueAccessErrorMessage(self.vm.allocator, "index", value, name, .local),
+                    );
+                    return error.RuntimeError;
+                },
             };
             return .{ .kind = .index, .name = name, .table = table, .key_index = try valueToInteger(key) };
         }
@@ -713,8 +765,18 @@ const Parser = struct {
     fn expressionValues(self: *Parser) anyerror![]const Value {
         if (self.match(.ellipsis)) return self.vm.currentVarargs();
         if (self.peek().tag == .ident and self.peekOffset(1).tag == .lparen) {
-            const callee = self.vm.lookup((try self.consumeIdent()));
-            return self.callFunctionValue(callee);
+            const name_token = self.peek();
+            const name = try self.consumeIdent();
+            const resolved = self.vm.lookupDetailed(name);
+            return self.callFunctionValue(resolved.value) catch |err| {
+                if (err == error.RuntimeError and resolved.value != .function and resolved.value != .builtin) {
+                    self.vm.setRuntimeErrorAt(
+                        name_token.line,
+                        try valueAccessErrorMessage(self.vm.allocator, "call", resolved.value, name, resolved.scope),
+                    );
+                }
+                return err;
+            };
         }
         const value = try self.expression(0);
         const values = try self.vm.allocator.alloc(Value, 1);
@@ -766,14 +828,16 @@ const Parser = struct {
 
     fn prefix(self: *Parser) anyerror!Value {
         if (self.match(.minus)) {
+            const op = self.tokens()[self.pos - 1];
             const value = try self.expression(11);
             if (!self.evaluate) return .{ .nil = {} };
-            return unaryMinus(value);
+            return unaryMinus(self.vm, op.line, value);
         }
         if (self.match(.len)) {
+            const op = self.tokens()[self.pos - 1];
             const value = try self.expression(11);
             if (!self.evaluate) return .{ .nil = {} };
-            return lengthValue(value);
+            return lengthValue(self.vm, op.line, value);
         }
         if (self.match(.tilde)) {
             const value = try self.expression(11);
@@ -790,20 +854,40 @@ const Parser = struct {
 
     fn postfix(self: *Parser, initial: Value) !Value {
         var value = initial;
+        var context_name = self.last_primary_name;
+        var context_scope = self.last_primary_scope;
         while (true) {
             if (self.match(.dot)) {
+                const key_token = self.peek();
                 const key = try self.consumeIdent();
                 value = switch (value) {
                     .table => |t| t.getString(key),
-                    else => return error.RuntimeError,
+                    else => {
+                        self.vm.setRuntimeErrorAt(
+                            key_token.line,
+                            try valueAccessErrorMessage(self.vm.allocator, "index", value, context_name, context_scope),
+                        );
+                        return error.RuntimeError;
+                    },
                 };
+                context_name = null;
+                context_scope = .unknown;
             } else if (self.match(.lbracket)) {
+                const bracket_line = self.tokens()[self.pos - 1].line;
                 const key = try self.expression(0);
-                try self.consume(.rbracket);
+                try self.consumeCloseBracket(bracket_line);
                 value = switch (value) {
                     .table => |t| t.getIndex(try valueToInteger(key)),
-                    else => return error.RuntimeError,
+                    else => {
+                        self.vm.setRuntimeErrorAt(
+                            bracket_line,
+                            try valueAccessErrorMessage(self.vm.allocator, "index", value, context_name, context_scope),
+                        );
+                        return error.RuntimeError;
+                    },
                 };
+                context_name = null;
+                context_scope = .unknown;
             } else if (self.peek().tag == .lparen) {
                 if (!self.evaluate) {
                     try self.consume(.lparen);
@@ -818,19 +902,30 @@ const Parser = struct {
                     value = .{ .nil = {} };
                     continue;
                 }
-                const returns = try self.callFunctionValue(value);
+                const returns = self.callFunctionValue(value) catch |err| {
+                    if (err == error.RuntimeError and value != .function and value != .builtin) {
+                        self.vm.setRuntimeErrorAt(
+                            self.peek().line,
+                            try valueAccessErrorMessage(self.vm.allocator, "call", value, context_name, context_scope),
+                        );
+                    }
+                    return err;
+                };
                 value = if (returns.len == 0) Value{ .nil = {} } else returns[0];
+                context_name = null;
+                context_scope = .unknown;
             } else break;
         }
         return value;
     }
 
     fn callFunctionValue(self: *Parser, callee: Value) anyerror![]const Value {
+        const open = self.peek();
         try self.consume(.lparen);
         var args: std.ArrayList(Value) = .empty;
         if (!self.match(.rparen)) {
             try self.parseExpressionList(&args);
-            try self.consume(.rparen);
+            try self.consumeCloseParen(open.line);
         }
         return self.invokeCallable(callee, args.items);
     }
@@ -839,7 +934,15 @@ const Parser = struct {
         const function = switch (callee) {
             .function => |f| f,
             .builtin => |b| return self.executeBuiltin(b, args),
-            else => return error.RuntimeError,
+            else => {
+                if (self.vm.runtime_error_message == null) {
+                    self.vm.setRuntimeErrorAt(
+                        self.peek().line,
+                        try std.fmt.allocPrint(self.vm.allocator, "attempt to call a {s} value", .{valueTypeName(callee)}),
+                    );
+                }
+                return error.RuntimeError;
+            },
         };
         return self.executeFunction(function, args);
     }
@@ -962,6 +1065,8 @@ const Parser = struct {
 
     fn primary(self: *Parser) anyerror!Value {
         const token = self.advance();
+        self.last_primary_name = null;
+        self.last_primary_scope = .unknown;
         switch (token.tag) {
             .number => return parseNumber(token.lexeme),
             .string => return .{ .string = token.lexeme },
@@ -969,7 +1074,12 @@ const Parser = struct {
                 const values = self.vm.currentVarargs();
                 return if (values.len == 0) Value{ .nil = {} } else values[0];
             },
-            .ident => return self.vm.lookup(token.lexeme),
+            .ident => {
+                const resolved = self.vm.lookupDetailed(token.lexeme);
+                self.last_primary_name = token.lexeme;
+                self.last_primary_scope = resolved.scope;
+                return resolved.value;
+            },
             .keyword => {
                 if (std.mem.eql(u8, token.lexeme, "nil")) return .{ .nil = {} };
                 if (std.mem.eql(u8, token.lexeme, "true")) return .{ .boolean = true };
@@ -978,7 +1088,7 @@ const Parser = struct {
             },
             .lparen => {
                 const value = try self.expression(0);
-                try self.consume(.rparen);
+                try self.consumeCloseParen(token.line);
                 return value;
             },
             .lbrace => return self.tableConstructor(),
@@ -1016,6 +1126,10 @@ const Parser = struct {
     }
 
     fn findEnd(self: *Parser, start: usize) !usize {
+        return self.findEndFor(start, null, 1);
+    }
+
+    fn findEndFor(self: *Parser, start: usize, opener: ?[]const u8, opener_line: usize) !usize {
         var depth: usize = 0;
         var i = start;
         while (i < self.limit) : (i += 1) {
@@ -1029,6 +1143,12 @@ const Parser = struct {
                 if (depth == 0) return i;
                 depth -= 1;
             }
+        }
+        if (opener) |word| {
+            self.vm.setSyntaxErrorAt(
+                self.peekOffset(self.limit - self.pos).line,
+                try std.fmt.allocPrint(self.vm.allocator, "'end' expected (to close '{s}' at line {d}) near <eof>", .{ word, opener_line }),
+            );
         }
         return error.SyntaxError;
     }
@@ -1121,6 +1241,24 @@ const Parser = struct {
     fn consume(self: *Parser, tag: TokenTag) !void {
         if (!self.match(tag)) return error.UnsupportedFeature;
     }
+    fn consumeCloseParen(self: *Parser, open_line: usize) !void {
+        if (self.match(.rparen)) return;
+        const near = try tokenNearText(self.vm.allocator, self.peek());
+        self.vm.setSyntaxErrorAt(
+            self.peek().line,
+            try std.fmt.allocPrint(self.vm.allocator, "')' expected (to close '(' at line {d}) near {s}", .{ open_line, near }),
+        );
+        return error.SyntaxError;
+    }
+    fn consumeCloseBracket(self: *Parser, open_line: usize) !void {
+        if (self.match(.rbracket)) return;
+        const near = try tokenNearText(self.vm.allocator, self.peek());
+        self.vm.setSyntaxErrorAt(
+            self.peek().line,
+            try std.fmt.allocPrint(self.vm.allocator, "']' expected (to close '[' at line {d}) near {s}", .{ open_line, near }),
+        );
+        return error.SyntaxError;
+    }
     fn consumeIdent(self: *Parser) ![]const u8 {
         if (self.peek().tag != .ident) return error.UnsupportedFeature;
         return self.advance().lexeme;
@@ -1169,11 +1307,20 @@ pub fn runLevel0WithArgStrings(
     var vm = try Vm.initWithVarargs(allocator, token_slice, try varargs.toOwnedSlice(allocator));
     var parser = Parser{ .vm = &vm, .pos = 0, .limit = token_slice.len, .evaluate = true };
     _ = parser.parseBlock() catch |err| switch (err) {
-        error.RuntimeError => return runtimeError(allocator, vm.runtime_error_message orelse "attempt to perform arithmetic on an unsupported value"),
-        error.SyntaxError => return syntaxError(allocator, "end-expected"),
+        error.RuntimeError => return runtimeErrorAt(
+            allocator,
+            vm.runtime_error_line,
+            vm.runtime_error_message orelse "runtime error",
+            vm.runtime_error_metamethod,
+        ),
+        error.SyntaxError => return syntaxErrorAt(allocator, vm.syntax_error_line, vm.syntax_error_message orelse "syntax error"),
         error.UnsupportedFeature => return unsupported(allocator, "outside-level0-subset"),
         else => return err,
     };
+    if (parser.peekKeyword("end") or parser.peekKeyword("until") or parser.peekKeyword("else")) {
+        const token = parser.peek();
+        return syntaxErrorAt(allocator, token.line, try std.fmt.allocPrint(allocator, "<eof> expected near '{s}'", .{token.lexeme}));
+    }
     return .{ .state = .pass, .stdout = try vm.stdout.toOwnedSlice(), .stderr = "", .exit_code = 0, .unsupported_reason = null };
 }
 
@@ -1938,6 +2085,20 @@ fn runtimeError(allocator: std.mem.Allocator, message: []const u8) !VmResult {
     return .{ .state = .runtime_error, .stdout = "", .stderr = try std.fmt.allocPrint(allocator, "ziglua-vm: {s}\n", .{message}), .exit_code = 1, .unsupported_reason = null };
 }
 
+fn runtimeErrorAt(allocator: std.mem.Allocator, line: usize, message: []const u8, metamethod: ?[]const u8) !VmResult {
+    return .{
+        .state = .runtime_error,
+        .stdout = "",
+        .stderr = try std.fmt.allocPrint(
+            allocator,
+            "ziglua-vm: runtime-error:{d}:{s}:{s}\n",
+            .{ line, metamethod orelse "-", message },
+        ),
+        .exit_code = 1,
+        .unsupported_reason = null,
+    };
+}
+
 fn syntaxError(allocator: std.mem.Allocator, reason: []const u8) !VmResult {
     return .{ .state = .runtime_error, .stdout = "", .stderr = try std.fmt.allocPrint(allocator, "ziglua-vm: syntax-error:{s}\n", .{reason}), .exit_code = 1, .unsupported_reason = null };
 }
@@ -2181,19 +2342,25 @@ fn valueToInteger(value: Value) !i64 {
     };
 }
 
-fn unaryMinus(value: Value) !Value {
+fn unaryMinus(vm: *Vm, line: usize, value: Value) !Value {
     return switch (value) {
         .integer => |i| .{ .integer = -i },
         .float => |f| .{ .float = -f },
-        else => error.RuntimeError,
+        else => {
+            vm.setRuntimeErrorAt(line, try std.fmt.allocPrint(vm.allocator, "attempt to perform arithmetic on a {s} value", .{valueTypeName(value)}));
+            return error.RuntimeError;
+        },
     };
 }
 
-fn lengthValue(value: Value) !Value {
+fn lengthValue(vm: *Vm, line: usize, value: Value) !Value {
     return switch (value) {
         .string => |s| .{ .integer = @intCast(s.len) },
         .table => |t| .{ .integer = t.length() },
-        else => error.RuntimeError,
+        else => {
+            vm.setRuntimeErrorAt(line, try std.fmt.allocPrint(vm.allocator, "attempt to get length of a {s} value", .{valueTypeName(value)}));
+            return error.RuntimeError;
+        },
     };
 }
 
@@ -2203,15 +2370,16 @@ fn bitNot(value: Value) !Value {
 
 fn applyBinary(vm: *Vm, op: Token, left: Value, right: Value) !Value {
     return switch (op.tag) {
-        .plus, .minus, .star, .slash, .floor_div, .percent => arithmetic(op.tag, left, right),
-        .concat => concat(vm.allocator, left, right),
-        .eq, .ne, .lt, .le, .gt, .ge => compare(vm, op.tag, left, right),
-        .amp, .pipe, .tilde, .shl, .shr => bitwise(op.tag, left, right),
+        .plus, .minus, .star, .slash, .floor_div, .percent => arithmetic(vm, op, left, right),
+        .concat => concat(vm, op.line, left, right),
+        .eq, .ne, .lt, .le, .gt, .ge => compare(vm, op, left, right),
+        .amp, .pipe, .tilde, .shl, .shr => bitwise(vm, op.line, op.tag, left, right),
         else => error.UnsupportedFeature,
     };
 }
 
-fn arithmetic(tag: TokenTag, left: Value, right: Value) !Value {
+fn arithmetic(vm: *Vm, op: Token, left: Value, right: Value) !Value {
+    const tag = op.tag;
     if (tag != .slash and left == .integer and right == .integer) {
         const a = left.integer;
         const b = right.integer;
@@ -2224,8 +2392,14 @@ fn arithmetic(tag: TokenTag, left: Value, right: Value) !Value {
             else => unreachable,
         };
     }
-    const a = try valueToNumber(left);
-    const b = try valueToNumber(right);
+    const a = valueToNumber(left) catch {
+        try setArithmeticRuntimeError(vm, op, left, right);
+        return error.RuntimeError;
+    };
+    const b = valueToNumber(right) catch {
+        try setArithmeticRuntimeError(vm, op, left, right);
+        return error.RuntimeError;
+    };
     return switch (tag) {
         .plus => numberFromFloatIntegral(a + b),
         .minus => numberFromFloatIntegral(a - b),
@@ -2237,10 +2411,16 @@ fn arithmetic(tag: TokenTag, left: Value, right: Value) !Value {
     };
 }
 
-fn concat(allocator: std.mem.Allocator, left: Value, right: Value) !Value {
-    const l = try valueToStringForConcat(allocator, left);
-    const r = try valueToStringForConcat(allocator, right);
-    return .{ .string = try std.mem.concat(allocator, u8, &.{ l, r }) };
+fn concat(vm: *Vm, line: usize, left: Value, right: Value) !Value {
+    const l = valueToStringForConcat(vm.allocator, left) catch {
+        vm.setRuntimeErrorAt(line, try concatErrorMessage(vm.allocator, left));
+        return error.RuntimeError;
+    };
+    const r = valueToStringForConcat(vm.allocator, right) catch {
+        vm.setRuntimeErrorAt(line, try concatErrorMessage(vm.allocator, right));
+        return error.RuntimeError;
+    };
+    return .{ .string = try std.mem.concat(vm.allocator, u8, &.{ l, r }) };
 }
 
 fn valueToStringForConcat(allocator: std.mem.Allocator, value: Value) ![]const u8 {
@@ -2252,11 +2432,11 @@ fn valueToStringForConcat(allocator: std.mem.Allocator, value: Value) ![]const u
     };
 }
 
-fn compare(vm: *Vm, tag: TokenTag, left: Value, right: Value) !Value {
-    const result = switch (tag) {
+fn compare(vm: *Vm, op: Token, left: Value, right: Value) !Value {
+    const result = switch (op.tag) {
         .eq => valuesEqual(left, right),
         .ne => !valuesEqual(left, right),
-        .lt, .le, .gt, .ge => try orderedCompare(vm, tag, left, right),
+        .lt, .le, .gt, .ge => try orderedCompare(vm, op, left, right),
         else => unreachable,
     };
     return .{ .boolean = result };
@@ -2281,11 +2461,11 @@ fn valuesEqual(left: Value, right: Value) bool {
     };
 }
 
-fn orderedCompare(vm: *Vm, tag: TokenTag, left: Value, right: Value) !bool {
+fn orderedCompare(vm: *Vm, op: Token, left: Value, right: Value) !bool {
     if ((left == .integer or left == .float) and (right == .integer or right == .float)) {
         const a = try valueToNumber(left);
         const b = try valueToNumber(right);
-        return switch (tag) {
+        return switch (op.tag) {
             .lt => a < b,
             .le => a <= b,
             .gt => a > b,
@@ -2295,7 +2475,7 @@ fn orderedCompare(vm: *Vm, tag: TokenTag, left: Value, right: Value) !bool {
     }
     if (left == .string and right == .string) {
         const order = std.mem.order(u8, left.string, right.string);
-        return switch (tag) {
+        return switch (op.tag) {
             .lt => order == .lt,
             .le => order != .gt,
             .gt => order == .gt,
@@ -2303,7 +2483,7 @@ fn orderedCompare(vm: *Vm, tag: TokenTag, left: Value, right: Value) !bool {
             else => unreachable,
         };
     }
-    vm.setRuntimeError(try orderedComparisonErrorMessage(vm.allocator, left, right));
+    vm.setRuntimeErrorAt(op.line, try orderedComparisonErrorMessage(vm.allocator, left, right));
     return error.RuntimeError;
 }
 
@@ -2314,6 +2494,59 @@ fn orderedComparisonErrorMessage(allocator: std.mem.Allocator, left: Value, righ
         return try std.fmt.allocPrint(allocator, "attempt to compare two {s} values", .{left_name});
     }
     return try std.fmt.allocPrint(allocator, "attempt to compare {s} with {s}", .{ left_name, right_name });
+}
+
+fn setArithmeticRuntimeError(vm: *Vm, op: Token, left: Value, right: Value) !void {
+    if (op.tag == .plus and (left == .string or right == .string)) {
+        vm.setRuntimeMetamethodErrorAt(
+            op.line,
+            "add",
+            try std.fmt.allocPrint(
+                vm.allocator,
+                "attempt to add a '{s}' with a '{s}'",
+                .{ valueTypeName(left), valueTypeName(right) },
+            ),
+        );
+        return;
+    }
+    const bad = if (left == .integer or left == .float) right else left;
+    vm.setRuntimeErrorAt(
+        op.line,
+        try std.fmt.allocPrint(vm.allocator, "attempt to perform arithmetic on a {s} value", .{valueTypeName(bad)}),
+    );
+}
+
+fn concatErrorMessage(allocator: std.mem.Allocator, value: Value) ![]const u8 {
+    return try std.fmt.allocPrint(allocator, "attempt to concatenate a {s} value", .{valueTypeName(value)});
+}
+
+fn bitwiseErrorMessage(allocator: std.mem.Allocator, value: Value) ![]const u8 {
+    if (value == .float) return try std.fmt.allocPrint(allocator, "number has no integer representation", .{});
+    return try std.fmt.allocPrint(allocator, "attempt to perform bitwise operation on a {s} value", .{valueTypeName(value)});
+}
+
+fn valueAccessErrorMessage(
+    allocator: std.mem.Allocator,
+    operation: []const u8,
+    value: Value,
+    name: ?[]const u8,
+    scope: ValueScope,
+) ![]const u8 {
+    if (name) |n| {
+        const scope_name = switch (scope) {
+            .local => "local",
+            .global => "global",
+            .unknown => "",
+        };
+        if (scope != .unknown) {
+            return try std.fmt.allocPrint(
+                allocator,
+                "attempt to {s} a {s} value ({s} '{s}')",
+                .{ operation, valueTypeName(value), scope_name, n },
+            );
+        }
+    }
+    return try std.fmt.allocPrint(allocator, "attempt to {s} a {s} value", .{ operation, valueTypeName(value) });
 }
 
 fn valueTypeName(value: Value) []const u8 {
@@ -2327,9 +2560,15 @@ fn valueTypeName(value: Value) []const u8 {
     };
 }
 
-fn bitwise(tag: TokenTag, left: Value, right: Value) !Value {
-    const a = try valueToInteger(left);
-    const b = try valueToInteger(right);
+fn bitwise(vm: *Vm, line: usize, tag: TokenTag, left: Value, right: Value) !Value {
+    const a = valueToInteger(left) catch {
+        vm.setRuntimeErrorAt(line, try bitwiseErrorMessage(vm.allocator, left));
+        return error.RuntimeError;
+    };
+    const b = valueToInteger(right) catch {
+        vm.setRuntimeErrorAt(line, try bitwiseErrorMessage(vm.allocator, right));
+        return error.RuntimeError;
+    };
     return .{ .integer = switch (tag) {
         .amp => a & b,
         .pipe => a | b,

@@ -309,7 +309,8 @@ class LuaZigCliShellTests(unittest.TestCase):
             self.assertEqual(fail_summary["state"], "fail")
             self.assertEqual(fail_summary["accounting"]["fail_count"], 1)
             self.assertEqual(fail_summary["accounting"]["native_pass_count"], 0)
-            self.assertIn("attempt to perform arithmetic", fail_summary["ledger"][0]["diagnostic"])
+            self.assertIn("runtime-error:1", fail_summary["ledger"][0]["diagnostic"])
+            self.assertIn("attempt to add", fail_summary["ledger"][0]["diagnostic"])
 
             fallback_failing = run(
                 str(CLI),

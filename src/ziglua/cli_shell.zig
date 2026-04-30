@@ -1753,19 +1753,27 @@ fn writeLuaString(writer: *std.Io.Writer, text: []const u8) !void {
     try writer.writeByte('"');
 }
 
-fn stockStyleArithmeticError(allocator: std.mem.Allocator, chunk_name: []const u8) ![]const u8 {
-    return try std.fmt.allocPrint(
-        allocator,
-        "./lua: {s}:1: attempt to add a 'string' with a 'number'\nstack traceback:\n\t[C]: in metamethod 'add'\n\t{s}:1: in main chunk\n\t[C]: in ?\n",
-        .{ chunk_name, chunk_name },
-    );
+fn stockStyleRuntimeError(
+    allocator: std.mem.Allocator,
+    chunk_name: []const u8,
+    line: usize,
+    metamethod: ?[]const u8,
+    message: []const u8,
+) ![]const u8 {
+    var out = std.Io.Writer.Allocating.init(allocator);
+    try out.writer.print("./lua: {s}:{d}: {s}\nstack traceback:\n", .{ chunk_name, line, message });
+    if (metamethod) |name| {
+        try out.writer.print("\t[C]: in metamethod '{s}'\n", .{name});
+    }
+    try out.writer.print("\t{s}:{d}: in main chunk\n\t[C]: in ?\n", .{ chunk_name, line });
+    return try out.toOwnedSlice();
 }
 
-fn stockStyleComparisonError(allocator: std.mem.Allocator, chunk_name: []const u8, message: []const u8) ![]const u8 {
+fn stockStyleComparisonError(allocator: std.mem.Allocator, chunk_name: []const u8, line: usize, message: []const u8) ![]const u8 {
     return try std.fmt.allocPrint(
         allocator,
-        "./lua: {s}:1: {s}\nstack traceback:\n\t{s}:1: in main chunk\n\t[C]: in ?\n",
-        .{ chunk_name, message, chunk_name },
+        "./lua: {s}:{d}: {s}\nstack traceback:\n\t{s}:{d}: in main chunk\n\t[C]: in ?\n",
+        .{ chunk_name, line, message, chunk_name, line },
     );
 }
 
@@ -1781,18 +1789,21 @@ fn stockStyleNativeError(
     }
     if (parseVmSyntaxError(vm_stderr)) |syntax| {
         const eof_padding: usize = if (std.mem.indexOf(u8, syntax.message, "near <eof>") != null) 1 else 0;
-        const line_offset = runPreludeLineCount(parsed) + eof_padding;
-        const source_line = if (syntax.line > line_offset) syntax.line - line_offset else syntax.line;
-        const message = try adjustSyntaxMessageLineNumbers(allocator, syntax.message, line_offset);
+        const prelude_lines = runPreludeLineCount(parsed);
+        const source_line_offset = prelude_lines + eof_padding;
+        const source_line = if (syntax.line > source_line_offset) syntax.line - source_line_offset else syntax.line;
+        const message = try adjustSyntaxMessageLineNumbers(allocator, syntax.message, prelude_lines);
         return try std.fmt.allocPrint(allocator, "./lua: {s}:{d}: {s}\n", .{ chunk_name, source_line, message });
     }
-    if (std.mem.indexOf(u8, vm_stderr, "attempt to perform arithmetic") != null) {
-        return try stockStyleArithmeticError(allocator, chunk_name);
+    if (parseVmRuntimeError(vm_stderr)) |runtime| {
+        const line_offset = runPreludeLineCount(parsed);
+        const source_line = if (runtime.line > line_offset) runtime.line - line_offset else runtime.line;
+        return try stockStyleRuntimeError(allocator, chunk_name, source_line, runtime.metamethod, runtime.message);
     }
     if (std.mem.indexOf(u8, vm_stderr, "attempt to compare")) |idx| {
         var message = vm_stderr[idx..];
         if (std.mem.indexOfScalar(u8, message, '\n')) |newline| message = message[0..newline];
-        return try stockStyleComparisonError(allocator, chunk_name, message);
+        return try stockStyleComparisonError(allocator, chunk_name, 1, message);
     }
     return vm_stderr;
 }
@@ -1810,6 +1821,30 @@ fn parseVmSyntaxError(stderr: []const u8) ?VmSyntaxError {
     const colon = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
     const line = std.fmt.parseInt(usize, rest[0..colon], 10) catch return null;
     return .{ .line = line, .message = rest[colon + 1 ..] };
+}
+
+const VmRuntimeError = struct {
+    line: usize,
+    metamethod: ?[]const u8,
+    message: []const u8,
+};
+
+fn parseVmRuntimeError(stderr: []const u8) ?VmRuntimeError {
+    const prefix = "ziglua-vm: runtime-error:";
+    if (!std.mem.startsWith(u8, stderr, prefix)) return null;
+    var rest = stderr[prefix.len..];
+    if (std.mem.indexOfScalar(u8, rest, '\n')) |newline| rest = rest[0..newline];
+    const line_colon = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+    const line = std.fmt.parseInt(usize, rest[0..line_colon], 10) catch return null;
+    const after_line = rest[line_colon + 1 ..];
+    const meta_colon = std.mem.indexOfScalar(u8, after_line, ':') orelse return null;
+    const meta = after_line[0..meta_colon];
+    const message = after_line[meta_colon + 1 ..];
+    return .{
+        .line = line,
+        .metamethod = if (std.mem.eql(u8, meta, "-")) null else meta,
+        .message = message,
+    };
 }
 
 fn runPreludeLineCount(parsed: ParsedRun) usize {

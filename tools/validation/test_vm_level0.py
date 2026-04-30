@@ -119,12 +119,43 @@ class VmLevel0Tests(unittest.TestCase):
                 self.assertEqual(candidate.stderr, stock.stderr)
 
     def test_supported_runtime_error_path_is_nonzero_and_diagnostic(self):
-        candidate = run(VM_COMMAND, stdin='local x = "bad" + 1\nprint(x)\n')
+        candidate = run(VM_COMMAND, stdin="local x = nil + 1\nprint(x)\n")
 
         self.assertNotEqual(candidate.returncode, 0)
         self.assertEqual(candidate.stdout, "")
         self.assertIn("ziglua-vm:", candidate.stderr)
+        self.assertIn("runtime-error:1", candidate.stderr)
         self.assertIn("arithmetic", candidate.stderr)
+        self.assertIn("nil", candidate.stderr)
+
+    def test_no_host_lua_core_diagnostics_match_stock_lua(self):
+        cases = {
+            "string-number-add": 'local x = "bad" + 1\nprint(x)\n',
+            "nil-arithmetic": "local x = nil + 1\nprint(x)\n",
+            "boolean-arithmetic": "local x = true + 1\nprint(x)\n",
+            "table-concat": 'print({} .. "x")\n',
+            "nil-index-local-line": "local x = nil\nprint(x.y)\n",
+            "nil-call-local-line": "local f = nil\nf()\n",
+            "missing-close-paren": "print(1\n",
+            "unexpected-end": "end\n",
+            "while-missing-end": "while true do print(1)\n",
+            "if-missing-end": 'if true then print("x")\n',
+        }
+        for name, source in cases.items():
+            with self.subTest(case=name):
+                stock = run("./lua", "-", stdin=source)
+                candidate = run(
+                    "./zig-out/bin/lua-zig",
+                    "run",
+                    "-",
+                    stdin=source,
+                    env={"LUA_ZIG_RUN_NO_HOST_LUA": "1"},
+                )
+
+                self.assertNotEqual(stock.returncode, 0, name)
+                self.assertEqual(candidate.returncode, stock.returncode, candidate.stderr)
+                self.assertEqual(candidate.stdout, stock.stdout)
+                self.assertEqual(candidate.stderr, stock.stderr)
 
     def test_no_host_lua_goto_label_legality_matches_stock_lua(self):
         cases = {
