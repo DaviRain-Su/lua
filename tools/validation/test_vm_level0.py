@@ -165,6 +165,7 @@ class VmLevel0Tests(unittest.TestCase):
             "malformed-goto-label": "goto end\n",
             "jump-into-local-scope": "goto L\nlocal x\n::L::\nprint(1)\n",
             "nested-duplicate-visible-label": "::l1::\ndo\n  ::l1::\nend\n",
+            "elseif-nested-duplicate-visible-label": "if false then\nelseif true then\n  ::again::\n  do\n    ::again::\n  end\nend\n",
         }
         for name, source in cases.items():
             with self.subTest(case=name):
@@ -187,6 +188,7 @@ class VmLevel0Tests(unittest.TestCase):
             "top-level-end-label-after-local": "goto L\nlocal x\n::L::\n",
             "nested-end-label-after-local": 'do\ngoto L\nlocal x\n::L::\nend\nprint("ok")\n',
             "end-label-after-local-and-empty-statements": "goto L\nlocal x\n; ; ::L:: ; ;\n",
+            "elseif-sibling-duplicate-label": 'if false then\n  ::again::\nelseif true then\n  ::again::\nend\nprint("ok")\n',
         }
         for name, source in cases.items():
             with self.subTest(case=name):

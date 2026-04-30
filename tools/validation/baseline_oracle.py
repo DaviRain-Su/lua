@@ -101,6 +101,7 @@ NATIVE_CORE_COVERAGE_REQUIREMENTS = {
             "goto:valid-forward",
             "goto:valid-nested",
             "goto:valid-end-of-block",
+            "goto:valid-elseif-sibling-label",
             "goto:undefined",
             "goto:duplicate",
             "goto:duplicate-visible-nested",
@@ -340,6 +341,14 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "coverage_tags": ["goto:valid-end-of-block"],
         "description": "forward goto over a local declaration to a label at the end of the same block remains valid like stock Lua",
         "source": 'do\n  goto done\n  local hidden\n  ::done::\nend\nprint("ok")\n',
+    },
+    {
+        "name": "goto-valid-elseif-sibling-label-core",
+        "puc_file": "goto.lua",
+        "validates": ["VAL-NATIVE-009"],
+        "coverage_tags": ["goto:valid-elseif-sibling-label"],
+        "description": "duplicate labels in separate if/elseif sibling branch bodies are accepted like stock Lua",
+        "source": 'if false then\n  ::again::\nelseif true then\n  ::again::\nend\nprint("ok")\n',
     },
     {
         "name": "goto-undefined-label-core",

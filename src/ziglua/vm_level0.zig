@@ -1415,8 +1415,10 @@ fn validateGotoAndLabels(allocator: std.mem.Allocator, tokens: []const Token) !?
             try collectLocalNames(allocator, tokens, i, block_stack.items[block_stack.items.len - 1], &locals);
         }
 
-        if (token.tag == .keyword) {
+        if (token.tag == .keyword or (token.tag == .ident and std.mem.eql(u8, token.lexeme, "elseif"))) {
             if (std.mem.eql(u8, token.lexeme, "end") or std.mem.eql(u8, token.lexeme, "until")) {
+                popBlock(&block_stack, &function_barriers);
+            } else if (std.mem.eql(u8, token.lexeme, "elseif")) {
                 popBlock(&block_stack, &function_barriers);
             } else if (std.mem.eql(u8, token.lexeme, "else")) {
                 popBlock(&block_stack, &function_barriers);
@@ -1508,8 +1510,11 @@ fn labelTerminatesBlock(tokens: []const Token, label_index: usize) bool {
         if (token.tag == .eof) return true;
         if (token.tag == .keyword and (std.mem.eql(u8, token.lexeme, "end") or
             std.mem.eql(u8, token.lexeme, "until") or
-            std.mem.eql(u8, token.lexeme, "else") or
-            std.mem.eql(u8, token.lexeme, "elseif")))
+            std.mem.eql(u8, token.lexeme, "else")))
+        {
+            return true;
+        }
+        if ((token.tag == .keyword or token.tag == .ident) and std.mem.eql(u8, token.lexeme, "elseif"))
         {
             return true;
         }
