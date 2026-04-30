@@ -26,6 +26,7 @@ const TokenTag = enum {
     comma,
     semi,
     dot,
+    colon,
     coloncolon,
     assign,
     plus,
@@ -64,6 +65,7 @@ const Function = struct {
     body_end: usize,
     env: ?*Table,
     lexical_scope_len: usize,
+    captures: std.StringHashMap(*Cell),
 };
 
 const Builtin = enum { print, select, pairs, ipairs, next, ipairs_iter };
@@ -94,6 +96,10 @@ const Value = union(ValueTag) {
             else => false,
         };
     }
+};
+
+const Cell = struct {
+    value: Value,
 };
 
 const Table = struct {
@@ -150,7 +156,7 @@ const Table = struct {
 };
 
 const Scope = struct {
-    vars: std.StringHashMap(Value),
+    vars: std.StringHashMap(*Cell),
     varargs: []const Value,
     has_varargs: bool,
 };
@@ -159,6 +165,7 @@ const CallFrame = struct {
     scope_start: usize,
     lexical_scope_len: usize,
     env: ?*Table,
+    captures: *std.StringHashMap(*Cell),
 };
 
 const ExecSignal = union(enum) {
@@ -219,7 +226,7 @@ const Vm = struct {
 
     fn pushScope(self: *Vm, varargs: []const Value, has_varargs: bool) !void {
         try self.scopes.append(self.allocator, .{
-            .vars = std.StringHashMap(Value).init(self.allocator),
+            .vars = std.StringHashMap(*Cell).init(self.allocator),
             .varargs = varargs,
             .has_varargs = has_varargs,
         });
@@ -234,13 +241,18 @@ const Vm = struct {
     }
 
     fn declare(self: *Vm, name: []const u8, value: Value) !void {
-        try self.currentScope().vars.put(name, value);
+        const cell = try self.allocator.create(Cell);
+        cell.* = .{ .value = value };
+        try self.currentScope().vars.put(name, cell);
     }
 
     fn assignName(self: *Vm, name: []const u8, value: Value) !void {
         if (self.activeFrame()) |frame| {
             if (self.assignNameInScopeRange(name, value, self.scopes.items.len, frame.scope_start)) return;
-            if (self.assignNameInScopeRange(name, value, @min(frame.lexical_scope_len, self.scopes.items.len), 0)) return;
+            if (frame.captures.get(name)) |cell| {
+                cell.value = value;
+                return;
+            }
             if (self.environmentForFrame(frame)) |env| {
                 try env.setString(name, value);
                 return;
@@ -252,7 +264,9 @@ const Vm = struct {
                 return;
             }
         }
-        try self.scopes.items[0].vars.put(name, value);
+        const cell = try self.allocator.create(Cell);
+        cell.* = .{ .value = value };
+        try self.scopes.items[0].vars.put(name, cell);
     }
 
     fn lookup(self: *Vm, name: []const u8) Value {
@@ -262,7 +276,7 @@ const Vm = struct {
     fn lookupDetailed(self: *Vm, name: []const u8) struct { value: Value, scope: ValueScope } {
         if (self.activeFrame()) |frame| {
             if (self.lookupNameInScopeRange(name, self.scopes.items.len, frame.scope_start)) |value| return .{ .value = value, .scope = .local };
-            if (self.lookupNameInScopeRange(name, @min(frame.lexical_scope_len, self.scopes.items.len), 0)) |value| return .{ .value = value, .scope = .local };
+            if (frame.captures.get(name)) |cell| return .{ .value = cell.value, .scope = .local };
             if (self.environmentForFrame(frame)) |env| {
                 const value = env.getString(name);
                 if (!value.isNil()) return .{ .value = value, .scope = .global };
@@ -282,7 +296,7 @@ const Vm = struct {
         var i = @min(start_exclusive, self.scopes.items.len);
         while (i > lower_inclusive) {
             i -= 1;
-            if (self.scopes.items[i].vars.get(name)) |value| return value;
+            if (self.scopes.items[i].vars.get(name)) |cell| return cell.value;
         }
         return null;
     }
@@ -293,7 +307,7 @@ const Vm = struct {
         while (i > lower_inclusive) {
             i -= 1;
             if (self.scopes.items[i].vars.getPtr(name)) |slot| {
-                slot.* = value;
+                slot.*.value = value;
                 return true;
             }
         }
@@ -306,7 +320,7 @@ const Vm = struct {
         while (i > lower_inclusive) {
             i -= 1;
             if (self.scopes.items[i].vars.get("_ENV")) |env| {
-                if (env == .table) return env.table;
+                if (env.value == .table) return env.value.table;
             }
         }
         return null;
@@ -323,6 +337,9 @@ const Vm = struct {
 
     fn environmentForFrame(self: *Vm, frame: CallFrame) ?*Table {
         if (self.environmentInScopeRange(self.scopes.items.len, frame.scope_start)) |env| return env;
+        if (frame.captures.get("_ENV")) |env| {
+            if (env.value == .table) return env.value.table;
+        }
         if (frame.env) |env| return env;
         return self.environmentInScopeRange(@min(frame.lexical_scope_len, self.scopes.items.len), 0);
     }
@@ -330,6 +347,32 @@ const Vm = struct {
     fn captureEnvironmentForDefinition(self: *Vm) ?*Table {
         if (self.activeFrame()) |frame| return self.environmentForFrame(frame);
         return self.currentEnvironment();
+    }
+
+    fn captureVisibleCells(self: *Vm) !std.StringHashMap(*Cell) {
+        var captures = std.StringHashMap(*Cell).init(self.allocator);
+        if (self.activeFrame()) |frame| {
+            var captured = frame.captures.iterator();
+            while (captured.next()) |entry| {
+                try captures.put(entry.key_ptr.*, entry.value_ptr.*);
+            }
+            var i = frame.scope_start;
+            while (i < self.scopes.items.len) : (i += 1) {
+                var scoped = self.scopes.items[i].vars.iterator();
+                while (scoped.next()) |entry| {
+                    try captures.put(entry.key_ptr.*, entry.value_ptr.*);
+                }
+            }
+            return captures;
+        }
+
+        for (self.scopes.items) |*scope| {
+            var scoped = scope.vars.iterator();
+            while (scoped.next()) |entry| {
+                try captures.put(entry.key_ptr.*, entry.value_ptr.*);
+            }
+        }
+        return captures;
     }
 
     fn currentVarargs(self: *Vm) []const Value {
@@ -385,6 +428,7 @@ const Parser = struct {
     evaluate: bool,
     last_primary_name: ?[]const u8 = null,
     last_primary_scope: ValueScope = .unknown,
+    last_call_values: ?[]const Value = null,
 
     fn parseBlock(self: *Parser) !ExecSignal {
         while (self.pos < self.limit and self.peek().tag != .eof) {
@@ -465,6 +509,15 @@ const Parser = struct {
     fn localFunctionStatement(self: *Parser) !ExecSignal {
         const opener_line = self.tokens()[self.pos - 1].line;
         const name = try self.consumeIdent();
+        if (self.vm.currentScope().vars.get(name) == null) {
+            try self.vm.declare(name, .{ .nil = {} });
+        }
+        const function = try self.parseFunctionAfterName(name, opener_line);
+        try self.vm.assignName(name, .{ .function = function });
+        return .normal;
+    }
+
+    fn parseFunctionAfterName(self: *Parser, name: []const u8, opener_line: usize) !*Function {
         try self.consume(.lparen);
         var params: std.ArrayList([]const u8) = .empty;
         var vararg = false;
@@ -492,10 +545,15 @@ const Parser = struct {
             .body_end = body_end,
             .env = self.vm.captureEnvironmentForDefinition(),
             .lexical_scope_len = self.vm.scopes.items.len,
+            .captures = try self.vm.captureVisibleCells(),
         };
-        try self.vm.declare(name, .{ .function = function });
         self.pos = body_end + 1;
-        return .normal;
+        return function;
+    }
+
+    fn parseAnonymousFunction(self: *Parser, opener_line: usize) !Value {
+        const function = try self.parseFunctionAfterName("", opener_line);
+        return .{ .function = function };
     }
 
     fn returnStatement(self: *Parser) !ExecSignal {
@@ -749,36 +807,26 @@ const Parser = struct {
 
     fn parseExpressionList(self: *Parser, out: *std.ArrayList(Value)) !void {
         while (true) {
-            const start = self.pos;
+            self.last_call_values = null;
             const first_value = try self.expression(0);
             if (self.match(.comma)) {
                 try out.append(self.vm.allocator, first_value);
                 continue;
             }
-            self.pos = start;
-            const values = try self.expressionValues();
-            try out.appendSlice(self.vm.allocator, values);
+            if (self.last_call_values) |values| {
+                try out.appendSlice(self.vm.allocator, values);
+            } else {
+                try out.append(self.vm.allocator, first_value);
+            }
             break;
         }
     }
 
     fn expressionValues(self: *Parser) anyerror![]const Value {
         if (self.match(.ellipsis)) return self.vm.currentVarargs();
-        if (self.peek().tag == .ident and self.peekOffset(1).tag == .lparen) {
-            const name_token = self.peek();
-            const name = try self.consumeIdent();
-            const resolved = self.vm.lookupDetailed(name);
-            return self.callFunctionValue(resolved.value) catch |err| {
-                if (err == error.RuntimeError and resolved.value != .function and resolved.value != .builtin) {
-                    self.vm.setRuntimeErrorAt(
-                        name_token.line,
-                        try valueAccessErrorMessage(self.vm.allocator, "call", resolved.value, name, resolved.scope),
-                    );
-                }
-                return err;
-            };
-        }
+        self.last_call_values = null;
         const value = try self.expression(0);
+        if (self.last_call_values) |values| return values;
         const values = try self.vm.allocator.alloc(Value, 1);
         values[0] = value;
         return values;
@@ -819,9 +867,11 @@ const Parser = struct {
             const right = try self.expression(right_min);
             if (!self.evaluate) {
                 left = .{ .nil = {} };
+                self.last_call_values = null;
                 continue;
             }
             left = try applyBinary(self.vm, op, left, right);
+            self.last_call_values = null;
         }
         return left;
     }
@@ -831,22 +881,26 @@ const Parser = struct {
             const op = self.tokens()[self.pos - 1];
             const value = try self.expression(11);
             if (!self.evaluate) return .{ .nil = {} };
+            self.last_call_values = null;
             return unaryMinus(self.vm, op.line, value);
         }
         if (self.match(.len)) {
             const op = self.tokens()[self.pos - 1];
             const value = try self.expression(11);
             if (!self.evaluate) return .{ .nil = {} };
+            self.last_call_values = null;
             return lengthValue(self.vm, op.line, value);
         }
         if (self.match(.tilde)) {
             const value = try self.expression(11);
             if (!self.evaluate) return .{ .nil = {} };
+            self.last_call_values = null;
             return bitNot(value);
         }
         if (self.matchKeyword("not")) {
             const value = try self.expression(11);
             if (!self.evaluate) return .{ .nil = {} };
+            self.last_call_values = null;
             return .{ .boolean = !value.isTruthy() };
         }
         return self.postfix(try self.primary());
@@ -858,6 +912,7 @@ const Parser = struct {
         var context_scope = self.last_primary_scope;
         while (true) {
             if (self.match(.dot)) {
+                self.last_call_values = null;
                 const key_token = self.peek();
                 const key = try self.consumeIdent();
                 value = switch (value) {
@@ -872,7 +927,42 @@ const Parser = struct {
                 };
                 context_name = null;
                 context_scope = .unknown;
+            } else if (self.match(.colon)) {
+                self.last_call_values = null;
+                const key_token = self.peek();
+                const key = try self.consumeIdent();
+                const receiver = value;
+                value = switch (value) {
+                    .table => |t| t.getString(key),
+                    else => {
+                        self.vm.setRuntimeErrorAt(
+                            key_token.line,
+                            try valueAccessErrorMessage(self.vm.allocator, "index", value, context_name, context_scope),
+                        );
+                        return error.RuntimeError;
+                    },
+                };
+                if (!self.evaluate) {
+                    try self.consume(.lparen);
+                    if (!self.match(.rparen)) {
+                        const previous_evaluate = self.evaluate;
+                        self.evaluate = false;
+                        var args: std.ArrayList(Value) = .empty;
+                        try self.parseExpressionList(&args);
+                        self.evaluate = previous_evaluate;
+                        try self.consume(.rparen);
+                    }
+                    value = .{ .nil = {} };
+                    self.last_call_values = null;
+                    continue;
+                }
+                const returns = try self.callFunctionValueWithPrefix(value, receiver);
+                self.last_call_values = returns;
+                value = if (returns.len == 0) Value{ .nil = {} } else returns[0];
+                context_name = null;
+                context_scope = .unknown;
             } else if (self.match(.lbracket)) {
+                self.last_call_values = null;
                 const bracket_line = self.tokens()[self.pos - 1].line;
                 const key = try self.expression(0);
                 try self.consumeCloseBracket(bracket_line);
@@ -900,17 +990,20 @@ const Parser = struct {
                         try self.consume(.rparen);
                     }
                     value = .{ .nil = {} };
+                    self.last_call_values = null;
                     continue;
                 }
+                const call_line = self.peek().line;
                 const returns = self.callFunctionValue(value) catch |err| {
                     if (err == error.RuntimeError and value != .function and value != .builtin) {
                         self.vm.setRuntimeErrorAt(
-                            self.peek().line,
+                            call_line,
                             try valueAccessErrorMessage(self.vm.allocator, "call", value, context_name, context_scope),
                         );
                     }
                     return err;
                 };
+                self.last_call_values = returns;
                 value = if (returns.len == 0) Value{ .nil = {} } else returns[0];
                 context_name = null;
                 context_scope = .unknown;
@@ -926,6 +1019,26 @@ const Parser = struct {
         if (!self.match(.rparen)) {
             try self.parseExpressionList(&args);
             try self.consumeCloseParen(open.line);
+        }
+        if (callee != .function and callee != .builtin) {
+            self.vm.setRuntimeErrorAt(open.line, try std.fmt.allocPrint(self.vm.allocator, "attempt to call a {s} value", .{valueTypeName(callee)}));
+            return error.RuntimeError;
+        }
+        return self.invokeCallable(callee, args.items);
+    }
+
+    fn callFunctionValueWithPrefix(self: *Parser, callee: Value, receiver: Value) anyerror![]const Value {
+        const open = self.peek();
+        try self.consume(.lparen);
+        var args: std.ArrayList(Value) = .empty;
+        try args.append(self.vm.allocator, receiver);
+        if (!self.match(.rparen)) {
+            try self.parseExpressionList(&args);
+            try self.consumeCloseParen(open.line);
+        }
+        if (callee != .function and callee != .builtin) {
+            self.vm.setRuntimeErrorAt(open.line, try std.fmt.allocPrint(self.vm.allocator, "attempt to call a {s} value", .{valueTypeName(callee)}));
+            return error.RuntimeError;
         }
         return self.invokeCallable(callee, args.items);
     }
@@ -1049,6 +1162,7 @@ const Parser = struct {
             .scope_start = self.vm.scopes.items.len - 1,
             .lexical_scope_len = function.lexical_scope_len,
             .env = function.env,
+            .captures = &function.captures,
         });
         defer _ = self.vm.frames.pop();
         for (function.params, 0..) |param, i| {
@@ -1072,6 +1186,7 @@ const Parser = struct {
             .string => return .{ .string = token.lexeme },
             .ellipsis => {
                 const values = self.vm.currentVarargs();
+                self.last_call_values = values;
                 return if (values.len == 0) Value{ .nil = {} } else values[0];
             },
             .ident => {
@@ -1084,11 +1199,13 @@ const Parser = struct {
                 if (std.mem.eql(u8, token.lexeme, "nil")) return .{ .nil = {} };
                 if (std.mem.eql(u8, token.lexeme, "true")) return .{ .boolean = true };
                 if (std.mem.eql(u8, token.lexeme, "false")) return .{ .boolean = false };
+                if (std.mem.eql(u8, token.lexeme, "function")) return self.parseAnonymousFunction(token.line);
                 return error.UnsupportedFeature;
             },
             .lparen => {
                 const value = try self.expression(0);
                 try self.consumeCloseParen(token.line);
+                self.last_call_values = null;
                 return value;
             },
             .lbrace => return self.tableConstructor(),
@@ -1105,14 +1222,14 @@ const Parser = struct {
                 try self.consume(.assign);
                 try table.setString(key, try self.expression(0));
             } else {
-                const start = self.pos;
+                self.last_call_values = null;
                 const first_value = try self.expression(0);
                 if (self.peek().tag == .comma or self.peek().tag == .semi) {
                     try table.appendArray(self.vm.allocator, first_value);
-                } else {
-                    self.pos = start;
-                    const values = try self.expressionValues();
+                } else if (self.last_call_values) |values| {
                     for (values) |value| try table.appendArray(self.vm.allocator, value);
+                } else {
+                    try table.appendArray(self.vm.allocator, first_value);
                 }
             }
             if (self.match(.comma) or self.match(.semi)) {
@@ -1122,6 +1239,7 @@ const Parser = struct {
             try self.consume(.rbrace);
             break;
         }
+        self.last_call_values = null;
         return .{ .table = table };
     }
 
@@ -1514,8 +1632,7 @@ fn labelTerminatesBlock(tokens: []const Token, label_index: usize) bool {
         {
             return true;
         }
-        if ((token.tag == .keyword or token.tag == .ident) and std.mem.eql(u8, token.lexeme, "elseif"))
-        {
+        if ((token.tag == .keyword or token.tag == .ident) and std.mem.eql(u8, token.lexeme, "elseif")) {
             return true;
         }
         return false;
@@ -1551,17 +1668,10 @@ fn tokenNearText(allocator: std.mem.Allocator, token: Token) ![]const u8 {
 }
 
 fn classifyUnsupportedTokens(tokens: []const Token) ?[]const u8 {
-    if (detectNamedClosureEscape(tokens)) return "closure-upvalues";
     if (classifyAdvancedHookBoundary(tokens)) |boundary| return advanced_hooks.reasonName(boundary);
     var i: usize = 0;
     while (i < tokens.len) : (i += 1) {
         const token = tokens[i];
-        if (token.tag == .keyword and std.mem.eql(u8, token.lexeme, "return")) {
-            if (i + 1 < tokens.len and tokens[i + 1].tag == .keyword and std.mem.eql(u8, tokens[i + 1].lexeme, "function")) return "closure-upvalues";
-        }
-        if (token.tag == .keyword and std.mem.eql(u8, token.lexeme, "function")) {
-            if (i + 1 < tokens.len and tokens[i + 1].tag == .lparen) return "closure-upvalues";
-        }
         if (token.tag == .ident and std.mem.eql(u8, token.lexeme, "_ENV")) {
             if (i + 1 < tokens.len and tokens[i + 1].tag == .lbracket) return "dynamic-env-mutation";
             if (i + 1 < tokens.len and tokens[i + 1].tag == .assign) {
@@ -2315,6 +2425,7 @@ fn lex(allocator: std.mem.Allocator, source: []const u8) !std.ArrayList(Token) {
             ',' => .comma,
             ';' => .semi,
             '.' => .dot,
+            ':' => .colon,
             '=' => .assign,
             '+' => .plus,
             '-' => .minus,
@@ -2901,7 +3012,8 @@ test "mixed integer float ordered comparisons preserve precision boundaries" {
         \\
     );
     try std.testing.expectEqual(VmState.pass, result.state);
-    try std.testing.expectEqualSlices(u8,
+    try std.testing.expectEqualSlices(
+        u8,
         "false\tfalse\ttrue\ttrue\n" ++
             "true\ttrue\tfalse\tfalse\n" ++
             "true\ttrue\tfalse\tfalse\n" ++
@@ -2928,20 +3040,37 @@ test "bitwise float coercion rejects nan and overflow without panicking" {
     }
 }
 
-test "vm level1 closures and dynamic features are explicitly unsupported fallback" {
+test "vm level1 closures upvalues aliases and method calls execute natively" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const snippets = [_]struct { source: []const u8, stdout: []const u8 }{
+        .{ .source = "local function counter(start)\n  local value = start\n  return function()\n    value = value + 1\n    return value\n  end\nend\nlocal a = counter(10)\nlocal b = counter(5)\nprint(a(), a(), b())\n", .stdout = "11\t12\t6\n" },
+        .{ .source = "local function outer(x)\n  local function inner() return x end\n  return inner\nend\nlocal f = outer(5)\nprint(f())\n", .stdout = "5\n" },
+        .{ .source = "local function outer(x)\n  local function inner() return x end\n  local alias = inner\n  return alias\nend\nlocal f = outer(5)\nprint(f())\n", .stdout = "5\n" },
+        .{ .source = "local function outer(x)\n  local function inner() return x end\n  local alias = inner\n  return (\n    alias\n  )\nend\nlocal f = outer(5)\nprint(f())\n", .stdout = "5\n" },
+        .{ .source = "local function outer(x)\n  local function inner() return x end\n  local alias = (inner)\n  return alias\nend\nlocal f = outer(5)\nprint(f())\n", .stdout = "5\n" },
+        .{ .source = "local function outer(x)\n  local function inner() return x end\n  local alias\n  alias = (inner)\n  return alias\nend\nlocal f = outer(5)\nprint(f())\n", .stdout = "5\n" },
+        .{ .source = "local function outer(x)\n  local function inner() return x end\n  local first, second = nil, inner\n  return second\nend\nlocal f = outer(5)\nprint(f())\n", .stdout = "5\n" },
+        .{ .source = "local function outer(x)\n  local function inner() return x end\n  local first, second\n  first, second = nil, inner\n  return second\nend\nlocal f = outer(5)\nprint(f())\n", .stdout = "5\n" },
+        .{ .source = "local function outer(x)\n  local function inner() return x end\n  escaped = inner\nend\nouter(5)\nprint(escaped())\nescaped = nil\n", .stdout = "5\n" },
+        .{ .source = "local function outer(x)\n  local function inner() return x end\n  local box = {}\n  box.fn = inner\n  return box.fn\nend\nlocal f = outer(5)\nprint(f())\n", .stdout = "5\n" },
+        .{ .source = "local box = { value = 7 }\nbox.get = function(self, extra) return self.value, extra end\nprint(box:get(3))\n", .stdout = "7\t3\n" },
+        .{ .source = "local t = {}\nt.fn = function() return 1, 2 end\nprint(t.fn())\n", .stdout = "1\t2\n" },
+    };
+    for (snippets) |snippet| {
+        const result = try runLevel0(arena.allocator(), snippet.source);
+        try std.testing.expectEqual(VmState.pass, result.state);
+        try std.testing.expectEqual(@as(u8, 0), result.exit_code);
+        try std.testing.expectEqualSlices(u8, snippet.stdout, result.stdout);
+        try std.testing.expectEqualSlices(u8, "", result.stderr);
+        _ = arena.reset(.retain_capacity);
+    }
+}
+
+test "vm level1 dynamic features remain explicitly unsupported fallback" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const snippets = [_]struct { source: []const u8, reason: []const u8 }{
-        .{ .source = "local function counter(start)\n  return function() return start end\nend\nprint(counter(1)())\n", .reason = "closure-upvalues" },
-        .{ .source = "local function outer(x)\n  local function inner() return x end\n  return inner\nend\nlocal f = outer(5)\nprint(f())\n", .reason = "closure-upvalues" },
-        .{ .source = "local function outer(x)\n  local function inner() return x end\n  local alias = inner\n  return alias\nend\nlocal f = outer(5)\nprint(f())\n", .reason = "closure-upvalues" },
-        .{ .source = "local function outer(x)\n  local function inner() return x end\n  local alias = inner\n  return (\n    alias\n  )\nend\nlocal f = outer(5)\nprint(f())\n", .reason = "closure-upvalues" },
-        .{ .source = "local function outer(x)\n  local function inner() return x end\n  local alias = (inner)\n  return alias\nend\nlocal f = outer(5)\nprint(f())\n", .reason = "closure-upvalues" },
-        .{ .source = "local function outer(x)\n  local function inner() return x end\n  local alias\n  alias = (inner)\n  return alias\nend\nlocal f = outer(5)\nprint(f())\n", .reason = "closure-upvalues" },
-        .{ .source = "local function outer(x)\n  local function inner() return x end\n  local first, second = nil, inner\n  return second\nend\nlocal f = outer(5)\nprint(f())\n", .reason = "closure-upvalues" },
-        .{ .source = "local function outer(x)\n  local function inner() return x end\n  local first, second\n  first, second = nil, inner\n  return second\nend\nlocal f = outer(5)\nprint(f())\n", .reason = "closure-upvalues" },
-        .{ .source = "local function outer(x)\n  local function inner() return x end\n  escaped = inner\nend\nouter(5)\nprint(escaped())\nescaped = nil\n", .reason = "closure-upvalues" },
-        .{ .source = "local function outer(x)\n  local function inner() return x end\n  local box = {}\n  box.fn = inner\n  return box.fn\nend\nlocal f = outer(5)\nprint(f())\n", .reason = "closure-upvalues" },
         .{ .source = "load(\"print(1)\")()\n", .reason = "load" },
         .{ .source = "_ENV = {}\nprint(1)\n", .reason = "dynamic-env-mutation" },
     };

@@ -124,6 +124,35 @@ NATIVE_CORE_COVERAGE_REQUIREMENTS = {
             "diagnostic:bitwise-coercion",
         ],
     },
+    "VAL-NATIVE-011": {
+        "min_cases": 4,
+        "required_puc_files": ["calls.lua"],
+        "required_tags": [
+            "call:nested",
+            "call:return-adjustment",
+            "call:method-sugar",
+            "call:table-field",
+        ],
+    },
+    "VAL-NATIVE-012": {
+        "min_cases": 4,
+        "required_puc_files": ["closure.lua"],
+        "required_tags": [
+            "closure:lexical-capture",
+            "closure:closed-upvalue",
+            "closure:mutation-visibility",
+            "closure:aliasing",
+        ],
+    },
+    "VAL-NATIVE-013": {
+        "min_cases": 2,
+        "required_puc_files": ["code.lua"],
+        "required_tags": [
+            "code:register-pressure",
+            "code:nested-prototypes",
+            "code:long-expression",
+        ],
+    },
 }
 NATIVE_CORE_LANGUAGE_CASES = [
     {
@@ -253,6 +282,134 @@ NATIVE_CORE_LANGUAGE_CASES = [
         "coverage_tags": ["vararg:main-chunk"],
         "description": "stdin main chunks expose an empty vararg tuple when invoked without script arguments",
         "source": 'print(select("#", ...))\n',
+    },
+    {
+        "name": "calls-nested-return-method-core",
+        "puc_file": "calls.lua",
+        "validates": ["VAL-NATIVE-011"],
+        "coverage_tags": ["call:nested", "call:return-adjustment", "call:method-sugar", "call:table-field"],
+        "description": "nested calls, table-field calls, method-call sugar, and multiple return adjustment",
+        "source": """local function values() return 1, 2, 3 end
+local box = { base = 10 }
+box.add = function(self, a, b) return self.base + a, b end
+local function passthrough(...) return ... end
+local a, b, c = passthrough(values())
+print(a, b, c)
+print(box:add(5, 9))
+print(box.add(box, 1, 2))
+""",
+    },
+    {
+        "name": "calls-tail-field-return-core",
+        "puc_file": "calls.lua",
+        "validates": ["VAL-NATIVE-011"],
+        "coverage_tags": ["call:nested", "call:return-adjustment", "call:table-field"],
+        "description": "tail-position returns through table fields preserve the complete result tuple",
+        "source": """local t = {}
+t.finish = function(x) return "done", x end
+local function bounce(n) if n == 0 then return t.finish(8) end return bounce(n - 1) end
+print(bounce(3))
+""",
+    },
+    {
+        "name": "calls-direct-nested-core",
+        "puc_file": "calls.lua",
+        "validates": ["VAL-NATIVE-011"],
+        "coverage_tags": ["call:nested", "call:return-adjustment"],
+        "description": "nested direct calls preserve argument and return adjustment semantics",
+        "source": """local function f(a, b, c) return c, b, a end
+local function g() return f(1, 2) end
+print(g())
+""",
+    },
+    {
+        "name": "calls-field-multireturn-core",
+        "puc_file": "calls.lua",
+        "validates": ["VAL-NATIVE-011"],
+        "coverage_tags": ["call:table-field", "call:return-adjustment"],
+        "description": "function calls through table fields expand multiple returns in final argument position",
+        "source": """local t = {}
+t.values = function() return "a", nil, "c" end
+print(1, t.values())
+""",
+    },
+    {
+        "name": "closure-counter-upvalue-core",
+        "puc_file": "closure.lua",
+        "validates": ["VAL-NATIVE-012"],
+        "coverage_tags": ["closure:lexical-capture", "closure:closed-upvalue", "closure:mutation-visibility"],
+        "description": "escaped closures retain closed mutable upvalues independently after scope exit",
+        "source": """local function counter(start)
+  local value = start
+  return function() value = value + 1; return value end
+end
+local a = counter(10)
+local b = counter(5)
+print(a(), a())
+print(b())
+""",
+    },
+    {
+        "name": "closure-alias-escape-core",
+        "puc_file": "closure.lua",
+        "validates": ["VAL-NATIVE-012"],
+        "coverage_tags": ["closure:lexical-capture", "closure:closed-upvalue", "closure:aliasing"],
+        "description": "nested closures can escape through aliases, table fields, and globals without losing captured cells",
+        "source": """local function outer(x)
+  local function inner() return x end
+  local alias = (inner)
+  local box = {}
+  box.fn = alias
+  escaped = box.fn
+end
+outer(5)
+print(escaped())
+escaped = nil
+""",
+    },
+    {
+        "name": "closure-shared-upvalue-core",
+        "puc_file": "closure.lua",
+        "validates": ["VAL-NATIVE-012"],
+        "coverage_tags": ["closure:lexical-capture", "closure:closed-upvalue", "closure:mutation-visibility", "closure:aliasing"],
+        "description": "sibling closures share the same closed upvalue cell after their factory returns",
+        "source": """local function make()
+  local x = 0
+  return function() x = x + 1 end, function() return x end
+end
+local inc, get = make()
+inc()
+inc()
+print(get())
+""",
+    },
+    {
+        "name": "code-register-expression-core",
+        "puc_file": "code.lua",
+        "validates": ["VAL-NATIVE-013"],
+        "coverage_tags": ["code:register-pressure", "code:long-expression"],
+        "description": "long expression and local register pressure execute with stock-observable results",
+        "source": """local a,b,c,d,e,f,g,h = 1,2,3,4,5,6,7,8
+local total = a+b+c+d+e+f+g+h + (a*b) + (h//b)
+print(total)
+""",
+    },
+    {
+        "name": "code-nested-prototype-core",
+        "puc_file": "code.lua",
+        "validates": ["VAL-NATIVE-013", "VAL-NATIVE-012"],
+        "coverage_tags": ["code:nested-prototypes", "closure:lexical-capture", "closure:closed-upvalue"],
+        "description": "nested prototype execution captures outer variables and returns through multiple call layers",
+        "source": """local function outer(a)
+  local b = a + 1
+  local function middle(c)
+    local function inner(d) return a, b, c, d end
+    return inner
+  end
+  return middle(3)
+end
+print(outer(1)(4))
+""",
     },
     {
         "name": "bitwise-core",
@@ -1678,7 +1835,7 @@ class BaselineOracle:
                 }
             )
 
-        required_ids = {f"VAL-NATIVE-{i:03d}" for i in range(4, 11)}
+        required_ids = {f"VAL-NATIVE-{i:03d}" for i in range(4, 14)}
         missing_ids = sorted(required_ids.difference(validated_ids))
         if missing_ids:
             state = "fail"
@@ -1708,9 +1865,9 @@ class BaselineOracle:
             "coverage_errors": coverage_errors,
             "coverage_error_count": len(coverage_errors),
             "staged_puc_files": sorted({str(case["puc_file"]) for case in NATIVE_CORE_LANGUAGE_CASES}),
-            "required_puc_files": ["bitwise.lua", "bwcoercion.lua", "constructs.lua", "errors.lua", "goto.lua", "literals.lua", "vararg.lua"],
+            "required_puc_files": ["bitwise.lua", "bwcoercion.lua", "calls.lua", "closure.lua", "code.lua", "constructs.lua", "errors.lua", "goto.lua", "literals.lua", "vararg.lua"],
             "compared_fields": ["stdout", "stderr", "exit_code"],
-            "classification": "M4 staged PUC-derived core language snippets are executed through lua-zig run with LUA_ZIG_RUN_NO_HOST_LUA=1; fallback and unsupported markers fail native compatibility accounting.",
+            "classification": "M4/M5 staged PUC-derived core, calls, closure, and code snippets are executed through lua-zig run with LUA_ZIG_RUN_NO_HOST_LUA=1; fallback and unsupported markers fail native compatibility accounting.",
         }
         self.write_json("native-core-language/summary.json", summary)
         return summary

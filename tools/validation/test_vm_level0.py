@@ -88,32 +88,13 @@ class VmLevel0Tests(unittest.TestCase):
                 self.assertIn("fallback", candidate.stderr)
                 self.assertIn(str(fixture["reason"]), candidate.stderr)
 
-    def test_level1_supported_corpus_matches_stock_lua_or_classifies_closures(self):
-        closure_snippets = {
-            "level1-closures",
-            "level1-named-closure-escape",
-            "level1-aliased-closure-escape",
-            "level1-parenthesized-return-alias-closure-escape",
-            "level1-parenthesized-local-alias-closure-escape",
-            "level1-parenthesized-assignment-alias-closure-escape",
-            "level1-multiname-local-closure-escape",
-            "level1-multitarget-assignment-closure-escape",
-            "level1-global-assignment-closure-escape",
-            "level1-table-assignment-closure-escape",
-        }
+    def test_level1_supported_corpus_matches_stock_lua(self):
         for snippet in pass_snippets(1):
             with self.subTest(snippet=snippet["name"]):
                 stock = run("./lua", "-", stdin=str(snippet["source"]))
                 candidate = run(VM_COMMAND, stdin=str(snippet["source"]))
 
                 self.assertEqual(stock.returncode, 0, stock.stderr)
-                if snippet["name"] in closure_snippets:
-                    self.assertNotEqual(candidate.returncode, 0)
-                    self.assertEqual(candidate.stdout, "")
-                    self.assertIn("unsupported", candidate.stderr)
-                    self.assertIn("closure", candidate.stderr)
-                    continue
-
                 self.assertEqual(candidate.returncode, 0, candidate.stderr)
                 self.assertEqual(candidate.stdout, stock.stdout)
                 self.assertEqual(candidate.stderr, stock.stderr)
@@ -273,6 +254,9 @@ class VmLevel0Tests(unittest.TestCase):
                 "VAL-NATIVE-008",
                 "VAL-NATIVE-009",
                 "VAL-NATIVE-010",
+                "VAL-NATIVE-011",
+                "VAL-NATIVE-012",
+                "VAL-NATIVE-013",
             ],
         )
 
