@@ -14,6 +14,7 @@ const value = @import("value.zig");
 const vm_level0 = @import("vm_level0.zig");
 const bc_vm = @import("bc_vm.zig");
 const undump = @import("undump.zig");
+const bc_compiler = @import("bc_compiler.zig");
 
 test {
     _ = advanced_hooks;
@@ -22,6 +23,7 @@ test {
     _ = vm_level0;
     _ = bc_vm;
     _ = undump;
+    _ = bc_compiler;
 }
 
 test "runtime constructors require allocator" {
