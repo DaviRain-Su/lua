@@ -168,6 +168,9 @@ const Builtin = enum {
     os_remove,
     os_rename,
     os_tmpname,
+    // package/require
+    require,
+    package_searchpath,
 };
 
 const ValueTag = enum { nil, boolean, integer, float, string, table, function, builtin, thread, wrapped_thread };
@@ -728,6 +731,29 @@ const Vm = struct {
         try os_table.setString("rename", .{ .builtin = .os_rename });
         try os_table.setString("tmpname", .{ .builtin = .os_tmpname });
         try default_env.setString("os", .{ .table = os_table });
+
+        // package/require system
+        const package_table = try Table.create(allocator);
+        try package_table.setString("path", .{ .string = "./?.lua;./?/init.lua" });
+        try package_table.setString("cpath", .{ .string = "" });
+        try package_table.setString("config", .{ .string = "/\n;\n?\n!\n-" });
+        try package_table.setString("searchpath", .{ .builtin = .package_searchpath });
+        // package.loaded — tracks loaded modules
+        const loaded_table = try Table.create(allocator);
+        try loaded_table.setString("_G", .{ .table = default_env });
+        try loaded_table.setString("math", .{ .table = math_table });
+        try loaded_table.setString("string", .{ .table = string_table });
+        try loaded_table.setString("table", .{ .table = table_lib });
+        try loaded_table.setString("io", .{ .table = io_table });
+        try loaded_table.setString("os", .{ .table = os_table });
+        try loaded_table.setString("coroutine", .{ .table = coroutine_table });
+        try loaded_table.setString("package", .{ .table = package_table });
+        try package_table.setString("loaded", .{ .table = loaded_table });
+        // package.preload
+        const preload_table = try Table.create(allocator);
+        try package_table.setString("preload", .{ .table = preload_table });
+        try default_env.setString("package", .{ .table = package_table });
+        try default_env.setString("require", .{ .builtin = .require });
         try vm.declare("_ENV", .{ .table = default_env });
         return vm;
     }
@@ -3284,6 +3310,61 @@ const Parser = struct {
                 values[0] = .{ .string = "/tmp/lua_XXXXXX" };
                 return values;
             },
+
+            // ====================
+            // package/require
+            // ====================
+
+            .require => {
+                if (args.len < 1) return error.RuntimeError;
+                const modname = try self.toString(args[0]);
+
+                // 1. Check package.loaded
+                const pkg = self.vm.lookup("package");
+                if (pkg == .table) {
+                    const loaded_val = pkg.table.getString("loaded");
+                    if (!loaded_val.isNil() and loaded_val == .table) {
+                        const cached = loaded_val.table.getString(modname);
+                        if (!cached.isNil()) {
+                            const values = try self.vm.allocator.alloc(Value, 1);
+                            values[0] = cached;
+                            return values;
+                        }
+                    }
+                    // 2. Check package.preload
+                    const preload_val = pkg.table.getString("preload");
+                    if (!preload_val.isNil() and preload_val == .table) {
+                        const loader = preload_val.table.getString(modname);
+                        if (!loader.isNil()) {
+                            const loader_args = try self.vm.allocator.alloc(Value, 1);
+                            loader_args[0] = .{ .string = modname };
+                            const result = try self.invokeCallable(loader, loader_args);
+                            // Cache result
+                            const loaded2 = pkg.table.getString("loaded");
+                            if (!loaded2.isNil() and loaded2 == .table) {
+                                try loaded2.table.setString(modname, if (result.len > 0) result[0] else .{ .boolean = true });
+                            }
+                            return result;
+                        }
+                    }
+                }
+
+                // Module not found
+                const err_msg = try std.fmt.allocPrint(self.vm.allocator, "module '{s}' not found", .{modname});
+                self.vm.setRuntimeErrorAt(self.peek().line, err_msg);
+                return error.RuntimeError;
+            },
+            .package_searchpath => {
+                if (args.len < 2) return error.RuntimeError;
+                const _name = try self.toString(args[0]);
+                _ = _name;
+                const _path = try self.toString(args[1]);
+                _ = _path;
+                // Search path not fully implemented
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .nil = {} };
+                return values;
+            },
         }
     }
 
@@ -3313,6 +3394,24 @@ const Parser = struct {
                 break :blk "";
             },
         };
+    }
+
+    fn resolveModulePath(self: *Parser, template: []const u8, modname: []const u8) anyerror![]const u8 {
+        // Replace '?' with modname
+        const count = std.mem.count(u8, template, "?");
+        const total_len = template.len + count * modname.len - count;
+        const buf = try self.vm.allocator.alloc(u8, total_len);
+        var offset: usize = 0;
+        for (template) |c| {
+            if (c == '?') {
+                @memcpy(buf[offset..][0..modname.len], modname);
+                offset += modname.len;
+            } else {
+                buf[offset] = c;
+                offset += 1;
+            }
+        }
+        return buf[0..offset];
     }
 
     fn lessThan(self: *Parser, a: Value, b: Value) anyerror!bool {
