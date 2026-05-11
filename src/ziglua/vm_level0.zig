@@ -95,6 +95,32 @@ const Builtin = enum {
     coroutine_wrap,
     coroutine_running,
     coroutine_isyieldable,
+    // math library
+    math_abs,
+    math_ceil,
+    math_floor,
+    math_sqrt,
+    math_max,
+    math_min,
+    math_exp,
+    math_log,
+    math_sin,
+    math_cos,
+    math_tan,
+    math_asin,
+    math_acos,
+    math_atan,
+    math_deg,
+    math_rad,
+    math_fmod,
+    math_modf,
+    math_frexp,
+    math_ldexp,
+    math_ult,
+    math_tointeger,
+    math_type,
+    math_random,
+    math_randomseed,
 };
 
 const ValueTag = enum { nil, boolean, integer, float, string, table, function, builtin, thread, wrapped_thread };
@@ -556,6 +582,40 @@ const Vm = struct {
         try coroutine_table.setString("isyieldable", .{ .builtin = .coroutine_isyieldable });
         try default_env.setString("coroutine", .{ .table = coroutine_table });
         try default_env.setString("_G", .{ .table = default_env });
+
+        // math library
+        const math_table = try Table.create(allocator);
+        try math_table.setString("abs", .{ .builtin = .math_abs });
+        try math_table.setString("ceil", .{ .builtin = .math_ceil });
+        try math_table.setString("floor", .{ .builtin = .math_floor });
+        try math_table.setString("sqrt", .{ .builtin = .math_sqrt });
+        try math_table.setString("max", .{ .builtin = .math_max });
+        try math_table.setString("min", .{ .builtin = .math_min });
+        try math_table.setString("exp", .{ .builtin = .math_exp });
+        try math_table.setString("log", .{ .builtin = .math_log });
+        try math_table.setString("sin", .{ .builtin = .math_sin });
+        try math_table.setString("cos", .{ .builtin = .math_cos });
+        try math_table.setString("tan", .{ .builtin = .math_tan });
+        try math_table.setString("asin", .{ .builtin = .math_asin });
+        try math_table.setString("acos", .{ .builtin = .math_acos });
+        try math_table.setString("atan", .{ .builtin = .math_atan });
+        try math_table.setString("deg", .{ .builtin = .math_deg });
+        try math_table.setString("rad", .{ .builtin = .math_rad });
+        try math_table.setString("fmod", .{ .builtin = .math_fmod });
+        try math_table.setString("modf", .{ .builtin = .math_modf });
+        try math_table.setString("frexp", .{ .builtin = .math_frexp });
+        try math_table.setString("ldexp", .{ .builtin = .math_ldexp });
+        try math_table.setString("ult", .{ .builtin = .math_ult });
+        try math_table.setString("tointeger", .{ .builtin = .math_tointeger });
+        try math_table.setString("type", .{ .builtin = .math_type });
+        try math_table.setString("random", .{ .builtin = .math_random });
+        try math_table.setString("randomseed", .{ .builtin = .math_randomseed });
+        // math constants
+        try math_table.setString("pi", .{ .float = std.math.pi });
+        try math_table.setString("huge", .{ .float = std.math.inf(f64) });
+        try math_table.setString("maxinteger", .{ .integer = std.math.maxInt(i64) });
+        try math_table.setString("mininteger", .{ .integer = std.math.minInt(i64) });
+        try default_env.setString("math", .{ .table = math_table });
         try vm.declare("_ENV", .{ .table = default_env });
         return vm;
     }
@@ -2168,7 +2228,362 @@ const Parser = struct {
                 values[0] = .{ .boolean = self.vm.current_thread != null };
                 return values;
             },
+
+            // ====================
+            // math library
+            // ====================
+
+            .math_abs => {
+                if (args.len == 0) return error.RuntimeError;
+                const n = try self.toNumber(args[0]);
+                const result: Value = switch (n) {
+                    .integer => |i| .{ .integer = if (i == std.math.minInt(i64)) blk: {
+                        break :blk @as(i64, @intFromFloat(@abs(@as(f64, @floatFromInt(i)))));
+                    } else if (i < 0) -i else i },
+                    .float => |f| if (f != f) .{ .float = std.math.nan(f64) } else .{ .float = @abs(f) },
+                    else => return error.RuntimeError,
+                };
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = result;
+                return values;
+            },
+            .math_ceil => {
+                if (args.len == 0) return error.RuntimeError;
+                const n = try self.toNumber(args[0]);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                switch (n) {
+                    .integer => |i| values[0] = .{ .integer = i },
+                    .float => |f| {
+                        const result = std.math.ceil(f);
+                        if (floatToInteger(result, .eq)) |i| {
+                            values[0] = .{ .integer = i };
+                        } else {
+                            values[0] = .{ .float = result };
+                        }
+                    },
+                    else => return error.RuntimeError,
+                }
+                return values;
+            },
+            .math_floor => {
+                if (args.len == 0) return error.RuntimeError;
+                const n = try self.toNumber(args[0]);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                switch (n) {
+                    .integer => |i| values[0] = .{ .integer = i },
+                    .float => |f| {
+                        const result = std.math.floor(f);
+                        if (floatToInteger(result, .eq)) |i| {
+                            values[0] = .{ .integer = i };
+                        } else {
+                            values[0] = .{ .float = result };
+                        }
+                    },
+                    else => return error.RuntimeError,
+                }
+                return values;
+            },
+            .math_sqrt => {
+                if (args.len == 0) return error.RuntimeError;
+                const n = try self.toNumber(args[0]);
+                const f = switch (n) {
+                    .integer => |i| @as(f64, @floatFromInt(i)),
+                    .float => |f2| f2,
+                    else => return error.RuntimeError,
+                };
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .float = @sqrt(f) };
+                return values;
+            },
+            .math_max => {
+                if (args.len == 0) return error.RuntimeError;
+                var best = try self.toNumber(args[0]);
+                for (args[1..]) |arg| {
+                    const n = try self.toNumber(arg);
+                    if (compareNumbers(n, best, .gt)) best = n;
+                }
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = numberToValue(best);
+                return values;
+            },
+            .math_min => {
+                if (args.len == 0) return error.RuntimeError;
+                var best = try self.toNumber(args[0]);
+                for (args[1..]) |arg| {
+                    const n = try self.toNumber(arg);
+                    if (compareNumbers(n, best, .lt)) best = n;
+                }
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = numberToValue(best);
+                return values;
+            },
+            .math_exp => {
+                if (args.len == 0) return error.RuntimeError;
+                const n = try self.toNumber(args[0]);
+                const f = switch (n) {
+                    .integer => |i| @as(f64, @floatFromInt(i)),
+                    .float => |f2| f2,
+                    else => return error.RuntimeError,
+                };
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .float = @exp(f) };
+                return values;
+            },
+            .math_log => {
+                if (args.len == 0) return error.RuntimeError;
+                const n = try self.toNumber(args[0]);
+                const x = switch (n) {
+                    .integer => |i| @as(f64, @floatFromInt(i)),
+                    .float => |f2| f2,
+                    else => return error.RuntimeError,
+                };
+                const result = if (args.len >= 2) blk: {
+                    const base_n = try self.toNumber(args[1]);
+                    const base = switch (base_n) {
+                        .integer => |i| @as(f64, @floatFromInt(i)),
+                        .float => |f2| f2,
+                        else => return error.RuntimeError,
+                    };
+                    break :blk @log(x) / @log(base);
+                } else @log(x);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .float = result };
+                return values;
+            },
+            .math_sin => return self.mathTrig(args, std.math.sin),
+            .math_cos => return self.mathTrig(args, std.math.cos),
+            .math_tan => return self.mathTrig(args, std.math.tan),
+            .math_asin => return self.mathTrig(args, std.math.asin),
+            .math_acos => return self.mathTrig(args, std.math.acos),
+            .math_atan => {
+                if (args.len == 0) return error.RuntimeError;
+                const n = try self.toNumber(args[0]);
+                const y = switch (n) {
+                    .integer => |i| @as(f64, @floatFromInt(i)),
+                    .float => |f2| f2,
+                    else => return error.RuntimeError,
+                };
+                const result = if (args.len >= 2) blk: {
+                    const xn = try self.toNumber(args[1]);
+                    const x = switch (xn) {
+                        .integer => |i| @as(f64, @floatFromInt(i)),
+                        .float => |f2| f2,
+                        else => return error.RuntimeError,
+                    };
+                    break :blk std.math.atan2(y, x);
+                } else std.math.atan(y);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .float = result };
+                return values;
+            },
+            .math_deg => {
+                if (args.len == 0) return error.RuntimeError;
+                const n = try self.toNumber(args[0]);
+                const r = switch (n) {
+                    .integer => |i| @as(f64, @floatFromInt(i)),
+                    .float => |f2| f2,
+                    else => return error.RuntimeError,
+                };
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .float = r * 180.0 / std.math.pi };
+                return values;
+            },
+            .math_rad => {
+                if (args.len == 0) return error.RuntimeError;
+                const n = try self.toNumber(args[0]);
+                const d = switch (n) {
+                    .integer => |i| @as(f64, @floatFromInt(i)),
+                    .float => |f2| f2,
+                    else => return error.RuntimeError,
+                };
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .float = d * std.math.pi / 180.0 };
+                return values;
+            },
+            .math_fmod => {
+                if (args.len < 2) return error.RuntimeError;
+                const a = try self.toFloat(args[0]);
+                const b = try self.toFloat(args[1]);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .float = @mod(a, b) };
+                return values;
+            },
+            .math_modf => {
+                if (args.len == 0) return error.RuntimeError;
+                const f = try self.toFloat(args[0]);
+                const frac = @mod(f, 1.0);
+                const int_part = f - frac;
+                const values = try self.vm.allocator.alloc(Value, 2);
+                values[0] = .{ .float = if (frac == 0.0) 0.0 else frac };
+                if (floatToInteger(int_part, .eq)) |i| {
+                    values[1] = .{ .integer = i };
+                } else {
+                    values[1] = .{ .float = int_part };
+                }
+                return values;
+            },
+            .math_frexp => {
+                if (args.len == 0) return error.RuntimeError;
+                const f = try self.toFloat(args[0]);
+                const result = std.math.frexp(f);
+                const values = try self.vm.allocator.alloc(Value, 2);
+                values[0] = .{ .float = result.significand };
+                values[1] = .{ .integer = result.exponent };
+                return values;
+            },
+            .math_ldexp => {
+                if (args.len < 2) return error.RuntimeError;
+                const f = try self.toFloat(args[0]);
+                const e = try self.toInteger(args[1]);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .float = std.math.ldexp(f, @intCast(e)) };
+                return values;
+            },
+            .math_ult => {
+                if (args.len < 2) return error.RuntimeError;
+                const a = try self.toInteger(args[0]);
+                const b = try self.toInteger(args[1]);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                // Reinterpret as unsigned for comparison
+                const ua: u64 = @bitCast(a);
+                const ub: u64 = @bitCast(b);
+                values[0] = .{ .boolean = ua < ub };
+                return values;
+            },
+            .math_tointeger => {
+                if (args.len == 0) return error.RuntimeError;
+                const n = try self.toNumber(args[0]);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                switch (n) {
+                    .integer => |i| values[0] = .{ .integer = i },
+                    .float => |f| values[0] = if (floatToInteger(f, .eq)) |i| .{ .integer = i } else .{ .nil = {} },
+                    else => return error.RuntimeError,
+                }
+                return values;
+            },
+            .math_type => {
+                if (args.len == 0) return error.RuntimeError;
+                const n = try self.toNumber(args[0]);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = switch (n) {
+                    .integer => .{ .string = "integer" },
+                    .float => .{ .string = "float" },
+                    else => .{ .nil = {} },
+                };
+                return values;
+            },
+            .math_random => {
+                // Simple LCG for now (not cryptographic quality)
+                // Use a thread-local seed stored in the Parser/VM
+                const lo: i64 = if (args.len >= 1) try self.toInteger(args[0]) else 1;
+                const hi: i64 = if (args.len >= 2) try self.toInteger(args[1]) else if (args.len >= 1) std.math.maxInt(i64) else 1;
+                const range = hi - lo + 1;
+                // Simple pseudo-random from stack address hash
+                var tmp: u64 = 0xDEADBEEF;
+                var seed: u64 = @intFromPtr(&tmp);
+                seed ^= seed >> 33;
+                seed *%= 0xff51afd7ed558ccd;
+                seed ^= seed >> 33;
+                seed *%= 0xc4ceb9fe1a85ec53;
+                seed ^= seed >> 33;
+                const ur = if (range > 0) @abs(seed % @abs(range)) else @as(u64, 0);
+                const r = lo + @as(i64, @intCast(ur));
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .integer = r };
+                return values;
+            },
+            .math_randomseed => {
+                // No persistent state in current VM — accept and ignore
+                const values = try self.vm.allocator.alloc(Value, 0);
+                return values;
+            },
         }
+    }
+
+    // ====================
+    // math library helpers
+    // ====================
+
+    const Number = union(enum) { integer: i64, float: f64, other: void };
+
+    fn toNumber(self: *Parser, v: Value) anyerror!Number {
+        _ = self;
+        return switch (v) {
+            .integer => |i| Number{ .integer = i },
+            .float => |f| Number{ .float = f },
+            .string => |s| blk: {
+                // Try parsing string as number
+                if (std.fmt.parseFloat(f64, s)) |f| break :blk Number{ .float = f } else |_| {}
+                if (std.fmt.parseInt(i64, s, 10)) |i| break :blk Number{ .integer = i } else |_| {}
+                return error.RuntimeError;
+            },
+            else => error.RuntimeError,
+        };
+    }
+
+    fn toFloat(self: *Parser, v: Value) anyerror!f64 {
+        const n = try self.toNumber(v);
+        return switch (n) {
+            .integer => |i| @as(f64, @floatFromInt(i)),
+            .float => |f| f,
+            .other => error.RuntimeError,
+        };
+    }
+
+    fn toInteger(self: *Parser, v: Value) anyerror!i64 {
+        const n = try self.toNumber(v);
+        return switch (n) {
+            .integer => |i| i,
+            .float => |f| floatToInteger(f, .eq) orelse error.RuntimeError,
+            .other => error.RuntimeError,
+        };
+    }
+
+    fn compareNumbers(a: Number, b: Number, op: enum { lt, gt }) bool {
+        return switch (op) {
+            .lt => switch (a) {
+                .integer => |ai| switch (b) {
+                    .integer => |bi| ai < bi,
+                    .float => |bf| @as(f64, @floatFromInt(ai)) < bf,
+                    .other => false,
+                },
+                .float => |af| switch (b) {
+                    .integer => |bi| af < @as(f64, @floatFromInt(bi)),
+                    .float => |bf| af < bf,
+                    .other => false,
+                },
+                .other => false,
+            },
+            .gt => switch (a) {
+                .integer => |ai| switch (b) {
+                    .integer => |bi| ai > bi,
+                    .float => |bf| @as(f64, @floatFromInt(ai)) > bf,
+                    .other => false,
+                },
+                .float => |af| switch (b) {
+                    .integer => |bi| af > @as(f64, @floatFromInt(bi)),
+                    .float => |bf| af > bf,
+                    .other => false,
+                },
+                .other => false,
+            },
+        };
+    }
+
+    fn numberToValue(n: Number) Value {
+        return switch (n) {
+            .integer => |i| .{ .integer = i },
+            .float => |f| .{ .float = f },
+            .other => .{ .nil = {} },
+        };
+    }
+
+    fn mathTrig(self: *Parser, args: []const Value, comptime func: anytype) anyerror![]const Value {
+        if (args.len == 0) return error.RuntimeError;
+        const f = try self.toFloat(args[0]);
+        const values = try self.vm.allocator.alloc(Value, 1);
+        values[0] = .{ .float = func(f) };
+        return values;
     }
 
     fn errorLevelLine(self: *Parser, level: i64) ?usize {
