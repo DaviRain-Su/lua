@@ -1,4 +1,5 @@
 const std = @import("std");
+const c_time = @cImport(@cInclude("time.h"));
 const advanced_hooks = @import("advanced_hooks.zig");
 const vm_table = @import("vm_table.zig");
 
@@ -1418,7 +1419,7 @@ const Parser = struct {
         var guard: usize = 0;
         while (true) {
             guard += 1;
-            if (guard > 100000) return error.UnsupportedFeature;
+            if (guard > 10000000) return error.UnsupportedFeature;
             var cond_parser = Parser{ .vm = self.vm, .pos = cond_start, .limit = do_idx, .evaluate = self.evaluate };
             if (!(try cond_parser.expression(0)).isTruthy()) break;
             var body = Parser{ .vm = self.vm, .pos = body_start, .limit = end_idx, .evaluate = self.evaluate };
@@ -1439,7 +1440,7 @@ const Parser = struct {
         var guard: usize = 0;
         while (true) {
             guard += 1;
-            if (guard > 100000) return error.UnsupportedFeature;
+            if (guard > 10000000) return error.UnsupportedFeature;
             var body = Parser{ .vm = self.vm, .pos = body_start, .limit = until_idx, .evaluate = self.evaluate };
             const signal = try body.parseBlock();
             switch (signal) {
@@ -1481,7 +1482,7 @@ const Parser = struct {
         var guard: usize = 0;
         while ((step >= 0 and i <= stop) or (step < 0 and i >= stop)) : (i += step) {
             guard += 1;
-            if (guard > 100000) return error.UnsupportedFeature;
+            if (guard > 10000000) return error.UnsupportedFeature;
             const signal = blk: {
                 try self.vm.pushScope(&.{}, false);
                 errdefer self.vm.popScope();
@@ -1525,7 +1526,7 @@ const Parser = struct {
         var guard: usize = 0;
         while (true) {
             guard += 1;
-            if (guard > 100000) return error.UnsupportedFeature;
+            if (guard > 10000000) return error.UnsupportedFeature;
             const returns = try self.invokeCallable(iterator, &.{ state, control });
             if (returns.len == 0 or returns[0].isNil()) break;
             control = returns[0];
@@ -3246,9 +3247,10 @@ const Parser = struct {
             // ====================
 
             .os_clock => {
-                // Return approximate CPU time — use a simple counter
+                const t = c_time.clock();
+                const sec: f64 = @as(f64, @floatFromInt(t)) / 1000000.0;
                 const values = try self.vm.allocator.alloc(Value, 1);
-                values[0] = .{ .float = 0.0 };
+                values[0] = .{ .float = sec };
                 return values;
             },
             .os_time => {
