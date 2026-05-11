@@ -136,6 +136,15 @@ const Builtin = enum {
     string_gmatch,
     string_gsub,
     string_dump,
+    // table library
+    table_insert,
+    table_remove,
+    table_sort,
+    table_concat,
+    table_move,
+    table_pack,
+    table_unpack,
+    table_create,
 };
 
 const ValueTag = enum { nil, boolean, integer, float, string, table, function, builtin, thread, wrapped_thread };
@@ -649,6 +658,18 @@ const Vm = struct {
         try string_table.setString("gsub", .{ .builtin = .string_gsub });
         try string_table.setString("dump", .{ .builtin = .string_dump });
         try default_env.setString("string", .{ .table = string_table });
+
+        // table library
+        const table_lib = try Table.create(allocator);
+        try table_lib.setString("insert", .{ .builtin = .table_insert });
+        try table_lib.setString("remove", .{ .builtin = .table_remove });
+        try table_lib.setString("sort", .{ .builtin = .table_sort });
+        try table_lib.setString("concat", .{ .builtin = .table_concat });
+        try table_lib.setString("move", .{ .builtin = .table_move });
+        try table_lib.setString("pack", .{ .builtin = .table_pack });
+        try table_lib.setString("unpack", .{ .builtin = .table_unpack });
+        try table_lib.setString("create", .{ .builtin = .table_create });
+        try default_env.setString("table", .{ .table = table_lib });
         try vm.declare("_ENV", .{ .table = default_env });
         return vm;
     }
@@ -2785,6 +2806,181 @@ const Parser = struct {
                 values[0] = .{ .nil = {} };
                 return values;
             },
+
+            // ====================
+            // table library
+            // ====================
+
+            .table_insert => {
+                if (args.len < 2 or args[0] != .table) return error.RuntimeError;
+                const t = args[0].table;
+                if (args.len == 2) {
+                    // table.insert(t, value) — append
+                    try t.appendArray(self.vm.allocator, args[1]);
+                } else {
+                    // table.insert(t, pos, value) — insert at position
+                    const pos = try self.toInteger(args[1]);
+                    if (pos < 1 or pos > t.array.items.len + 1) return error.RuntimeError;
+                    const idx: usize = @intCast(pos - 1);
+                    // Extend if needed
+                    try t.array.append(self.vm.allocator, .{ .nil = {} });
+                    // Shift elements right
+                    var i = t.array.items.len - 1;
+                    while (i > idx) : (i -= 1) {
+                        t.array.items[i] = t.array.items[i - 1];
+                    }
+                    t.array.items[idx] = args[2];
+                }
+                const values = try self.vm.allocator.alloc(Value, 0);
+                return values;
+            },
+            .table_remove => {
+                if (args.len < 1 or args[0] != .table) return error.RuntimeError;
+                const t = args[0].table;
+                if (t.array.items.len == 0) return error.RuntimeError;
+                const pos: usize = if (args.len >= 2) blk: {
+                    const p = try self.toInteger(args[1]);
+                    if (p < 1 or p > t.array.items.len) return error.RuntimeError;
+                    break :blk @intCast(p - 1);
+                } else t.array.items.len - 1;
+                const removed = t.array.items[pos];
+                // Shift elements left
+                var i = pos;
+                while (i < t.array.items.len - 1) : (i += 1) {
+                    t.array.items[i] = t.array.items[i + 1];
+                }
+                t.array.items[t.array.items.len - 1] = .{ .nil = {} };
+                // Shrink: remove trailing nils isn't needed, length handles it
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = removed;
+                return values;
+            },
+            .table_sort => {
+                if (args.len < 1 or args[0] != .table) return error.RuntimeError;
+                const t = args[0].table;
+                // Simple insertion sort (sufficient for correctness)
+                const n = t.array.items.len;
+                var i: usize = 1;
+                while (i < n) : (i += 1) {
+                    const key = t.array.items[i];
+                    var j: usize = i;
+                    while (j > 0) : (j -= 1) {
+                        // Compare: items[j-1] > key
+                        const should_swap = try self.lessThan(t.array.items[j - 1], key);
+                        if (!should_swap) break;
+                        t.array.items[j] = t.array.items[j - 1];
+                    }
+                    t.array.items[j] = key;
+                }
+                const values = try self.vm.allocator.alloc(Value, 0);
+                return values;
+            },
+            .table_concat => {
+                if (args.len < 1 or args[0] != .table) return error.RuntimeError;
+                const t = args[0].table;
+                const sep: []const u8 = if (args.len >= 2) try self.toString(args[1]) else "";
+                const i_raw: i64 = if (args.len >= 3) try self.toInteger(args[2]) else 1;
+                const j_raw: i64 = if (args.len >= 4) try self.toInteger(args[3]) else t.length();
+                if (i_raw > j_raw) {
+                    const values = try self.vm.allocator.alloc(Value, 1);
+                    values[0] = .{ .string = "" };
+                    return values;
+                }
+                // Calculate total size
+                var total: usize = 0;
+                var sep_count: usize = 0;
+                var k: i64 = i_raw;
+                while (k <= j_raw) : (k += 1) {
+                    const idx: usize = @intCast(k - 1);
+                    if (idx < t.array.items.len and !t.array.items[idx].isNil()) {
+                        const s = try self.toString(t.array.items[idx]);
+                        total += s.len;
+                        sep_count += 1;
+                    }
+                }
+                if (sep_count > 1) total += sep.len * (sep_count - 1);
+                const buf = try self.vm.allocator.alloc(u8, total);
+                var offset: usize = 0;
+                var first = true;
+                k = i_raw;
+                while (k <= j_raw) : (k += 1) {
+                    const idx: usize = @intCast(k - 1);
+                    if (idx < t.array.items.len and !t.array.items[idx].isNil()) {
+                        if (!first and sep.len > 0) {
+                            @memcpy(buf[offset..][0..sep.len], sep);
+                            offset += sep.len;
+                        }
+                        const s = try self.toString(t.array.items[idx]);
+                        @memcpy(buf[offset..][0..s.len], s);
+                        offset += s.len;
+                        first = false;
+                    }
+                }
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .string = buf[0..offset] };
+                return values;
+            },
+            .table_move => {
+                if (args.len < 4 or args[0] != .table) return error.RuntimeError;
+                const src = args[0].table;
+                const dst = if (args.len >= 5 and args[4] == .table) args[4].table else src;
+                const f = try self.toInteger(args[1]);
+                const e = try self.toInteger(args[2]);
+                const t_pos = try self.toInteger(args[3]);
+                var i: i64 = f;
+                var d: i64 = t_pos;
+                while (i <= e) : ({
+                    i += 1;
+                    d += 1;
+                }) {
+                    try dst.setIndex(self.vm.allocator, d, src.getIndex(i));
+                }
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = args[3]; // return dst table (via t_pos arg — actually should return dst)
+                values[0] = .{ .table = dst };
+                return values;
+            },
+            .table_pack => {
+                const t = try Table.create(self.vm.allocator);
+                for (args, 0..) |arg, i| {
+                    try t.setIndex(self.vm.allocator, @intCast(i + 1), arg);
+                }
+                try t.setString("n", .{ .integer = @intCast(args.len) });
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .table = t };
+                return values;
+            },
+            .table_unpack => {
+                if (args.len < 1 or args[0] != .table) return error.RuntimeError;
+                const t = args[0].table;
+                const i_raw: i64 = if (args.len >= 2) try self.toInteger(args[1]) else 1;
+                const j_raw: i64 = if (args.len >= 3) try self.toInteger(args[2]) else t.length();
+                const count = @max(j_raw - i_raw + 1, 0);
+                const values = try self.vm.allocator.alloc(Value, @intCast(count));
+                var idx: usize = 0;
+                var k: i64 = i_raw;
+                while (k <= j_raw) : ({
+                    k += 1;
+                    idx += 1;
+                }) {
+                    values[idx] = t.getIndex(k);
+                }
+                return values;
+            },
+            .table_create => {
+                const narr: usize = if (args.len >= 1) blk: {
+                    const n = try self.toInteger(args[0]);
+                    break :blk if (n > 0) @intCast(n) else @as(usize, 0);
+                } else 0;
+                const t = try Table.create(self.vm.allocator);
+                // Pre-allocate array slots with nil
+                for (0..narr) |_| {
+                    try t.array.append(self.vm.allocator, .{ .nil = {} });
+                }
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .table = t };
+                return values;
+            },
         }
     }
 
@@ -2814,6 +3010,26 @@ const Parser = struct {
                 break :blk "";
             },
         };
+    }
+
+    fn lessThan(self: *Parser, a: Value, b: Value) anyerror!bool {
+        _ = self;
+        // Compare two values for table.sort (a > b means swap)
+        if (a == .integer and b == .integer) return a.integer > b.integer;
+        if (a == .float and b == .float) return a.float > b.float;
+        if (a == .integer and b == .float) return @as(f64, @floatFromInt(a.integer)) > b.float;
+        if (a == .float and b == .integer) return a.float > @as(f64, @floatFromInt(b.integer));
+        if (a == .string and b == .string) {
+            // Handle string slice lifetime issue by comparing byte by byte
+            const sa = a.string;
+            const sb = b.string;
+            const min_len = @min(sa.len, sb.len);
+            for (0..min_len) |i| {
+                if (sa[i] != sb[i]) return sa[i] > sb[i];
+            }
+            return sa.len > sb.len;
+        }
+        return false;
     }
 
     fn hasPatternMagic(self: *Parser, pattern: []const u8) bool {
