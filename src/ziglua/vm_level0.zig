@@ -145,6 +145,18 @@ const Builtin = enum {
     table_pack,
     table_unpack,
     table_create,
+    // io library
+    io_open,
+    io_close,
+    io_read,
+    io_write,
+    io_lines,
+    io_type,
+    io_flush,
+    io_tmpfile,
+    io_input,
+    io_output,
+    io_popen,
 };
 
 const ValueTag = enum { nil, boolean, integer, float, string, table, function, builtin, thread, wrapped_thread };
@@ -670,6 +682,21 @@ const Vm = struct {
         try table_lib.setString("unpack", .{ .builtin = .table_unpack });
         try table_lib.setString("create", .{ .builtin = .table_create });
         try default_env.setString("table", .{ .table = table_lib });
+
+        // io library (native profile only)
+        const io_table = try Table.create(allocator);
+        try io_table.setString("open", .{ .builtin = .io_open });
+        try io_table.setString("close", .{ .builtin = .io_close });
+        try io_table.setString("read", .{ .builtin = .io_read });
+        try io_table.setString("write", .{ .builtin = .io_write });
+        try io_table.setString("lines", .{ .builtin = .io_lines });
+        try io_table.setString("type", .{ .builtin = .io_type });
+        try io_table.setString("flush", .{ .builtin = .io_flush });
+        try io_table.setString("tmpfile", .{ .builtin = .io_tmpfile });
+        try io_table.setString("input", .{ .builtin = .io_input });
+        try io_table.setString("output", .{ .builtin = .io_output });
+        try io_table.setString("popen", .{ .builtin = .io_popen });
+        try default_env.setString("io", .{ .table = io_table });
         try vm.declare("_ENV", .{ .table = default_env });
         return vm;
     }
@@ -2979,6 +3006,99 @@ const Parser = struct {
                 }
                 const values = try self.vm.allocator.alloc(Value, 1);
                 values[0] = .{ .table = t };
+                return values;
+            },
+
+            // ====================
+            // io library (native profile)
+            // ====================
+
+            .io_open => {
+                if (args.len < 1) return error.RuntimeError;
+                _ = try self.toString(args[0]);
+                // File I/O stubbed in tree-walk VM — returns a table handle
+                const handle = try Table.create(self.vm.allocator);
+                try handle.setString("__type", .{ .string = "file" });
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .table = handle };
+                return values;
+            },
+            .io_close => {
+                // File closing not fully supported in tree-walk VM
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .nil = {} };
+                return values;
+            },
+            .io_read => {
+                // io.read() — stdin reading stubbed in tree-walk VM
+                const fmt_str: []const u8 = if (args.len >= 1) try self.toString(args[0]) else "*l";
+                _ = fmt_str;
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .string = "" };
+                return values;
+            },
+            .io_write => {
+                for (args) |arg| {
+                    const s = try self.toString(arg);
+                    try self.vm.stdout.writer.writeAll(s);
+                }
+                try self.vm.stdout.writer.flush();
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = args[0];
+                return values;
+            },
+            .io_lines => {
+                // Returns nil — file iteration not yet supported
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .nil = {} };
+                return values;
+            },
+            .io_type => {
+                if (args.len < 1) {
+                    const values = try self.vm.allocator.alloc(Value, 1);
+                    values[0] = .{ .nil = {} };
+                    return values;
+                }
+                const values = try self.vm.allocator.alloc(Value, 1);
+                if (args[0] == .table and !args[0].table.getString("__type").isNil()) {
+                    values[0] = .{ .string = "file" };
+                } else {
+                    values[0] = .{ .nil = {} };
+                }
+                return values;
+            },
+            .io_flush => {
+                try self.vm.stdout.writer.flush();
+                const values = try self.vm.allocator.alloc(Value, 0);
+                return values;
+            },
+            .io_tmpfile => {
+                const handle = try Table.create(self.vm.allocator);
+                try handle.setString("__type", .{ .string = "file" });
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .table = handle };
+                return values;
+            },
+            .io_input => {
+                // Return stdin handle
+                const handle = try Table.create(self.vm.allocator);
+                try handle.setString("__type", .{ .string = "file" });
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .table = handle };
+                return values;
+            },
+            .io_output => {
+                // Return stdout handle
+                const handle = try Table.create(self.vm.allocator);
+                try handle.setString("__type", .{ .string = "file" });
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .table = handle };
+                return values;
+            },
+            .io_popen => {
+                // popen not supported in tree-walk VM
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .nil = {} };
                 return values;
             },
         }
