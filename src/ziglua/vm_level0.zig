@@ -559,6 +559,9 @@ const Vm = struct {
     stdout: std.Io.Writer.Allocating,
     scopes: std.ArrayList(Scope),
     frames: std.ArrayList(CallFrame),
+    gc_tables: std.ArrayList(*Table),
+    gc_functions: std.ArrayList(*Function),
+    gc_threads: std.ArrayList(*Thread),
     runtime_error_message: ?[]const u8,
     runtime_error_value: ?Value,
     runtime_error_line: usize,
@@ -590,6 +593,9 @@ const Vm = struct {
             .stdout = std.Io.Writer.Allocating.init(allocator),
             .scopes = .empty,
             .frames = .empty,
+            .gc_tables = .empty,
+            .gc_functions = .empty,
+            .gc_threads = .empty,
             .runtime_error_message = null,
             .runtime_error_value = null,
             .runtime_error_line = 1,
@@ -875,6 +881,68 @@ const Vm = struct {
             }
         }
         return captures;
+    }
+
+    // ====================
+    // GC: allocation tracking
+    // ====================
+
+    fn allocTable(self: *Vm) !*Table {
+        const t = try Table.create(self.allocator);
+        try self.gc_tables.append(self.allocator, t);
+        return t;
+    }
+
+    fn allocFunction(self: *Vm, name: []const u8, params: []const []const u8, vararg: bool, body_start: usize, body_end: usize, env: ?*Table, lexical_scope_len: usize) !*Function {
+        const f = try self.allocator.create(Function);
+        f.* = .{
+            .name = name,
+            .params = params,
+            .vararg = vararg,
+            .body_start = body_start,
+            .body_end = body_end,
+            .env = env,
+            .lexical_scope_len = lexical_scope_len,
+            .captures = std.StringHashMap(*Cell).init(self.allocator),
+        };
+        try self.gc_functions.append(f);
+        return f;
+    }
+
+    fn allocThread(self: *Vm, function: *Function) !*Thread {
+        const t = try self.allocator.create(Thread);
+        t.* = .{
+            .vm = self.*,
+            .function = function,
+            .status = .suspended,
+            .continuations = std.ArrayList(CoroutineContinuation).init(self.allocator),
+            .yield_values = &.{},
+            .close_error = null,
+        };
+        try self.gc_threads.append(t);
+        return t;
+    }
+
+    /// Collect all garbage — sweeps all tracked allocations.
+    /// Call this after script execution completes.
+    fn gcCollect(self: *Vm) void {
+        // Destroy all tracked tables
+        for (self.gc_tables.items) |t| {
+            t.destroy(self.allocator);
+        }
+        self.gc_tables.deinit(self.allocator);
+        // Destroy all tracked functions
+        for (self.gc_functions.items) |f| {
+            f.captures.deinit();
+            self.allocator.destroy(f);
+        }
+        self.gc_functions.deinit(self.allocator);
+        // Destroy all tracked threads
+        for (self.gc_threads.items) |t| {
+            t.continuations.deinit(self.allocator);
+            self.allocator.destroy(t);
+        }
+        self.gc_threads.deinit(self.allocator);
     }
 
     fn currentVarargs(self: *Vm) []const Value {
@@ -1219,6 +1287,7 @@ const Parser = struct {
         const body_start = self.pos;
         const body_end = try self.findEndFor(body_start, "function", opener_line);
         const function = try self.vm.allocator.create(Function);
+        try self.vm.gc_functions.append(self.vm.allocator, function);
         function.* = .{
             .name = name,
             .params = try params.toOwnedSlice(self.vm.allocator),
@@ -2255,6 +2324,7 @@ const Parser = struct {
                     .yield_values = &.{},
                     .close_error = null,
                 };
+                try self.vm.gc_threads.append(self.vm.allocator, thread);
                 const values = try self.vm.allocator.alloc(Value, 1);
                 values[0] = .{ .thread = thread };
                 return values;
@@ -2314,6 +2384,7 @@ const Parser = struct {
                     .yield_values = &.{},
                     .close_error = null,
                 };
+                try self.vm.gc_threads.append(self.vm.allocator, thread);
                 const values = try self.vm.allocator.alloc(Value, 1);
                 values[0] = .{ .wrapped_thread = thread };
                 return values;
@@ -2993,7 +3064,7 @@ const Parser = struct {
                 return values;
             },
             .table_pack => {
-                const t = try Table.create(self.vm.allocator);
+                const t = try self.vm.allocTable();
                 for (args, 0..) |arg, i| {
                     try t.setIndex(self.vm.allocator, @intCast(i + 1), arg);
                 }
@@ -3024,7 +3095,7 @@ const Parser = struct {
                     const n = try self.toInteger(args[0]);
                     break :blk if (n > 0) @intCast(n) else @as(usize, 0);
                 } else 0;
-                const t = try Table.create(self.vm.allocator);
+                const t = try self.vm.allocTable();
                 // Pre-allocate array slots with nil
                 for (0..narr) |_| {
                     try t.array.append(self.vm.allocator, .{ .nil = {} });
@@ -3042,7 +3113,7 @@ const Parser = struct {
                 if (args.len < 1) return error.RuntimeError;
                 _ = try self.toString(args[0]);
                 // File I/O stubbed in tree-walk VM — returns a table handle
-                const handle = try Table.create(self.vm.allocator);
+                const handle = try self.vm.allocTable();
                 try handle.setString("__type", .{ .string = "file" });
                 const values = try self.vm.allocator.alloc(Value, 1);
                 values[0] = .{ .table = handle };
@@ -3098,7 +3169,7 @@ const Parser = struct {
                 return values;
             },
             .io_tmpfile => {
-                const handle = try Table.create(self.vm.allocator);
+                const handle = try self.vm.allocTable();
                 try handle.setString("__type", .{ .string = "file" });
                 const values = try self.vm.allocator.alloc(Value, 1);
                 values[0] = .{ .table = handle };
@@ -3106,7 +3177,7 @@ const Parser = struct {
             },
             .io_input => {
                 // Return stdin handle
-                const handle = try Table.create(self.vm.allocator);
+                const handle = try self.vm.allocTable();
                 try handle.setString("__type", .{ .string = "file" });
                 const values = try self.vm.allocator.alloc(Value, 1);
                 values[0] = .{ .table = handle };
@@ -3114,7 +3185,7 @@ const Parser = struct {
             },
             .io_output => {
                 // Return stdout handle
-                const handle = try Table.create(self.vm.allocator);
+                const handle = try self.vm.allocTable();
                 try handle.setString("__type", .{ .string = "file" });
                 const values = try self.vm.allocator.alloc(Value, 1);
                 values[0] = .{ .table = handle };
@@ -3147,7 +3218,7 @@ const Parser = struct {
                 const format: []const u8 = if (args.len >= 1) try self.toString(args[0]) else "%c";
                 // Minimal date formatting
                 if (std.mem.eql(u8, format, "*t")) {
-                    const t = try Table.create(self.vm.allocator);
+                    const t = try self.vm.allocTable();
                     try t.setString("year", .{ .integer = 2026 });
                     try t.setString("month", .{ .integer = 5 });
                     try t.setString("day", .{ .integer = 11 });
@@ -3866,7 +3937,7 @@ const Parser = struct {
     }
 
     fn tableConstructor(self: *Parser) !Value {
-        const table = try Table.create(self.vm.allocator);
+        const table = try self.vm.allocTable();
         if (self.match(.rbrace)) return .{ .table = table };
         while (true) {
             if (self.match(.lbracket)) {
@@ -4107,7 +4178,9 @@ pub fn runLevel0WithRunContext(
         const token = parser.peek();
         return syntaxErrorAt(allocator, token.line, try std.fmt.allocPrint(allocator, "<eof> expected near '{s}'", .{token.lexeme}));
     }
-    return .{ .state = .pass, .stdout = try vm.stdout.toOwnedSlice(), .stderr = "", .exit_code = 0, .unsupported_reason = null };
+    const result: VmResult = .{ .state = .pass, .stdout = try vm.stdout.toOwnedSlice(), .stderr = "", .exit_code = 0, .unsupported_reason = null };
+    vm.gcCollect();
+    return result;
 }
 
 fn sourceEofLine(source: []const u8) usize {
