@@ -171,6 +171,12 @@ const Builtin = enum {
     // package/require
     require,
     package_searchpath,
+    // debug library
+    debug_traceback,
+    debug_getinfo,
+    debug_getlocal,
+    debug_sethook,
+    debug_gethook,
 };
 
 const ValueTag = enum { nil, boolean, integer, float, string, table, function, builtin, thread, wrapped_thread };
@@ -754,6 +760,17 @@ const Vm = struct {
         try package_table.setString("preload", .{ .table = preload_table });
         try default_env.setString("package", .{ .table = package_table });
         try default_env.setString("require", .{ .builtin = .require });
+
+        // debug library
+        const debug_table = try Table.create(allocator);
+        try debug_table.setString("traceback", .{ .builtin = .debug_traceback });
+        try debug_table.setString("getinfo", .{ .builtin = .debug_getinfo });
+        try debug_table.setString("getlocal", .{ .builtin = .debug_getlocal });
+        try debug_table.setString("sethook", .{ .builtin = .debug_sethook });
+        try debug_table.setString("gethook", .{ .builtin = .debug_gethook });
+        try debug_table.setString("getmetatable", .{ .builtin = .getmetatable });
+        try debug_table.setString("setmetatable", .{ .builtin = .setmetatable });
+        try default_env.setString("debug", .{ .table = debug_table });
         try vm.declare("_ENV", .{ .table = default_env });
         return vm;
     }
@@ -3356,13 +3373,99 @@ const Parser = struct {
             },
             .package_searchpath => {
                 if (args.len < 2) return error.RuntimeError;
-                const _name = try self.toString(args[0]);
-                _ = _name;
-                const _path = try self.toString(args[1]);
-                _ = _path;
-                // Search path not fully implemented
+                _ = try self.toString(args[0]);
+                _ = try self.toString(args[1]);
                 const values = try self.vm.allocator.alloc(Value, 1);
                 values[0] = .{ .nil = {} };
+                return values;
+            },
+
+            // ====================
+            // debug library
+            // ====================
+
+            .debug_traceback => {
+                const msg: []const u8 = if (args.len >= 1) try self.toString(args[0]) else "";
+                const level: i64 = if (args.len >= 2) try self.toInteger(args[1]) else 1;
+                _ = level;
+                // Build a simple traceback from call frames
+                var buf = std.ArrayList(u8).initCapacity(self.vm.allocator, 256) catch return error.OutOfMemory;
+                defer buf.deinit(self.vm.allocator);
+                if (msg.len > 0) {
+                    buf.appendSlice(self.vm.allocator, msg) catch return error.OutOfMemory;
+                    buf.appendSlice(self.vm.allocator, "\n") catch return error.OutOfMemory;
+                }
+                buf.appendSlice(self.vm.allocator, "stack traceback:") catch return error.OutOfMemory;
+                // Add current position
+                const current_line = self.vm.error_line_offset + self.peek().line;
+                const line_str = std.fmt.allocPrint(self.vm.allocator, "\n  stdin:{d}: in main chunk", .{current_line}) catch "";
+                buf.appendSlice(self.vm.allocator, line_str) catch return error.OutOfMemory;
+                // Add frame info
+                for (self.vm.frames.items, 0..) |frame, i| {
+                    const frame_line = if (frame.call_line) |l| self.vm.error_line_offset + l else 0;
+                    const frame_str = std.fmt.allocPrint(self.vm.allocator, "\n  stdin:{d}: in local function", .{frame_line}) catch "";
+                    _ = i;
+                    buf.appendSlice(self.vm.allocator, frame_str) catch return error.OutOfMemory;
+                }
+                const result = try buf.toOwnedSlice(self.vm.allocator);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .string = result };
+                return values;
+            },
+            .debug_getinfo => {
+                if (args.len < 1) return error.RuntimeError;
+                const what: []const u8 = if (args.len >= 2) try self.toString(args[1]) else "flnSu";
+                _ = what;
+                const info = try self.vm.allocTable();
+                try info.setString("source", .{ .string = "=stdin" });
+                try info.setString("short_src", .{ .string = "stdin" });
+                try info.setString("what", .{ .string = "main" });
+                try info.setString("name", .{ .string = "" });
+                try info.setString("namewhat", .{ .string = "global" });
+                const current_line = self.vm.error_line_offset + self.peek().line;
+                try info.setString("currentline", .{ .integer = @intCast(current_line) });
+                try info.setString("linedefined", .{ .integer = 0 });
+                try info.setString("lastlinedefined", .{ .integer = -1 });
+                try info.setString("nups", .{ .integer = 0 });
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .table = info };
+                return values;
+            },
+            .debug_getlocal => {
+                if (args.len < 2) return error.RuntimeError;
+                _ = try self.toInteger(args[0]); // stack level
+                const local_idx = try self.toInteger(args[1]);
+                // Walk scopes to find the nth local
+                var count: i64 = 0;
+                var scope_idx: usize = self.vm.scopes.items.len;
+                while (scope_idx > 0) {
+                    scope_idx -= 1;
+                    var iter = self.vm.scopes.items[scope_idx].vars.iterator();
+                    while (iter.next()) |entry| {
+                        count += 1;
+                        if (count == local_idx) {
+                            const values = try self.vm.allocator.alloc(Value, 2);
+                            values[0] = .{ .string = entry.key_ptr.* };
+                            values[1] = entry.value_ptr.*.value;
+                            return values;
+                        }
+                    }
+                }
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .nil = {} };
+                return values;
+            },
+            .debug_sethook => {
+                // Hook not supported in tree-walk VM
+                const values = try self.vm.allocator.alloc(Value, 0);
+                return values;
+            },
+            .debug_gethook => {
+                const values = try self.vm.allocator.alloc(Value, 4);
+                values[0] = .{ .nil = {} };
+                values[1] = .{ .string = "" };
+                values[2] = .{ .integer = 0 };
+                values[3] = .{ .integer = 0 };
                 return values;
             },
         }
@@ -4521,7 +4624,6 @@ fn classifyUnsupportedTokens(tokens: []const Token) ?[]const u8 {
         }
         if (token.tag == .ident) {
             if (std.mem.eql(u8, token.lexeme, "load")) return "load";
-            if (std.mem.eql(u8, token.lexeme, "debug")) return "debug";
             if (std.mem.eql(u8, token.lexeme, "assert")) return "puc-test-harness";
         }
     }
