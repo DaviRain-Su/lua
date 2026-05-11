@@ -326,3 +326,513 @@ test "k flag in ABC" {
     try std.testing.expect(getk(i));
     try std.testing.expectEqual(@as(u8, 1), getA(i));
 }
+
+// =============================================================================
+// Bytecode Execution Engine
+// =============================================================================
+
+pub const BcVmState = struct {
+    allocator: std.mem.Allocator,
+    /// Register file (stack frames overlaid)
+    stack: []BcValue,
+    stack_top: usize,
+    // Current frame base
+    stack_base: usize,
+    /// Open upvalue chain
+    upvalues: std.ArrayList(*Upvalue),
+
+    pub fn init(allocator: std.mem.Allocator, max_stack: usize) !BcVmState {
+        const stack = try allocator.alloc(BcValue, max_stack + 64); // extra margin
+        @memset(stack, BcValue{ .nil = {} });
+        return .{
+            .allocator = allocator,
+            .stack = stack,
+            .stack_top = 0,
+            .stack_base = 0,
+            .upvalues = std.ArrayList(*Upvalue).initCapacity(allocator, 16) catch @panic("oom"),
+        };
+    }
+
+    pub fn deinit(self: *BcVmState) void {
+        self.allocator.free(self.stack);
+        self.upvalues.deinit(self.allocator);
+    }
+
+    pub inline fn getReg(self: *BcVmState, idx: u8) BcValue {
+        return self.stack[self.stack_base + idx];
+    }
+
+    pub inline fn setReg(self: *BcVmState, idx: u8, val: BcValue) void {
+        self.stack[self.stack_base + idx] = val;
+    }
+};
+
+const Upvalue = struct {
+    ref: *BcValue,
+    next: ?*Upvalue,
+    closed: bool,
+};
+
+/// Execute a prototype with a fresh VM state
+pub fn executePrototype(allocator: std.mem.Allocator, proto: *const Prototype) !BcValue {
+    var vm = try BcVmState.init(allocator, proto.max_stack_size);
+    defer vm.deinit();
+    vm.stack_base = 0;
+
+    const code = proto.code;
+    var pc: usize = 0;
+
+    while (pc < code.len) {
+        const inst = code[pc];
+        const op = getOp(inst);
+        const a = getA(inst);
+
+        switch (op) {
+            .OP_LOADK => {
+                const bx = getBx(inst);
+                vm.setReg(a, proto.constants[bx]);
+                pc += 1;
+            },
+            .OP_LOADI => {
+                const sbx = getsBx(inst);
+                vm.setReg(a, .{ .integer = @intCast(sbx) });
+                pc += 1;
+            },
+            .OP_LOADF => {
+                const sbx = getsBx(inst);
+                vm.setReg(a, .{ .float = @floatFromInt(sbx) });
+                pc += 1;
+            },
+            .OP_LOADFALSE => {
+                vm.setReg(a, .{ .boolean = false });
+                pc += 1;
+            },
+            .OP_LOADTRUE => {
+                vm.setReg(a, .{ .boolean = true });
+                pc += 1;
+            },
+            .OP_LOADNIL => {
+                const b = getB(inst);
+                var i: u8 = a;
+                while (i <= a + b) : (i += 1) {
+                    vm.setReg(i, .{ .nil = {} });
+                }
+                pc += 1;
+            },
+            .OP_MOVE => {
+                const b = getB(inst);
+                vm.setReg(a, vm.getReg(b));
+                pc += 1;
+            },
+            // Arithmetic
+            .OP_ADD => {
+                const b = getB(inst);
+                const c = getC(inst);
+                const vb = vm.getReg(b);
+                const vc = vm.getReg(c);
+                vm.setReg(a, try arithAdd(vb, vc));
+                pc += 1;
+            },
+            .OP_SUB => {
+                const b = getB(inst);
+                const c = getC(inst);
+                vm.setReg(a, try arithSub(vm.getReg(b), vm.getReg(c)));
+                pc += 1;
+            },
+            .OP_MUL => {
+                const b = getB(inst);
+                const c = getC(inst);
+                vm.setReg(a, try arithMul(vm.getReg(b), vm.getReg(c)));
+                pc += 1;
+            },
+            .OP_DIV => {
+                const b = getB(inst);
+                const c = getC(inst);
+                vm.setReg(a, try arithDiv(vm.getReg(b), vm.getReg(c)));
+                pc += 1;
+            },
+            .OP_MOD => {
+                const b = getB(inst);
+                const c = getC(inst);
+                vm.setReg(a, try arithMod(vm.getReg(b), vm.getReg(c)));
+                pc += 1;
+            },
+            .OP_POW => {
+                const b = getB(inst);
+                const c = getC(inst);
+                vm.setReg(a, try arithPow(vm.getReg(b), vm.getReg(c)));
+                pc += 1;
+            },
+            .OP_IDIV => {
+                const b = getB(inst);
+                const c = getC(inst);
+                vm.setReg(a, try arithIDiv(vm.getReg(b), vm.getReg(c)));
+                pc += 1;
+            },
+            .OP_UNM => {
+                const b = getB(inst);
+                const vb = vm.getReg(b);
+                vm.setReg(a, switch (vb) {
+                    .integer => |v| .{ .integer = -v },
+                    .float => |v| .{ .float = -v },
+                    else => .{ .nil = {} },
+                });
+                pc += 1;
+            },
+            .OP_NOT => {
+                const b = getB(inst);
+                vm.setReg(a, .{ .boolean = !isTruthy(vm.getReg(b)) });
+                pc += 1;
+            },
+            .OP_LEN => {
+                const b = getB(inst);
+                // Length of string
+                const vb = vm.getReg(b);
+                vm.setReg(a, switch (vb) {
+                    .string => |s| .{ .integer = @intCast(s.len) },
+                    else => .{ .integer = 0 },
+                });
+                pc += 1;
+            },
+            // Comparison
+            .OP_EQ => {
+                const b = getB(inst);
+                const c = getC(inst);
+                const k = getk(inst);
+                const eq = valuesEqual(vm.getReg(b), vm.getReg(c));
+                if (eq != k) pc += 2 else pc += 1;
+            },
+            .OP_LT => {
+                const b = getB(inst);
+                const c = getC(inst);
+                const k = getk(inst);
+                const lt = try valuesLessThan(vm.getReg(b), vm.getReg(c));
+                if (lt != k) pc += 2 else pc += 1;
+            },
+            .OP_LE => {
+                const b = getB(inst);
+                const c = getC(inst);
+                const k = getk(inst);
+                const le = try valuesLessEqual(vm.getReg(b), vm.getReg(c));
+                if (le != k) pc += 2 else pc += 1;
+            },
+            .OP_TEST => {
+                const k = getk(inst);
+                if (isTruthy(vm.getReg(a)) == k) pc += 2 else pc += 1;
+            },
+            .OP_TESTSET => {
+                const b = getB(inst);
+                const k = getk(inst);
+                if (isTruthy(vm.getReg(b)) == k) {
+                    vm.setReg(a, vm.getReg(b));
+                    pc += 2;
+                } else {
+                    pc += 1;
+                }
+            },
+            // Jump
+            .OP_JMP => {
+                const sj = getsJ(inst);
+                pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, @intCast(sj)));
+            },
+            // Return
+            .OP_RETURN0 => {
+                return .{ .nil = {} };
+            },
+            .OP_RETURN1 => {
+                return vm.getReg(a);
+            },
+            .OP_RETURN => {
+                const b = getB(inst);
+                _ = b;
+                // Return R[A]
+                if (a < vm.stack.len - vm.stack_base) {
+                    return vm.getReg(a);
+                }
+                return .{ .nil = {} };
+            },
+            // For loops
+            .OP_FORPREP => {
+                const sbx = getsBx(inst);
+                const idx = vm.getReg(a);
+                const limit = vm.getReg(a + 1);
+                const step = vm.getReg(a + 2);
+                // Numeric for: prepare
+                if (idx == .integer and limit == .integer and step == .integer) {
+                    vm.setReg(a, .{ .integer = idx.integer - step.integer });
+                } else if (idx == .float) {
+                    const s: f64 = if (step == .float) step.float else @floatFromInt(step.integer);
+                    vm.setReg(a, .{ .float = idx.float - s });
+                }
+                pc = @intCast(@as(i64, @intCast(pc)) + @as(i64, @intCast(sbx)));
+            },
+            .OP_FORLOOP => {
+                const sbx = getsBx(inst);
+                const idx = vm.getReg(a);
+                const limit = vm.getReg(a + 1);
+                const step = vm.getReg(a + 2);
+                var cont = false;
+                if (idx == .integer and limit == .integer and step == .integer) {
+                    const new_idx = idx.integer + step.integer;
+                    vm.setReg(a, .{ .integer = new_idx });
+                    vm.setReg(a + 3, .{ .integer = new_idx });
+                    cont = if (step.integer > 0) new_idx <= limit.integer else new_idx >= limit.integer;
+                } else if (idx == .float or limit == .float or step == .float) {
+                    const fidx: f64 = if (idx == .float) idx.float else @floatFromInt(idx.integer);
+                    const flimit: f64 = if (limit == .float) limit.float else @floatFromInt(limit.integer);
+                    const fstep: f64 = if (step == .float) step.float else @floatFromInt(step.integer);
+                    const new_idx = fidx + fstep;
+                    vm.setReg(a, .{ .float = new_idx });
+                    vm.setReg(a + 3, .{ .float = new_idx });
+                    cont = if (fstep > 0) new_idx <= flimit else new_idx >= flimit;
+                }
+                if (cont) {
+                    pc = @intCast(@as(i64, @intCast(pc)) - @as(i64, @intCast(sbx)));
+                } else {
+                    pc += 1;
+                }
+            },
+            // Concat
+            .OP_CONCAT => {
+                const b = getB(inst);
+                // R[A] := R[A].. ... ..R[A+b-1]
+                var total: usize = 0;
+                var j: u8 = 0;
+                while (j < b) : (j += 1) {
+                    switch (vm.getReg(a + j)) {
+                        .string => |s| total += s.len,
+                        else => {},
+                    }
+                }
+                const buf = try allocator.alloc(u8, total);
+                var off: usize = 0;
+                j = 0;
+                while (j < b) : (j += 1) {
+                    switch (vm.getReg(a + j)) {
+                        .string => |s| {
+                            @memcpy(buf[off..][0..s.len], s);
+                            off += s.len;
+                        },
+                        else => {},
+                    }
+                }
+                vm.setReg(a, .{ .string = buf });
+                pc += 1;
+            },
+            // NEWTABLE
+            .OP_NEWTABLE => {
+                vm.setReg(a, .{ .nil = {} }); // placeholder
+                pc += 1;
+            },
+            // CALL — simplified (no actual function calls yet)
+            .OP_CALL => {
+                // Skip for now — return the value in R[A]
+                pc += 1;
+            },
+            // CLOSURE
+            .OP_CLOSURE => {
+                const bx = getBx(inst);
+                vm.setReg(a, .{ .integer = @intCast(bx) }); // placeholder
+                pc += 1;
+            },
+            // Default: skip unknown instructions
+            else => {
+                pc += 1;
+            },
+        }
+    }
+
+    return .{ .nil = {} };
+}
+
+// =============================================================================
+// Arithmetic helpers
+// =============================================================================
+
+fn arithAdd(a: BcValue, b: BcValue) !BcValue {
+    if (a == .integer and b == .integer) {
+        return .{ .integer = a.integer + b.integer };
+    }
+    const fa: f64 = if (a == .float) a.float else @floatFromInt(a.integer);
+    const fb: f64 = if (b == .float) b.float else @floatFromInt(b.integer);
+    return .{ .float = fa + fb };
+}
+
+fn arithSub(a: BcValue, b: BcValue) !BcValue {
+    if (a == .integer and b == .integer) {
+        return .{ .integer = a.integer - b.integer };
+    }
+    const fa: f64 = if (a == .float) a.float else @floatFromInt(a.integer);
+    const fb: f64 = if (b == .float) b.float else @floatFromInt(b.integer);
+    return .{ .float = fa - fb };
+}
+
+fn arithMul(a: BcValue, b: BcValue) !BcValue {
+    if (a == .integer and b == .integer) {
+        return .{ .integer = a.integer * b.integer };
+    }
+    const fa: f64 = if (a == .float) a.float else @floatFromInt(a.integer);
+    const fb: f64 = if (b == .float) b.float else @floatFromInt(b.integer);
+    return .{ .float = fa * fb };
+}
+
+fn arithDiv(a: BcValue, b: BcValue) !BcValue {
+    const fa: f64 = if (a == .float) a.float else @floatFromInt(a.integer);
+    const fb: f64 = if (b == .float) b.float else @floatFromInt(b.integer);
+    return .{ .float = fa / fb };
+}
+
+fn arithIDiv(a: BcValue, b: BcValue) !BcValue {
+    if (a == .integer and b == .integer) {
+        if (b.integer == 0) return error.DivisionByZero;
+        const result = @divTrunc(a.integer, b.integer);
+        return .{ .integer = result };
+    }
+    const fa: f64 = if (a == .float) a.float else @floatFromInt(a.integer);
+    const fb: f64 = if (b == .float) b.float else @floatFromInt(b.integer);
+    return .{ .float = @trunc(fa / fb) };
+}
+
+fn arithMod(a: BcValue, b: BcValue) !BcValue {
+    if (a == .integer and b == .integer) {
+        if (b.integer == 0) return error.DivisionByZero;
+        return .{ .integer = @mod(a.integer, b.integer) };
+    }
+    const fa: f64 = if (a == .float) a.float else @floatFromInt(a.integer);
+    const fb: f64 = if (b == .float) b.float else @floatFromInt(b.integer);
+    return .{ .float = @mod(fa, fb) };
+}
+
+fn arithPow(a: BcValue, b: BcValue) !BcValue {
+    const fa: f64 = if (a == .float) a.float else @floatFromInt(a.integer);
+    const fb: f64 = if (b == .float) b.float else @floatFromInt(b.integer);
+    return .{ .float = std.math.pow(f64, fa, fb) };
+}
+
+// =============================================================================
+// Value helpers
+// =============================================================================
+
+fn isTruthy(v: BcValue) bool {
+    return switch (v) {
+        .nil => false,
+        .boolean => |b| b,
+        else => true,
+    };
+}
+
+fn valuesEqual(a: BcValue, b: BcValue) bool {
+    const a_tag = std.meta.activeTag(a);
+    const b_tag = std.meta.activeTag(b);
+    if (a_tag != b_tag) return false;
+    return switch (a) {
+        .nil => b == .nil,
+        .boolean => |v| b == .boolean and b.boolean == v,
+        .integer => |v| b == .integer and b.integer == v,
+        .float => |v| b == .float and b.float == v,
+        .string => |v| b == .string and std.mem.eql(u8, v, b.string),
+    };
+}
+
+fn valuesLessThan(a: BcValue, b: BcValue) !bool {
+    if (a == .integer and b == .integer) return a.integer < b.integer;
+    const fa: f64 = if (a == .float) a.float else @floatFromInt(a.integer);
+    const fb: f64 = if (b == .float) b.float else @floatFromInt(b.integer);
+    return fa < fb;
+}
+
+fn valuesLessEqual(a: BcValue, b: BcValue) !bool {
+    if (a == .integer and b == .integer) return a.integer <= b.integer;
+    const fa: f64 = if (a == .float) a.float else @floatFromInt(a.integer);
+    const fb: f64 = if (b == .float) b.float else @floatFromInt(b.integer);
+    return fa <= fb;
+}
+
+test "bytecode execution: LOADK + RETURN1" {
+    const allocator = std.testing.allocator;
+    const proto = Prototype{
+        .constants = &.{BcValue{ .integer = 42 }},
+        .code = &.{
+            encodeABx(.OP_LOADK, 0, 0), // R[0] := K[0] = 42
+            @intFromEnum(Op.OP_RETURN1) | (@as(Instruction, 0) << POS_A), // return R[0]
+        },
+        .prototypes = &.{},
+        .line_info = &.{},
+        .max_stack_size = 2,
+        .num_upvalues = 0,
+        .num_params = 0,
+        .is_vararg = false,
+    };
+    const result = try executePrototype(allocator, &proto);
+    try std.testing.expectEqual(BcValue{ .integer = 42 }, result);
+}
+
+test "bytecode execution: LOADI + arithmetic" {
+    const allocator = std.testing.allocator;
+    const proto = Prototype{
+        .constants = &.{},
+        .code = &.{
+            encodeAsBx(.OP_LOADI, 0, 10), // R[0] := 10
+            encodeAsBx(.OP_LOADI, 1, 20), // R[1] := 20
+            encodeABC(.OP_ADD, 2, 0, 1),  // R[2] := R[0] + R[1]
+            @intFromEnum(Op.OP_RETURN1) | (@as(Instruction, 2) << POS_A), // return R[2]
+        },
+        .prototypes = &.{},
+        .line_info = &.{},
+        .max_stack_size = 4,
+        .num_upvalues = 0,
+        .num_params = 0,
+        .is_vararg = false,
+    };
+    const result = try executePrototype(allocator, &proto);
+    try std.testing.expectEqual(BcValue{ .integer = 30 }, result);
+}
+
+test "bytecode execution: FORLOOP" {
+    const allocator = std.testing.allocator;
+    // Simulate: local sum = 0; for i = 1, 5 do sum = sum + i end; return sum
+    // Registers: R[0]=sum, R[1]=i (loop idx), R[2]=limit, R[3]=step
+    const code = &[_]Instruction{
+        encodeAsBx(.OP_LOADI, 0, 0),   // R[0] := 0 (sum)
+        encodeAsBx(.OP_LOADI, 1, 1),   // R[1] := 1 (i initial)
+        encodeAsBx(.OP_LOADI, 2, 5),   // R[2] := 5 (limit)
+        encodeAsBx(.OP_LOADI, 3, 1),   // R[3] := 1 (step)
+        encodeAsBx(.OP_FORPREP, 1, 2), // prepare loop, jump to FORLOOP+2 offset
+        encodeABC(.OP_ADD, 0, 0, 4),   // R[0] := R[0] + R[4] (R[4] = loop value)
+        encodeAsBx(.OP_FORLOOP, 1, 1), // loop back by 1 instruction
+        @intFromEnum(Op.OP_RETURN1) | (@as(Instruction, 0) << POS_A), // return R[0]
+    };
+    const proto = Prototype{
+        .constants = &.{},
+        .code = code,
+        .prototypes = &.{},
+        .line_info = &.{},
+        .max_stack_size = 8,
+        .num_upvalues = 0,
+        .num_params = 0,
+        .is_vararg = false,
+    };
+    const result = try executePrototype(allocator, &proto);
+    try std.testing.expectEqual(BcValue{ .integer = 15 }, result);
+}
+
+test "bytecode execution: LOADI values" {
+    const allocator = std.testing.allocator;
+    const proto = Prototype{
+        .constants = &.{},
+        .code = &.{
+            encodeAsBx(.OP_LOADI, 0, 10),  // R[0] := 10
+            encodeAsBx(.OP_LOADI, 1, 20),  // R[1] := 20
+            encodeABC(.OP_ADD, 0, 0, 1),   // R[0] := R[0] + R[1]
+            @intFromEnum(Op.OP_RETURN1) | (@as(Instruction, 0) << POS_A),
+        },
+        .prototypes = &.{},
+        .line_info = &.{},
+        .max_stack_size = 4,
+        .num_upvalues = 0,
+        .num_params = 0,
+        .is_vararg = false,
+    };
+    const result = try executePrototype(allocator, &proto);
+    try std.testing.expectEqual(BcValue{ .integer = 30 }, result);
+}
