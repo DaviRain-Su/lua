@@ -12,12 +12,14 @@ const thread = @import("thread.zig");
 const userdata = @import("userdata.zig");
 const value = @import("value.zig");
 const vm_level0 = @import("vm_level0.zig");
+const bc_vm = @import("bc_vm.zig");
 
 test {
     _ = advanced_hooks;
     _ = debug_capi_gates;
     _ = lua_alloc_bridge;
     _ = vm_level0;
+    _ = bc_vm;
 }
 
 test "runtime constructors require allocator" {
