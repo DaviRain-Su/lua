@@ -1,0 +1,175 @@
+[
+  {
+    "file": "all.lua",
+    "categories": ["core", "stdlib", "gc", "debug", "coroutine", "platform-sensitive", "heavy-resource-sensitive"],
+    "stage": "full-suite-known-constraint",
+    "notes": "Full PUC suite driver; tracked separately because this macOS environment has a known prompt assertion constraint."
+  },
+  {
+    "file": "api.lua",
+    "categories": ["c-api-internal-test"],
+    "stage": "c-api-internal"
+  },
+  {
+    "file": "attrib.lua",
+    "categories": ["core", "stdlib"],
+    "stage": "core-expansion"
+  },
+  {
+    "file": "big.lua",
+    "categories": ["core", "heavy-resource-sensitive"],
+    "stage": "resource-sensitive"
+  },
+  {
+    "file": "bitwise.lua",
+    "categories": ["core"],
+    "stage": "core-expansion"
+  },
+  {
+    "file": "bwcoercion.lua",
+    "categories": ["core"],
+    "stage": "core-expansion"
+  },
+  {
+    "file": "calls.lua",
+    "categories": ["core"],
+    "stage": "level1-core"
+  },
+  {
+    "file": "closure.lua",
+    "categories": ["core"],
+    "stage": "level1-core"
+  },
+  {
+    "file": "code.lua",
+    "categories": ["core"],
+    "stage": "core-expansion"
+  },
+  {
+    "file": "constructs.lua",
+    "categories": ["core"],
+    "stage": "early-core",
+    "selected_early": true
+  },
+  {
+    "file": "coroutine.lua",
+    "categories": ["coroutine"],
+    "stage": "advanced-coroutine"
+  },
+  {
+    "file": "cstack.lua",
+    "categories": ["core", "heavy-resource-sensitive"],
+    "stage": "resource-sensitive"
+  },
+  {
+    "file": "db.lua",
+    "categories": ["debug"],
+    "stage": "advanced-debug"
+  },
+  {
+    "file": "errors.lua",
+    "categories": ["core"],
+    "stage": "core-expansion"
+  },
+  {
+    "file": "events.lua",
+    "categories": ["core"],
+    "stage": "advanced-core"
+  },
+  {
+    "file": "files.lua",
+    "categories": ["stdlib", "platform-sensitive"],
+    "stage": "stdlib-platform"
+  },
+  {
+    "file": "gc.lua",
+    "categories": ["gc"],
+    "stage": "advanced-gc"
+  },
+  {
+    "file": "gengc.lua",
+    "categories": ["gc"],
+    "stage": "advanced-gc"
+  },
+  {
+    "file": "goto.lua",
+    "categories": ["core"],
+    "stage": "core-expansion"
+  },
+  {
+    "file": "heavy.lua",
+    "categories": ["core", "heavy-resource-sensitive"],
+    "stage": "resource-sensitive"
+  },
+  {
+    "file": "literals.lua",
+    "categories": ["core"],
+    "stage": "early-core"
+  },
+  {
+    "file": "locals.lua",
+    "categories": ["core"],
+    "stage": "early-core"
+  },
+  {
+    "file": "main.lua",
+    "categories": ["core", "stdlib", "platform-sensitive"],
+    "stage": "stdlib-platform"
+  },
+  {
+    "file": "math.lua",
+    "categories": ["stdlib"],
+    "stage": "stdlib-core"
+  },
+  {
+    "file": "memerr.lua",
+    "categories": ["gc", "heavy-resource-sensitive"],
+    "stage": "resource-sensitive"
+  },
+  {
+    "file": "nextvar.lua",
+    "categories": ["core"],
+    "stage": "core-expansion"
+  },
+  {
+    "file": "pm.lua",
+    "categories": ["stdlib"],
+    "stage": "stdlib-core"
+  },
+  {
+    "file": "sort.lua",
+    "categories": ["stdlib"],
+    "stage": "stdlib-core"
+  },
+  {
+    "file": "strings.lua",
+    "categories": ["stdlib"],
+    "stage": "stdlib-core"
+  },
+  {
+    "file": "tpack.lua",
+    "categories": ["stdlib"],
+    "stage": "stdlib-core"
+  },
+  {
+    "file": "tracegc.lua",
+    "categories": ["gc"],
+    "stage": "advanced-gc"
+  },
+  {
+    "file": "utf8.lua",
+    "categories": ["stdlib"],
+    "stage": "stdlib-core"
+  },
+  {
+    "file": "vararg.lua",
+    "categories": ["core"],
+    "stage": "early-core",
+    "selected_early": true
+  },
+  {
+    "file": "verybig.lua",
+    "categories": ["core", "heavy-resource-sensitive"],
+    "stage": "resource-sensitive"
+  }
+]
