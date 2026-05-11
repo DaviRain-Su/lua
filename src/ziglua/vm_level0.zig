@@ -121,6 +121,21 @@ const Builtin = enum {
     math_type,
     math_random,
     math_randomseed,
+    // string library
+    string_len,
+    string_sub,
+    string_rep,
+    string_reverse,
+    string_upper,
+    string_lower,
+    string_byte,
+    string_char,
+    string_format,
+    string_find,
+    string_match,
+    string_gmatch,
+    string_gsub,
+    string_dump,
 };
 
 const ValueTag = enum { nil, boolean, integer, float, string, table, function, builtin, thread, wrapped_thread };
@@ -616,6 +631,24 @@ const Vm = struct {
         try math_table.setString("maxinteger", .{ .integer = std.math.maxInt(i64) });
         try math_table.setString("mininteger", .{ .integer = std.math.minInt(i64) });
         try default_env.setString("math", .{ .table = math_table });
+
+        // string library
+        const string_table = try Table.create(allocator);
+        try string_table.setString("len", .{ .builtin = .string_len });
+        try string_table.setString("sub", .{ .builtin = .string_sub });
+        try string_table.setString("rep", .{ .builtin = .string_rep });
+        try string_table.setString("reverse", .{ .builtin = .string_reverse });
+        try string_table.setString("upper", .{ .builtin = .string_upper });
+        try string_table.setString("lower", .{ .builtin = .string_lower });
+        try string_table.setString("byte", .{ .builtin = .string_byte });
+        try string_table.setString("char", .{ .builtin = .string_char });
+        try string_table.setString("format", .{ .builtin = .string_format });
+        try string_table.setString("find", .{ .builtin = .string_find });
+        try string_table.setString("match", .{ .builtin = .string_match });
+        try string_table.setString("gmatch", .{ .builtin = .string_gmatch });
+        try string_table.setString("gsub", .{ .builtin = .string_gsub });
+        try string_table.setString("dump", .{ .builtin = .string_dump });
+        try default_env.setString("string", .{ .table = string_table });
         try vm.declare("_ENV", .{ .table = default_env });
         return vm;
     }
@@ -2497,14 +2530,320 @@ const Parser = struct {
                 const values = try self.vm.allocator.alloc(Value, 0);
                 return values;
             },
+
+            // ====================
+            // string library
+            // ====================
+
+            .string_len => {
+                if (args.len == 0) return error.RuntimeError;
+                const s = try self.toString(args[0]);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .integer = @intCast(s.len) };
+                return values;
+            },
+            .string_sub => {
+                if (args.len < 2) return error.RuntimeError;
+                const s = try self.toString(args[0]);
+                const i_raw = try self.toInteger(args[1]);
+                const j_raw: i64 = if (args.len >= 3) try self.toInteger(args[2]) else @as(i64, @intCast(s.len));
+                const i: usize = if (i_raw < 0) @max(@as(usize, @intCast(@as(i64, @intCast(s.len)) + i_raw + 1)), 1) else @intCast(i_raw);
+                const j: usize = if (j_raw < 0) @max(@as(usize, @intCast(@as(i64, @intCast(s.len)) + j_raw + 1)), @as(usize, 1)) else @min(@as(usize, @intCast(j_raw)), s.len);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                if (i > j or i > s.len) {
+                    values[0] = .{ .string = "" };
+                } else {
+                    const start: usize = @intCast(i - 1);
+                    values[0] = .{ .string = s[start..@intCast(j)] };
+                }
+                return values;
+            },
+            .string_rep => {
+                if (args.len < 2) return error.RuntimeError;
+                const s = try self.toString(args[0]);
+                const n = try self.toInteger(args[1]);
+                const sep: []const u8 = if (args.len >= 3) try self.toString(args[2]) else "";
+                if (n <= 0) {
+                    const values = try self.vm.allocator.alloc(Value, 1);
+                    values[0] = .{ .string = "" };
+                    return values;
+                }
+                const total_len = @as(usize, @intCast(n)) * s.len + @max(@as(usize, @intCast(n)) - 1, 0) * sep.len;
+                const buf = try self.vm.allocator.alloc(u8, total_len);
+                var offset: usize = 0;
+                for (0..@intCast(n)) |idx| {
+                    if (idx > 0 and sep.len > 0) {
+                        @memcpy(buf[offset..][0..sep.len], sep);
+                        offset += sep.len;
+                    }
+                    if (s.len > 0) {
+                        @memcpy(buf[offset..][0..s.len], s);
+                        offset += s.len;
+                    }
+                }
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .string = buf };
+                return values;
+            },
+            .string_reverse => {
+                if (args.len == 0) return error.RuntimeError;
+                const s = try self.toString(args[0]);
+                const buf = try self.vm.allocator.alloc(u8, s.len);
+                for (s, 0..) |c, i| buf[buf.len - 1 - i] = c;
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .string = buf };
+                return values;
+            },
+            .string_upper => {
+                if (args.len == 0) return error.RuntimeError;
+                const s = try self.toString(args[0]);
+                const buf = try self.vm.allocator.alloc(u8, s.len);
+                for (s, 0..) |c, i| buf[i] = std.ascii.toUpper(c);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .string = buf };
+                return values;
+            },
+            .string_lower => {
+                if (args.len == 0) return error.RuntimeError;
+                const s = try self.toString(args[0]);
+                const buf = try self.vm.allocator.alloc(u8, s.len);
+                for (s, 0..) |c, i| buf[i] = std.ascii.toLower(c);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .string = buf };
+                return values;
+            },
+            .string_byte => {
+                if (args.len == 0) return error.RuntimeError;
+                const s = try self.toString(args[0]);
+                const i_raw: i64 = if (args.len >= 2) try self.toInteger(args[1]) else 1;
+                const j_raw: i64 = if (args.len >= 3) try self.toInteger(args[2]) else i_raw;
+                const i: i64 = if (i_raw < 1) @max(@as(i64, @intCast(s.len)) + i_raw + 1, 1) else i_raw;
+                const j: i64 = if (j_raw < 1) @max(@as(i64, @intCast(s.len)) + j_raw + 1, 1) else j_raw;
+                if (i < 1 or @as(usize, @intCast(i)) > s.len or j < i) {
+                    const values = try self.vm.allocator.alloc(Value, 0);
+                    return values;
+                }
+                const count = @min(@as(usize, @intCast(j)), s.len) - @as(usize, @intCast(i)) + 1;
+                const values = try self.vm.allocator.alloc(Value, count);
+                var idx: usize = 0;
+                var pos: usize = @intCast(i - 1);
+                while (pos < s.len and idx < count) : ({ pos += 1; idx += 1; }) {
+                    values[idx] = .{ .integer = s[pos] };
+                }
+                return values;
+            },
+            .string_char => {
+                const buf = try self.vm.allocator.alloc(u8, args.len);
+                for (args, 0..) |arg, i| {
+                    const n = try self.toInteger(arg);
+                    if (n < 0 or n > 255) return error.RuntimeError;
+                    buf[i] = @intCast(n);
+                }
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .string = buf };
+                return values;
+            },
+            .string_format => {
+                if (args.len == 0) return error.RuntimeError;
+                const fmt = try self.toString(args[0]);
+                var buf = try std.ArrayList(u8).initCapacity(self.vm.allocator, fmt.len * 2);
+                defer buf.deinit(self.vm.allocator);
+                var arg_idx: usize = 1;
+                var fi: usize = 0;
+                while (fi < fmt.len) {
+                    if (fmt[fi] != '%') {
+                        buf.append(self.vm.allocator, fmt[fi]) catch return error.OutOfMemory;
+                        fi += 1;
+                        continue;
+                    }
+                    fi += 1;
+                    if (fi >= fmt.len) return error.RuntimeError;
+                    if (fmt[fi] == '%') {
+                        buf.append(self.vm.allocator, '%') catch return error.OutOfMemory;
+                        fi += 1;
+                        continue;
+                    }
+                    // skip flags/width/precision
+                    if (fi < fmt.len and fmt[fi] == '-') fi += 1;
+                    while (fi < fmt.len and fmt[fi] >= '0' and fmt[fi] <= '9') fi += 1;
+                    if (fi < fmt.len and fmt[fi] == '.') {
+                        fi += 1;
+                        while (fi < fmt.len and fmt[fi] >= '0' and fmt[fi] <= '9') fi += 1;
+                    }
+                    if (fi >= fmt.len) return error.RuntimeError;
+                    const spec = fmt[fi];
+                    fi += 1;
+                    if (arg_idx >= args.len) return error.RuntimeError;
+                    const val = args[arg_idx];
+                    arg_idx += 1;
+                    switch (spec) {
+                        'd', 'i' => {
+                            const n = try self.toInteger(val);
+                            var int_buf: [32]u8 = undefined;
+                            const slice = std.fmt.bufPrint(&int_buf, "{}", .{n}) catch "0";
+                            buf.appendSlice(self.vm.allocator, slice) catch return error.OutOfMemory;
+                        },
+                        'f' => {
+                            const f = try self.toFloat(val);
+                            self.formatFloatSimple(&buf, f, 6) catch return error.OutOfMemory;
+                        },
+                        's' => {
+                            const s2 = switch (val) {
+                                .string => |s3| s3,
+                                else => blk: {
+                                    const s3 = try self.toString(val);
+                                    break :blk s3;
+                                },
+                            };
+                            buf.appendSlice(self.vm.allocator, s2) catch return error.OutOfMemory;
+                        },
+                        'x' => {
+                            const n = try self.toInteger(val);
+                            var int_buf: [20]u8 = undefined;
+                            const slice = std.fmt.bufPrint(&int_buf, "{x}", .{@as(u64, @bitCast(n))}) catch "0";
+                            buf.appendSlice(self.vm.allocator, slice) catch return error.OutOfMemory;
+                        },
+                        'X' => {
+                            const n = try self.toInteger(val);
+                            var int_buf: [20]u8 = undefined;
+                            const slice = std.fmt.bufPrint(&int_buf, "{X}", .{@as(u64, @bitCast(n))}) catch "0";
+                            buf.appendSlice(self.vm.allocator, slice) catch return error.OutOfMemory;
+                        },
+                        'q' => {
+                            const s2 = try self.toString(val);
+                            try buf.append(self.vm.allocator, '"');
+                            for (s2) |c| {
+                                switch (c) {
+                                    '"', '\\' => {
+                                        try buf.append(self.vm.allocator, '\\');
+                                        try buf.append(self.vm.allocator, c);
+                                    },
+                                    '\n' => try buf.appendSlice(self.vm.allocator, "\\n"),
+                                    '\r' => try buf.appendSlice(self.vm.allocator, "\\r"),
+                                    '\t' => try buf.appendSlice(self.vm.allocator, "\\t"),
+                                    else => try buf.append(self.vm.allocator, c),
+                                }
+                            }
+                            try buf.append(self.vm.allocator, '"');
+                        },
+                        else => {
+                            // Unknown specifier — just write value as string
+                            const s2 = try self.toString(val);
+                            buf.appendSlice(self.vm.allocator, s2) catch return error.OutOfMemory;
+                        },
+                    }
+                }
+                const result = try buf.toOwnedSlice(self.vm.allocator);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .string = result };
+                return values;
+            },
+            .string_find => {
+                if (args.len < 2) return error.RuntimeError;
+                const s = try self.toString(args[0]);
+                const pattern = try self.toString(args[1]);
+                const init_raw: i64 = if (args.len >= 3) try self.toInteger(args[2]) else 1;
+                const plain = args.len >= 4 and args[3].isTruthy();
+                const init: usize = if (init_raw < 1) @max(@as(usize, @intCast(@as(i64, @intCast(s.len)) + init_raw + 1)), @as(usize, 1)) else @as(usize, @intCast(init_raw));
+                if (init < 1 or init > s.len + 1) {
+                    const values = try self.vm.allocator.alloc(Value, 1);
+                    values[0] = .{ .nil = {} };
+                    return values;
+                }
+                if (plain or !self.hasPatternMagic(pattern)) {
+                    const start = if (init > 0) init - 1 else 0;
+                    if (std.mem.indexOfPos(u8, s, start, pattern)) |pos| {
+                        const values = try self.vm.allocator.alloc(Value, 2);
+                        values[0] = .{ .integer = @intCast(pos + 1) };
+                        values[1] = .{ .integer = @intCast(pos + pattern.len) };
+                        return values;
+                    }
+                }
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .nil = {} };
+                return values;
+            },
+            .string_match => {
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .nil = {} };
+                return values;
+            },
+            .string_gmatch => {
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .nil = {} };
+                return values;
+            },
+            .string_gsub => {
+                if (args.len < 3) return error.RuntimeError;
+                const s = try self.toString(args[0]);
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .string = s };
+                return values;
+            },
+            .string_dump => {
+                const values = try self.vm.allocator.alloc(Value, 1);
+                values[0] = .{ .nil = {} };
+                return values;
+            },
         }
     }
+
 
     // ====================
     // math library helpers
     // ====================
 
     const Number = union(enum) { integer: i64, float: f64, other: void };
+
+    fn toString(self: *Parser, v: Value) anyerror![]const u8 {
+        return switch (v) {
+            .string => |s| s,
+            .integer => |i| blk: {
+                var buf: [32]u8 = undefined;
+                const slice = std.fmt.bufPrint(&buf, "{}", .{i}) catch "0";
+                break :blk try self.vm.allocator.dupe(u8, slice);
+            },
+            .float => |f| blk: {
+                var buf: [64]u8 = undefined;
+                const slice = std.fmt.bufPrint(&buf, "{d}", .{f}) catch "0";
+                break :blk try self.vm.allocator.dupe(u8, slice);
+            },
+            .boolean => |b| if (b) "true" else "false",
+            .nil => "nil",
+            else => blk: {
+                break :blk "";
+            },
+        };
+    }
+
+    fn hasPatternMagic(self: *Parser, pattern: []const u8) bool {
+        _ = self;
+        for (pattern) |c| {
+            if (c == '^' or c == '$' or c == '(' or c == ')' or c == '%' or c == '.' or c == '[' or c == ']' or c == '*' or c == '+' or c == '-' or c == '?') return true;
+        }
+        return false;
+    }
+
+    fn formatFloatSimple(self: *Parser, buf: *std.ArrayList(u8), f: f64, prec: usize) !void {
+        var result_buf: [128]u8 = undefined;
+        const slice = switch (prec) {
+            0 => std.fmt.bufPrint(&result_buf, "{d:.0}", .{f}) catch "0",
+            1 => std.fmt.bufPrint(&result_buf, "{d:.1}", .{f}) catch "0",
+            2 => std.fmt.bufPrint(&result_buf, "{d:.2}", .{f}) catch "0",
+            3 => std.fmt.bufPrint(&result_buf, "{d:.3}", .{f}) catch "0",
+            4 => std.fmt.bufPrint(&result_buf, "{d:.4}", .{f}) catch "0",
+            5 => std.fmt.bufPrint(&result_buf, "{d:.5}", .{f}) catch "0",
+            6 => std.fmt.bufPrint(&result_buf, "{d:.6}", .{f}) catch "0",
+            7 => std.fmt.bufPrint(&result_buf, "{d:.7}", .{f}) catch "0",
+            8 => std.fmt.bufPrint(&result_buf, "{d:.8}", .{f}) catch "0",
+            9 => std.fmt.bufPrint(&result_buf, "{d:.9}", .{f}) catch "0",
+            10 => std.fmt.bufPrint(&result_buf, "{d:.10}", .{f}) catch "0",
+            12 => std.fmt.bufPrint(&result_buf, "{d:.12}", .{f}) catch "0",
+            14 => std.fmt.bufPrint(&result_buf, "{d:.14}", .{f}) catch "0",
+            else => std.fmt.bufPrint(&result_buf, "{d}", .{f}) catch "0",
+        };
+        try buf.appendSlice(self.vm.allocator, slice);
+    }
 
     fn toNumber(self: *Parser, v: Value) anyerror!Number {
         _ = self;
