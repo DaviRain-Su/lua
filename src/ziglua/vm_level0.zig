@@ -1,5 +1,6 @@
 const std = @import("std");
 const advanced_hooks = @import("advanced_hooks.zig");
+const vm_table = @import("vm_table.zig");
 
 pub const VmState = enum { pass, unsupported, runtime_error };
 
@@ -282,6 +283,163 @@ const Table = struct {
         var n: usize = 0;
         while (n < self.array.items.len and !self.array.items[n].isNil()) : (n += 1) {}
         return @intCast(n);
+    }
+
+    fn destroy(self: *Table, allocator: std.mem.Allocator) void {
+        self.integers.deinit();
+        self.floats.deinit();
+        self.strings.deinit();
+        self.table_keys.deinit();
+        self.function_keys.deinit();
+        self.builtin_keys.deinit();
+        self.thread_keys.deinit();
+        self.array.deinit(allocator);
+        allocator.destroy(self);
+    }
+
+    /// Iterate to next key/value pair after the given key.
+    /// Pass null to start from the beginning.
+    /// Returns null when iteration is complete.
+    /// Iteration order: array part (integer keys 1..n), then hash part
+    /// (negative integers, floats, strings, booleans).
+    fn next(self: *Table, key: ?Value) ?struct { key: Value, value: Value } {
+        if (key == null) {
+            // Start from array part
+            if (self.array.items.len > 0) {
+                var i: usize = 0;
+                while (i < self.array.items.len) : (i += 1) {
+                    if (!self.array.items[i].isNil()) {
+                        return .{ .key = .{ .integer = @intCast(i + 1) }, .value = self.array.items[i] };
+                    }
+                }
+            }
+            // Fall through to hash part
+            return self.nextHashPart(null);
+        }
+
+        const k = key.?;
+        switch (k) {
+            .integer => |i| {
+                if (i >= 1) {
+                    // Continue array part from next slot
+                    var idx: usize = @intCast(i);
+                    while (idx < self.array.items.len) : (idx += 1) {
+                        if (!self.array.items[idx].isNil()) {
+                            return .{ .key = .{ .integer = @intCast(idx + 1) }, .value = self.array.items[idx] };
+                        }
+                    }
+                    // Fall through to hash part
+                    return self.nextHashPart(null);
+                }
+                // Negative integer: in hash part
+                return self.nextHashPartAfterKey(k);
+            },
+            else => return self.nextHashPartAfterKey(k),
+        }
+    }
+
+    fn nextHashPart(self: *Table, start_hint: ?void) ?struct { key: Value, value: Value } {
+        _ = start_hint;
+        // Negative integers
+        var iter = self.integers.iterator();
+        if (iter.next()) |entry| {
+            return .{ .key = .{ .integer = entry.key_ptr.* }, .value = entry.value_ptr.* };
+        }
+        // Floats
+        var fiter = self.floats.iterator();
+        if (fiter.next()) |entry| {
+            const f: f64 = @bitCast(entry.key_ptr.*);
+            return .{ .key = .{ .float = f }, .value = entry.value_ptr.* };
+        }
+        // Strings
+        var siter = self.strings.iterator();
+        if (siter.next()) |entry| {
+            return .{ .key = .{ .string = entry.key_ptr.* }, .value = entry.value_ptr.* };
+        }
+        // Booleans
+        if (!self.bool_true.isNil()) {
+            return .{ .key = .{ .boolean = true }, .value = self.bool_true };
+        }
+        if (!self.bool_false.isNil()) {
+            return .{ .key = .{ .boolean = false }, .value = self.bool_false };
+        }
+        return null;
+    }
+
+    fn nextHashPartAfterKey(self: *Table, after: Value) ?struct { key: Value, value: Value } {
+        switch (after) {
+            .integer => |i| {
+                var found = false;
+                var iter = self.integers.iterator();
+                while (iter.next()) |entry| {
+                    if (!found) {
+                        if (entry.key_ptr.* == i) found = true;
+                        continue;
+                    }
+                    return .{ .key = .{ .integer = entry.key_ptr.* }, .value = entry.value_ptr.* };
+                }
+                if (!found) return null;
+                return self.nextHashFromFloats();
+            },
+            .float => |f| {
+                const after_key = floatTableKey(f);
+                var found = false;
+                var iter = self.floats.iterator();
+                while (iter.next()) |entry| {
+                    if (!found) {
+                        if (entry.key_ptr.* == after_key) found = true;
+                        continue;
+                    }
+                    const fv: f64 = @bitCast(entry.key_ptr.*);
+                    return .{ .key = .{ .float = fv }, .value = entry.value_ptr.* };
+                }
+                if (!found) return null;
+                return self.nextHashFromStrings();
+            },
+            .string => |s| {
+                var found = false;
+                var iter = self.strings.iterator();
+                while (iter.next()) |entry| {
+                    if (!found) {
+                        if (std.mem.eql(u8, entry.key_ptr.*, s)) found = true;
+                        continue;
+                    }
+                    return .{ .key = .{ .string = entry.key_ptr.* }, .value = entry.value_ptr.* };
+                }
+                if (!found) return null;
+                if (!self.bool_true.isNil()) {
+                    return .{ .key = .{ .boolean = true }, .value = self.bool_true };
+                }
+                if (!self.bool_false.isNil()) {
+                    return .{ .key = .{ .boolean = false }, .value = self.bool_false };
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+
+    fn nextHashFromFloats(self: *Table) ?struct { key: Value, value: Value } {
+        var iter = self.floats.iterator();
+        if (iter.next()) |entry| {
+            const f: f64 = @bitCast(entry.key_ptr.*);
+            return .{ .key = .{ .float = f }, .value = entry.value_ptr.* };
+        }
+        return self.nextHashFromStrings();
+    }
+
+    fn nextHashFromStrings(self: *Table) ?struct { key: Value, value: Value } {
+        var iter = self.strings.iterator();
+        if (iter.next()) |entry| {
+            return .{ .key = .{ .string = entry.key_ptr.* }, .value = entry.value_ptr.* };
+        }
+        if (!self.bool_true.isNil()) {
+            return .{ .key = .{ .boolean = true }, .value = self.bool_true };
+        }
+        if (!self.bool_false.isNil()) {
+            return .{ .key = .{ .boolean = false }, .value = self.bool_false };
+        }
+        return null;
     }
 
     fn rawMetafield(self: *Table, name: []const u8) Value {
@@ -3794,9 +3952,7 @@ fn valueToInteger(value: Value) !i64 {
     };
 }
 
-fn floatTableKey(value: f64) u64 {
-    return @bitCast(value);
-}
+const floatTableKey = vm_table.floatTableKey;
 
 fn tableIndexErrorMessage(key: Value) []const u8 {
     return switch (key) {
@@ -4029,21 +4185,8 @@ fn orderedCompare(vm: *Vm, op: Token, left: Value, right: Value) !bool {
     return error.RuntimeError;
 }
 
-const FloatToIntegerMode = enum { eq, floor, ceil };
-
-fn floatToInteger(value: f64, mode: FloatToIntegerMode) ?i64 {
-    if (value != value) return null;
-    var rounded = @floor(value);
-    if (value != rounded) {
-        switch (mode) {
-            .eq => return null,
-            .floor => {},
-            .ceil => rounded += 1.0,
-        }
-    }
-    if (rounded < -9223372036854775808.0 or rounded >= 9223372036854775808.0) return null;
-    return @intFromFloat(rounded);
-}
+const FloatToIntegerMode = vm_table.FloatToIntegerMode;
+const floatToInteger = vm_table.floatToInteger;
 
 fn intFitsFloat(value: i64) bool {
     const max_exact_int_in_float: i64 = 9007199254740992;

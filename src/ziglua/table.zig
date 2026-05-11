@@ -2,6 +2,10 @@ const std = @import("std");
 const object = @import("object.zig");
 const runtime_allocator = @import("allocator.zig");
 
+/// Object-model-level Table placeholder.
+/// The full Table implementation lives in vm_level0.zig (for the VM's Value type).
+/// This struct provides the GC-compatible header and basic lifecycle.
+/// When Value types are unified (T1.4), this will merge with the VM Table.
 pub const Table = struct {
     header: object.Header,
     array_slots: usize,
