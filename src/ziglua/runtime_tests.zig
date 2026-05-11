@@ -13,6 +13,7 @@ const userdata = @import("userdata.zig");
 const value = @import("value.zig");
 const vm_level0 = @import("vm_level0.zig");
 const bc_vm = @import("bc_vm.zig");
+const undump = @import("undump.zig");
 
 test {
     _ = advanced_hooks;
@@ -20,6 +21,7 @@ test {
     _ = lua_alloc_bridge;
     _ = vm_level0;
     _ = bc_vm;
+    _ = undump;
 }
 
 test "runtime constructors require allocator" {
